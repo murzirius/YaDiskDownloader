@@ -1,0 +1,38 @@
+<dialog id="help-dialog" aria-labelledby="help-title">
+  <div class="help-header"><h2 id="help-title">Начало работы</h2><button id="close-help" aria-label="Закрыть инструкцию">×</button></div>
+  <p id="help-progress" class="muted">Шаг 1 из 3</p>
+  <section class="help-step" data-step="0">
+    <h3>Создай приложение Яндекса</h3>
+    <ol>
+      <li>Войди в аккаунт, с которого хочешь скачивать файлы, и открой <a href="https://oauth.yandex.ru/client/new/" target="_blank" rel="noopener noreferrer">Яндекс OAuth → Создать приложение</a>.</li>
+      <li>Выбери тип <strong>«Для доступа к API или отладки»</strong>.</li>
+      <li>Название сервиса: <strong>Disk Downloader</strong>. Контактная почта: твоя почта.</li>
+      <li>В доступах найди Яндекс Диск и выбери только <strong>«Чтение всего Диска» — <code>cloud_api:disk.read</code></strong>. Создай приложение.</li>
+    </ol>
+    <p class="hint">Для этого типа приложения Redirect URI уже задан: <code>https://oauth.yandex.ru/verification_code</code>. Платформу, права записи, удаления и данные профиля добавлять не требуется.</p>
+    <a href="https://yandex.ru/dev/id/doc/ru/register-api" target="_blank" rel="noopener noreferrer">Официальная инструкция по регистрации</a>
+  </section>
+  <section class="help-step" data-step="1" hidden>
+    <h3>Получи OAuth-токен</h3>
+    <ol>
+      <li>На странице созданного приложения скопируй <strong>ClientID / Client_ID</strong>. Это идентификатор приложения, не секрет и не токен.</li>
+      <li>Вставь его ниже и открой страницу получения токена. Проверь аккаунт и подтверди доступ к чтению Диска.</li>
+      <li>Скопируй выданный <strong>OAuth-токен</strong>, вернись сюда и вставь его в поле сверху. Нажми <strong>«Подключить»</strong>.</li>
+    </ol>
+    <label class="field">ClientID<input id="oauth-client-id" maxlength="32" autocomplete="off" spellcheck="false" placeholder="32 символа со страницы приложения"></label>
+    <a id="oauth-authorize" class="oauth-link" target="_blank" rel="noopener noreferrer" aria-disabled="true">Открыть получение токена</a>
+    <p class="hint">Client_secret не нужен. Если страница показывает токен в адресе, возьми значение после <code>access_token=</code> до следующего <code>&amp;</code>. Токен вводится только в локальном интерфейсе, хранится в памяти и после перезапуска вводится снова.</p>
+    <a href="https://yandex.ru/dev/id/doc/ru/tokens/debug-token" target="_blank" rel="noopener noreferrer">Официальная инструкция по получению токена</a>
+  </section>
+  <section class="help-step" data-step="2" hidden>
+    <h3>Выбери файлы и начни загрузку</h3>
+    <ol>
+      <li>Отметь нужные папки или включи <strong>«Скачать весь Диск»</strong>. Общие папки других пользователей тоже попадут в этот выбор.</li>
+      <li>Выбери папку на ПК, типы файлов и режим. Превью скачиваются для фото и видео, музыка и другие файлы — оригиналами.</li>
+      <li>Нажми <strong>«Оценить выбранное»</strong>, дождись обхода и нажми <strong>«Начать»</strong>.</li>
+      <li>Для повторного обхода выбери <strong>«Дозагрузить недостающее»</strong> и прежнюю папку <code>Disk-…</code>. Сначала загружаются файлы без результата, затем программа пробует заменить превью оригиналами. Проверенный оригинал исключает новую загрузку превью.</li>
+    </ol>
+    <p class="hint">По умолчанию: 8 потоков, 1 попытка, 20 секунд на попытку. ZIP и отчёты сохраняются прямо в папке импорта. Кнопка ZIP открывает эту папку.</p>
+  </section>
+  <div class="help-actions"><button id="help-back">Назад</button><button id="help-next" class="primary">Далее</button></div>
+</dialog>

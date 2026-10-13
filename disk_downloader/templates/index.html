@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf }}">
+  <title>Диск · Локальное скачивание</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><strong>Диск</strong><span>Локальное скачивание</span></div>
+  <span class="connection" id="connection">Не подключён</span>
+  <form id="auth-form" class="auth">
+    <label class="sr-only" for="token">OAuth-токен</label>
+    <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="OAuth-токен · только в памяти" required>
+    <button id="connect" type="submit">Подключить</button>
+  </form>
+  <button id="disconnect" hidden>Отключить</button>
+  <button id="open-help" class="quiet">Как начать</button>
+</header>
+<div id="notice" class="notice" role="status" hidden></div>
+<main>
+  <section class="browser-panel" aria-label="Файлы Диска">
+    <div class="navigation">
+      <button id="back" title="Назад" aria-label="Назад">←</button>
+      <button id="up" title="В родительскую папку" aria-label="В родительскую папку">↑</button>
+      <nav id="breadcrumbs" aria-label="Путь папки"></nav>
+      <button id="refresh" title="Обновить папку" aria-label="Обновить папку">↻</button>
+    </div>
+    <div class="toolbar">
+      <input id="filter" type="search" placeholder="Фильтр на странице" aria-label="Фильтр списка">
+      <select id="sort" aria-label="Сортировка"><option value="name">Имя ↑</option><option value="-name">Имя ↓</option><option value="-modified">Новые сначала</option><option value="modified">Старые сначала</option><option value="-size">Размер ↓</option><option value="size">Размер ↑</option></select>
+      <div class="view-toggle"><button id="table-view" aria-pressed="true">Таблица</button><button id="grid-view" aria-pressed="false">Сетка</button></div>
+      <label class="thumb-control">Миниатюры <input id="thumb-size" type="range" min="64" max="180" value="104"></label>
+    </div>
+    <div class="selection-bar"><label><input id="select-page" type="checkbox"> Эта страница</label><span id="selection-count">Выбрано: 0</span><button id="clear-selection" class="quiet">Снять выбор</button></div>
+    <div id="file-list" class="file-list"><div class="empty"><strong>Диск не подключён</strong><span>Введите OAuth-токен с правом чтения Диска.</span><span>После перезапуска токен нужно ввести снова.</span></div></div>
+    <div class="pagination"><span id="page-info">Список папки</span><button id="prev-page" disabled>Предыдущая</button><button id="next-page" disabled>Следующая</button></div>
+    <details class="selected-detail"><summary>Выбранные исходные пути</summary><div id="selected-paths">Выбор пуст</div></details>
+  </section>
+  <aside>
+    <div class="panel-tabs" role="tablist" aria-label="Панель скачивания"><button id="settings-tab" role="tab" aria-selected="true" aria-controls="settings-panel">Параметры</button><button id="job-tab" role="tab" aria-selected="false" aria-controls="job-panel">Задание</button></div>
+    <section id="settings-panel" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab">
+      <h1>Скачивание</h1>
+      <label class="field">Как загрузить<select id="operation"><option value="new">Новая загрузка</option><option value="missing">Дозагрузить недостающее</option></select></label>
+      <label class="whole"><input id="whole-disk" type="checkbox"> Скачать весь Диск</label>
+      <label class="field"><span id="destination-label">Сохранить в</span><div class="folder-input"><input id="destination" value="{{ default_destination }}" spellcheck="false"><button id="choose-folder" title="Выбрать папку" aria-label="Выбрать папку">…</button></div></label>
+      <label class="field">Режим<select id="mode"><option value="previews" selected>Только превью</option><option value="both">Оригиналы и превью</option><option value="fallback">Оригинал, превью при неудаче</option></select></label>
+      <fieldset id="file-types"><legend>Типы для скачивания</legend><div class="type-options"><label><input type="checkbox" name="file-type" value="photos" checked> Фото</label><label><input type="checkbox" name="file-type" value="videos" checked> Видео</label><label><input type="checkbox" name="file-type" value="music" checked> Музыка</label><label><input type="checkbox" name="file-type" value="files" checked> Другие файлы</label></div><p class="hint">Превью — для фото и видео. Музыка и другие файлы — оригиналы.</p></fieldset>
+      <fieldset><legend>Отчёты</legend><label><input type="checkbox" name="report" value="csv" checked> CSV</label><label><input type="checkbox" name="report" value="json" checked> JSON</label><label><input type="checkbox" name="report" value="html"> HTML</label><label><input type="checkbox" name="report" value="txt"> TXT</label></fieldset>
+      <details class="advanced-settings"><summary>Дополнительные настройки</summary>
+        <label class="field">Размер превью<select id="preview-size"><option value="XXXL">Максимальный · 1280 px</option><option value="XXL">1024 px</option><option value="XL">800 px</option><option value="L">500 px</option><option value="M">300 px</option><option value="S">150 px</option></select></label>
+        <div class="numeric-settings"><label>Потоки<input id="workers" type="number" min="1" max="8" value="8"></label><label>Попытки всего<input id="retries" type="number" min="1" max="9" value="1"></label><label>Лимит попытки, с<input id="timeout" type="number" min="5" max="180" value="20"></label></div>
+        <p class="hint">Превью без обрезки. Файлы, отчёты и ZIP — в папке импорта.</p>
+      </details>
+      <button id="estimate" class="primary wide">Оценить выбранное</button>
+    </section>
+    <section id="job-panel" class="job-panel" role="tabpanel" aria-labelledby="job-tab" hidden>
+      <div class="section-title"><h2>Задание</h2><button id="refresh-jobs" class="quiet">Обновить</button></div>
+      <select id="job-history" aria-label="История заданий"><option value="">Нет заданий</option></select>
+      <div id="job-content" hidden>
+        <div class="phase-line"><strong id="phase">—</strong><span id="percentage">—</span></div>
+        <progress id="progress" max="100" value="0" aria-label="Прогресс задания"></progress>
+        <div id="counters" class="counters"></div>
+        <div id="active-files" class="active-files"></div>
+        <div id="estimate-info" class="estimate-info"></div>
+        <div class="actions"><button id="start-job" class="primary">Начать</button><button id="pause-job">Пауза</button><button id="resume-job">Продолжить</button><button id="stop-job" class="danger">Остановить</button></div>
+        <div id="result-info" class="result-info"></div>
+        <div class="actions"><button id="retry-job">Повторить неудачные</button><button id="pack-job">Собрать ZIP результатов</button></div>
+        <div id="zip-saved" class="hint" hidden></div>
+        <button id="download-zip" class="download" hidden>Открыть папку с ZIP</button>
+        <details id="job-details" class="job-details"><summary>Подробности задания</summary>
+          <div id="extra-counters" class="counters"></div>
+          <div id="estimate-details" class="hint"></div>
+          <div id="job-settings" class="hint"></div>
+          <div id="output-path" class="output-path"></div>
+          <button id="open-journal" hidden>Открыть HTML-журнал</button>
+          <div id="journal-info" class="hint"></div>
+        </details>
+        <details id="errors-detail"><summary id="errors-title">Ошибки и замены оригиналов</summary><div id="errors-list"></div><div class="actions"><button id="errors-prev">Назад</button><button id="errors-next">Ещё</button></div></details>
+      </div>
+    </section>
+  </aside>
+</main>
+{% include 'help.html' %}
+<footer>Только чтение Яндекс.Диска · Сервер на 127.0.0.1 · Превью сохраняются с суффиксом .preview и не заменяют оригиналы</footer>
+</body>
+</html>
