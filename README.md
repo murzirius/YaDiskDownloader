@@ -4,7 +4,7 @@
 
 ## Быстрый запуск
 
-1. Откройте **[Releases](https://github.com/murzirius/YaDiskDownloader/releases)** и скачайте **YaDiskDownloader-v1.2.0-Windows-x64.zip**.
+1. Откройте **[Releases](https://github.com/murzirius/YaDiskDownloader/releases)** и скачайте **YaDiskDownloader-v1.2.1-Windows-x64.zip**.
 2. Полностью распакуйте ZIP и запустите **YaDiskDownloader.exe**. Python устанавливать не нужно.
 3. В открывшемся браузере следуйте кнопке **«Как начать»**: получите токен Яндекса и подключите Диск.
 4. Выберите папки, режим и папку назначения. Нажмите **«Оценить выбранное»**, затем **«Начать»**.

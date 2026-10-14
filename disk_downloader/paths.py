@@ -133,7 +133,7 @@ def safe_join(root, relative):
     if not isinstance(relative, str) or relative.startswith(("/", "\\")):
         raise PathError("Недопустимый локальный путь")
     parts = relative.split("/") if relative else []
-    if any(p in ("", ".", "..") or ":" in p or "\\" in p for p in parts):
+    if any(p in ("", ".", "..") or ":" in p or "\\" in p or p.endswith((".", " ")) or any(ord(c) < 32 for c in p) or re.fullmatch(r"(?i)(CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])", p.split(".")[0]) for p in parts):
         raise PathError("Недопустимый локальный путь")
     root = Path(root).absolute()
     candidate = root.joinpath(*parts)
@@ -157,7 +157,12 @@ def normalize_selection(paths, whole):
     if not paths:
         raise ValueError("Выберите файлы, папки или весь Диск")
     result = []
+    accepted = set()
     for path in paths:
-        if not any(path == p or path.startswith(p.rstrip("/") + "/") for p in result):
+        ancestor = path
+        while ancestor not in accepted and ancestor != "disk:/":
+            ancestor = parent_path(ancestor)
+        if ancestor not in accepted:
             result.append(path)
+            accepted.add(path)
     return result

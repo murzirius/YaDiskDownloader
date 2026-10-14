@@ -9,7 +9,7 @@ from flask import Flask, abort, jsonify, render_template, request, send_file, se
 from PIL import Image
 from werkzeug.exceptions import HTTPException
 
-from .api import APIError, Credentials, DiskAPI, SIZES, Suspended
+from .api import APIError, Credentials, Deadline, DiskAPI, SIZES, Suspended, validate_resource
 from .engine import Engine, safe_error
 from .paths import remote_path, safe_join
 from .store import Store
@@ -49,7 +49,8 @@ def create_app(state_dir=None, api=None, port=8766):
             abort(403, "Межсайтовый запрос запрещён")
         if request.path.startswith("/api/"):
             csrf = session.get("csrf")
-            if not csrf or not secrets.compare_digest(request.headers.get("X-CSRF-Token", ""), csrf):
+            supplied = request.headers.get("X-CSRF-Token", "")
+            if not csrf or not supplied.isascii() or not secrets.compare_digest(supplied, csrf):
                 abort(403, "Откройте интерфейс приложения: требуется CSRF-токен")
         if request.method == "POST" and origin not in origins:
             abort(403, "Для управляющего запроса требуется локальный Origin")
@@ -145,7 +146,20 @@ def create_app(state_dir=None, api=None, port=8766):
 
     @app.get("/api/profiles")
     def profiles():
-        return jsonify(items=[{"name": row["name"], "settings": json.loads(row["settings"])} for row in store.rows("SELECT * FROM profiles ORDER BY name")])
+        items = []
+        for row in store.rows("SELECT * FROM profiles ORDER BY name"):
+            try:
+                value = json.loads(row["settings"])
+                if not isinstance(value, dict):
+                    raise ValueError()
+                empty_sources = not value.get("whole_disk") and not value.get("paths")
+                validated = engine.validate_settings(value | {"whole_disk": True} if empty_sources else value)
+                if empty_sources:
+                    validated.update(paths=[], whole_disk=False)
+                items.append({"name": row["name"], "settings": validated})
+            except (ValueError, TypeError, OSError):
+                items.append({"name": row["name"], "settings": None, "error": "Профиль повреждён. Создайте его заново."})
+        return jsonify(items=items)
 
     @app.post("/api/profiles")
     def save_profile():
@@ -193,14 +207,14 @@ def create_app(state_dir=None, api=None, port=8766):
 
     @app.post("/api/connect")
     def connect():
-        if any(t.is_alive() for t in engine.threads.values()):
-            raise ValueError("Сначала остановите текущее задание и дождитесь остановки")
-        credentials.set(payload().get("token"))
-        try:
-            api.metadata("disk:/", limit=1)
-        except BaseException:
-            credentials.clear()
-            raise
+        with engine.lock:
+            engine.ensure_idle()
+            credentials.set(payload().get("token"))
+            try:
+                api.metadata("disk:/", {"attempts": 1, "timeout": 20}, limit=1)
+            except BaseException:
+                credentials.clear()
+                raise
         return jsonify(connected=True)
 
     @app.post("/api/disconnect")
@@ -213,12 +227,13 @@ def create_app(state_dir=None, api=None, port=8766):
         path = remote_path(request.args.get("path", "disk:/"))
         offset = request.args.get("offset", "0")
         sort = request.args.get("sort", "name")
-        if not offset.isdigit() or sort not in ("name", "-name", "size", "-size", "modified", "-modified"):
+        if not offset.isascii() or not offset.isdigit() or len(offset) > 8 or sort not in ("name", "-name", "size", "-size", "modified", "-modified"):
             raise ValueError("Некорректные параметры списка")
         data = api.metadata(path, {"preview_size": "S"}, offset=int(offset), limit=100, sort=sort)
         embedded = data.get("_embedded", {})
         items = []
         for item in embedded.get("items", []):
+            validate_resource(item)
             items.append({k: item.get(k) for k in ("path", "name", "type", "size", "modified", "mime_type")} | {"has_preview": preview_type(item) and bool(item.get("preview"))})
         return jsonify(path=path, items=items, total=embedded.get("total"), offset=int(offset), next_offset=int(offset) + len(items), has_more=bool(items) and (embedded.get("total") is None or int(offset) + len(items) < embedded["total"]))
 
@@ -228,15 +243,25 @@ def create_app(state_dir=None, api=None, port=8766):
             return "", 429
         response = connection = None
         try:
+            _, epoch = credentials.snapshot()
+            def check():
+                credentials.check(epoch)
+            with Deadline(15, check, cancelled=lambda: not credentials.connected) as deadline:
+                return load_thumbnail(deadline)
+        finally:
+            thumbnail_slots.release()
+
+    def load_thumbnail(deadline):
+        response = connection = None
+        try:
             path = remote_path(request.args.get("path", ""))
             size = request.args.get("size", "M")
             if size not in SIZES:
                 raise ValueError("Некорректный размер миниатюры")
-            response, connection = api.media(path, "preview", {"preview_size": size, "retries": 1, "timeout": 15})
+            response, connection = api.media(path, "preview", {"preview_size": size, "attempts": 1, "timeout": 15, "_single_attempt": True, "_deadline": deadline}, deadline.check)
             data = bytearray()
             for chunk in response.iter_content(65536):
-                if not credentials.connected:
-                    raise Suspended("Диск отключён")
+                deadline.check()
                 data.extend(chunk)
                 if len(data) > 16 * 1024 * 1024:
                     raise APIError("Превью слишком большое для миниатюры")
@@ -247,11 +272,11 @@ def create_app(state_dir=None, api=None, port=8766):
                 output = io.BytesIO()
                 image.convert("RGB").save(output, format="JPEG", quality=85)
             output.seek(0)
+            deadline.check()
             return send_file(output, mimetype="image/jpeg")
         finally:
             if response is not None:
                 api.close(response, connection)
-            thumbnail_slots.release()
 
     @app.post("/api/folder")
     def folder():
@@ -285,7 +310,7 @@ def create_app(state_dir=None, api=None, port=8766):
     def job_errors(job_id):
         store.job(job_id)
         offset = request.args.get("offset", "0")
-        if not offset.isdigit():
+        if not offset.isascii() or not offset.isdigit() or len(offset) > 8:
             raise ValueError("Некорректное смещение")
         rows = list(store.rows("SELECT path,status,error,original_status,preview_status,fallback FROM entries WHERE job=? AND kind='file' AND status NOT IN ('pending','running','cancelled') AND (error!='' OR status IN ('error','no_preview')) UNION ALL SELECT path,'scan_error',error,'not_requested','not_requested',0 FROM scan_errors WHERE job=? LIMIT 100 OFFSET ?", (job_id, job_id, int(offset))))
         return jsonify(items=rows, next_offset=int(offset) + len(rows), has_more=len(rows) == 100)

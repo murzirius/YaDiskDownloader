@@ -22,8 +22,11 @@ def read_journal(engine, job_id):
 def eventually(check, timeout=4):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
-        if check():
-            return
+        try:
+            if check():
+                return
+        except PermissionError:
+            pass
         time.sleep(0.02)
     raise AssertionError("Состояние не изменилось вовремя")
 

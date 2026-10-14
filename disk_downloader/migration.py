@@ -8,7 +8,7 @@ from pathlib import Path
 from .store import Store
 
 
-TABLES = ("entries", "names", "artifacts", "partials", "baseline", "changes", "verification_cache", "scan_errors")
+TABLES = ("entries", "names", "artifacts", "partials", "baseline", "changes", "scan_errors")
 
 
 @contextmanager

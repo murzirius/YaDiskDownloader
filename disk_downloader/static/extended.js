@@ -1,11 +1,13 @@
+let inventoryVersion=0;
 let inventory={mode:'folders',path:'disk:/',offset:0,job:null,more:false};
 for(const id of ['speed-limit','exclusions'])$(id).onchange=()=>{state.limitsTouched=true;};
 $('exclude-selected').onclick=()=>{if(!selected.size){notice('Выберите файлы или папки в списке');return;}excludePaths([...selected]);};
 $('close-inventory').onclick=()=>$('inventory-dialog').close();
 async function renderInventory(){
+  const version=++inventoryVersion;
   const changes=inventory.mode==='changes';$('inventory-title').textContent=changes?'Отчёт об изменениях':'Объём по папкам';$('change-filter').hidden=!changes;$('open-changes-report').hidden=!changes||!state.jobStatus?.settings.changes_local;
   const url='/api/jobs/'+inventory.job+(changes?'/changes?':'/folders?')+new URLSearchParams({path:inventory.path,offset:inventory.offset,status:$('change-filter').value||'all'});
-  const result=await api(url);inventory.more=result.has_more;$('inventory-prev').disabled=inventory.offset===0;$('inventory-next').disabled=!inventory.more;$('inventory-nav').replaceChildren();$('inventory-head').replaceChildren();$('inventory-body').replaceChildren();
+  const result=await api(url);if(version!==inventoryVersion)return;inventory.more=result.has_more;$('inventory-prev').disabled=inventory.offset===0;$('inventory-next').disabled=!inventory.more;$('inventory-nav').replaceChildren();$('inventory-head').replaceChildren();$('inventory-body').replaceChildren();
   if(changes){
     $('inventory-note').textContent=(result.summary.compared?'Сравнение с предыдущим импортом':'Первый импорт: предыдущего обхода для сравнения пока нет')+(!result.summary.complete?' · Обход ещё не завершён':'');
     const choice=$('change-filter').value||'all';$('change-filter').replaceChildren(new Option('Все изменения','all'));for(const [key,label] of Object.entries(result.summary.labels))$('change-filter').append(new Option(label+' · '+result.summary.counts[key],key));$('change-filter').value=choice;

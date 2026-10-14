@@ -14,6 +14,20 @@ if (-not (Test-Path -LiteralPath $runtime)) {
     & $pythonTool.Source @pythonArguments -m venv .venv
     if ($LASTEXITCODE -ne 0) { throw 'Не удалось создать окружение Python' }
 }
+$bootstrapFile = Join-Path $PSScriptRoot 'requirements-bootstrap.txt'
+$bootstrapStamp = Join-Path $PSScriptRoot '.venv\bootstrap.sha256'
+$bootstrapHashProvider = [System.Security.Cryptography.SHA256]::Create()
+try {
+    $bootstrapHash = [BitConverter]::ToString($bootstrapHashProvider.ComputeHash([System.IO.File]::ReadAllBytes($bootstrapFile))).Replace('-', '')
+} finally {
+    $bootstrapHashProvider.Dispose()
+}
+$bootstrapInstalled = if (Test-Path -LiteralPath $bootstrapStamp) { (Get-Content -LiteralPath $bootstrapStamp -Raw).Trim() } else { '' }
+if ($bootstrapInstalled -ne $bootstrapHash) {
+    & $runtime -m pip install --upgrade -r $bootstrapFile
+    if ($LASTEXITCODE -ne 0) { throw 'Не удалось обновить установщик зависимостей' }
+    Set-Content -LiteralPath $bootstrapStamp -Value $bootstrapHash -Encoding Ascii
+}
 $requirementsFile = Join-Path $PSScriptRoot 'requirements.txt'
 $hashProvider = [System.Security.Cryptography.SHA256]::Create()
 try {

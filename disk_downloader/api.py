@@ -1,6 +1,8 @@
 import threading
 import socket
 import time
+import math
+import re
 from contextlib import nullcontext, contextmanager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -15,6 +17,7 @@ from .paths import remote_path
 
 BASE = "https://cloud-api.yandex.net/v1/disk"
 SIZES = ("S", "M", "L", "XL", "XXL", "XXXL")
+PREVIEW_MAX_BYTES = 64 * 1024 * 1024
 
 
 class Suspended(Exception):
@@ -156,13 +159,41 @@ class DeadlineAdapter(HTTPAdapter):
 def retry_delay(value, attempt):
     if value:
         try:
-            return max(0, float(value))
+            seconds = float(value)
+            if math.isfinite(seconds):
+                return min(300, max(0, seconds))
         except (ValueError, TypeError):
             try:
-                return max(0, (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds())
+                return min(300, max(0, (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds()))
             except (ValueError, TypeError, OverflowError):
                 pass
     return min(30, 0.5 * 2 ** attempt)
+
+
+def validate_resource(meta):
+    try:
+        if not isinstance(meta, dict) or meta.get("type") not in ("file", "dir"):
+            raise ValueError()
+        remote_path(meta.get("path"))
+        size = meta.get("size")
+        if size is not None and (isinstance(size, bool) or not isinstance(size, int) or not 0 <= size < 2 ** 63):
+            raise ValueError()
+        for key, length in (("md5", 32), ("sha256", 64)):
+            value = meta.get(key)
+            if value and (not isinstance(value, str) or not re.fullmatch(r"[a-fA-F0-9]{" + str(length) + r"}", value)):
+                raise ValueError()
+        if "name" in meta and not isinstance(meta["name"], str):
+            raise ValueError()
+        embedded = meta.get("_embedded")
+        if embedded is not None:
+            if not isinstance(embedded, dict) or not isinstance(embedded.get("items"), list):
+                raise ValueError()
+            total = embedded.get("total")
+            if total is not None and (isinstance(total, bool) or not isinstance(total, int) or total < 0):
+                raise ValueError()
+        return meta
+    except ValueError:
+        raise APIError("API вернул некорректные метаданные ресурса") from None
 
 
 def trusted_media(url):
@@ -184,7 +215,7 @@ class Credentials:
         self.responses = set()
 
     def set(self, token):
-        if not isinstance(token, str) or not 10 <= len(token) <= 4096 or any(c.isspace() or ord(c) < 32 for c in token):
+        if not isinstance(token, str) or not 10 <= len(token) <= 4096 or any(not 33 <= ord(c) <= 126 for c in token):
             raise ValueError("Некорректный OAuth-токен")
         self.clear()
         with self.lock:
@@ -234,7 +265,8 @@ class DiskAPI:
         checkpoint()
         with self.rate_lock:
             delay = max(0, self.rate_until - time.monotonic())
-        self.wait(delay, checkpoint)
+        with deadline.hold() if (deadline := getattr(checkpoint, "deadline", None)) else nullcontext():
+            self.wait(delay, checkpoint)
         token, current_epoch = self.credentials.snapshot()
         if current_epoch != epoch:
             raise Suspended("Подключение изменилось")
@@ -320,10 +352,10 @@ class DiskAPI:
             if network and not owner:
                 network.wait(checkpoint)
             try:
+                if delay:
+                    self.wait(delay, check)
                 with nullcontext(owner) if owner else Deadline(timeout, checkpoint, getattr(control, "active_clock", time.monotonic), lambda: getattr(control, "stopped", False) or not self.credentials.connected) as budget:
                     check.deadline = budget
-                    if delay:
-                        self.wait(delay, check)
                     response, session = self._open(BASE + endpoint, params, True, timeout, check, epoch)
                     if response.status_code == 401:
                         self.credentials.clear()
@@ -369,7 +401,8 @@ class DiskAPI:
         path = remote_path(path)
         result = self.get("/resources", {"path": path, "limit": limit, "offset": offset, "sort": sort,
                           "preview_size": preview_size or settings.get("preview_size", "XXXL"), "preview_crop": "false"}, settings, checkpoint)
-        if remote_path(result.get("path", "")) != path or result.get("type") not in ("file", "dir"):
+        validate_resource(result)
+        if result["path"] != path:
             raise APIError("API вернул неожиданный путь или тип ресурса")
         return result
 

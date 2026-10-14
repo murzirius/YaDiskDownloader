@@ -45,9 +45,19 @@ class Updates:
     def settings(self):
         with self.store.db() as db:
             row = db.execute("SELECT value FROM preferences WHERE key='updates'").fetchone()
-        return json.loads(row[0]) if row else {"repository": DEFAULT_REPOSITORY, "automatic": True}
+        defaults = {"repository": DEFAULT_REPOSITORY, "automatic": True}
+        if not row:
+            return defaults
+        try:
+            data = json.loads(row[0])
+            if not isinstance(data, dict) or not isinstance(data.get("automatic"), bool):
+                raise ValueError()
+            return {"repository": repository(data["repository"]), "automatic": data["automatic"]}
+        except (ValueError, KeyError, TypeError):
+            return defaults | {"automatic": False}
 
     def save(self, data):
+        data = self.settings() | data
         if not isinstance(data.get("automatic", True), bool):
             raise ValueError("Некорректная настройка обновлений")
         value = {"repository": repository(data.get("repository", DEFAULT_REPOSITORY)), "automatic": data.get("automatic", True)}
@@ -94,7 +104,7 @@ class Updates:
                         latest = version(tag)
                         result.update(latest=tag, url=target.geturl(), available=bool(latest and latest > version(__version__)))
                         result["message"] = "Доступна новая версия " + tag if result["available"] else "Новая версия не требуется" if latest else "Найден релиз " + tag + "; сравните версии вручную"
-        except (APIError, requests.RequestException, ValueError, TypeError, AttributeError):
+        except (APIError, requests.RequestException, OSError, ValueError, TypeError, AttributeError):
             result["message"] = "Не удалось проверить обновления. Проверьте соединение и попробуйте позже."
         finally:
             with self.lock:

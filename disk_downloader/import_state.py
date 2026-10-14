@@ -18,7 +18,14 @@ def find_import(store, root):
         if os.path.normcase(str(Path(row["root"]).resolve())) == normalized or same_name:
             job = store.job(row["id"])
             return {"job": job, "store": store, "id": job["id"]}
-    for filename in sorted(Path(root).glob(".disk-import*.sqlite3"), key=lambda p: p.stat().st_mtime, reverse=True):
+    manifests = []
+    for filename in Path(root).glob(".disk-import*.sqlite3"):
+        try:
+            safe_join(root, filename.name)
+            manifests.append((filename.stat().st_mtime, filename))
+        except (OSError, ValueError):
+            continue
+    for _, filename in sorted(manifests, key=lambda item: item[0], reverse=True):
         try:
             safe_join(root, filename.name)
             with closing(sqlite3.connect(filename.resolve().as_uri() + "?mode=ro", uri=True)) as db:
@@ -28,7 +35,7 @@ def find_import(store, root):
                     if not isinstance(settings, dict) or not isinstance(settings.get("paths"), list):
                         continue
                     return {"job": {"settings": settings, "service": meta["service"], "generation": int(meta["generation"])}, "file": filename, "inventory_available": bool(db.execute("SELECT 1 FROM sqlite_master WHERE name='inventory'").fetchone())}
-        except (sqlite3.Error, OSError, ValueError, KeyError):
+        except (sqlite3.Error, OSError, ValueError, KeyError, TypeError):
             continue
     return None
 
@@ -60,10 +67,6 @@ def inherit(store, job_id, previous):
                     target.execute("INSERT OR IGNORE INTO partials VALUES(?,?,?,?,?,?,?,?,?)", (job_id, *row))
         else:
             with closing(sqlite3.connect(previous["file"].resolve().as_uri() + "?mode=ro", uri=True)) as source:
-                if source.execute("SELECT 1 FROM sqlite_master WHERE name='verification_cache'").fetchone():
-                    for row in source.execute("SELECT local,signature FROM verification_cache"):
-                        safe_join(root, row[0])
-                        target.execute("INSERT OR IGNORE INTO verification_cache VALUES(?,?,?)", (job_id, *row))
                 if source.execute("SELECT 1 FROM sqlite_master WHERE name='inventory'").fetchone():
                     for row in source.execute("SELECT path,kind,meta FROM inventory"):
                         remote_path(row[0])

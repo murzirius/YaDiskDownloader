@@ -3,6 +3,7 @@ import json
 import os
 import platform
 import re
+import secrets
 import sys
 import zipfile
 from datetime import datetime, timezone
@@ -11,7 +12,7 @@ from . import __version__
 from .paths import publish, reserve_output, safe_join, temporary_file
 
 
-SETTINGS = ("mode", "preview_size", "file_types", "workers", "attempts", "timeout", "reports", "create_zip", "auto_pause", "max_disk_percent", "adaptive_workers", "resume_parts", "operation")
+SETTINGS = ("mode", "preview_size", "file_types", "workers", "attempts", "timeout", "reports", "create_zip", "auto_pause", "max_disk_percent", "adaptive_workers", "resume_parts", "operation", "speed_limit_mib")
 
 
 def error_kind(value):
@@ -23,6 +24,9 @@ def error_kind(value):
 
 
 def bundle(engine, job_id):
+    salt = secrets.token_bytes(32)
+    def source_id(path):
+        return hashlib.sha256(salt + path.encode()).hexdigest()[:16]
     status = engine.status(job_id)
     summary = {key: status.get(key) for key in ("phase", "files", "folders", "processed", "originals", "previews", "errors", "scan_errors", "cancelled", "replacements", "missing_previews", "saved_bytes", "downloaded", "zip_bytes", "partial_bytes", "free_bytes", "workers_status")}
     summary["error_type"] = error_kind(status["error"])
@@ -30,7 +34,7 @@ def bundle(engine, job_id):
     environment = {"app_version": __version__, "python": sys.version.split()[0], "system": platform.system(), "system_release": platform.release(), "architecture": platform.machine(), "created": datetime.now(timezone.utc).isoformat()}
     entries = []
     for row in engine.store.rows("SELECT path,status,error,original_status,preview_status,original_attempts,preview_attempts FROM entries WHERE job=? AND kind='file' AND (error!='' OR status IN ('error','cancelled','no_preview')) LIMIT 1000", (job_id,)):
-        row["source_id"] = hashlib.sha256(row.pop("path").encode()).hexdigest()[:16]
+        row["source_id"] = source_id(row.pop("path"))
         row["error_type"] = error_kind(row.pop("error"))
         entries.append(row)
     events = []
@@ -44,7 +48,7 @@ def bundle(engine, job_id):
         if match:
             row.update(attempt=int(match[1]), attempts=int(match[2]))
         if path:
-            row["source_id"] = hashlib.sha256(path.encode()).hexdigest()[:16]
+            row["source_id"] = source_id(path)
         events.append(row)
     return {"environment.json": environment, "settings.json": settings, "summary.json": summary, "errors.json": entries, "events.json": events}
 

@@ -21,23 +21,34 @@ def compare(store, job_id, checkpoint=lambda: None):
     with store.db() as db:
         errors = [r[0] for r in db.execute("SELECT path FROM scan_errors WHERE job=?", (job_id,))]
         db.execute("DELETE FROM changes WHERE job=?", (job_id,))
-        rows = db.execute("SELECT e.path,e.meta,b.meta AS old FROM entries e LEFT JOIN baseline b ON b.job=e.job AND b.path=e.path WHERE e.job=? AND e.kind='file'", (job_id,))
-        for row in rows:
+    selections = (
+        ("SELECT e.path,e.meta,b.meta AS old FROM entries e LEFT JOIN baseline b ON b.job=e.job AND b.path=e.path WHERE e.job=? AND e.kind='file'", False),
+        ("SELECT b.path,b.meta FROM baseline b WHERE b.job=? AND b.kind='file' AND NOT EXISTS(SELECT 1 FROM entries e WHERE e.job=b.job AND e.path=b.path)", True)
+    )
+    for sql, missing in selections:
+        batch = []
+        for row in store.rows(sql, (job_id,)):
             checkpoint()
-            status = "new" if row["old"] is None else "unchanged" if stamp(json.loads(row["old"])) == stamp(json.loads(row["meta"])) else "changed"
-            db.execute("INSERT INTO changes VALUES(?,?,?,?,?)", (job_id, row["path"], status, row["old"], row["meta"]))
-        rows = db.execute("SELECT b.path,b.meta FROM baseline b WHERE b.job=? AND b.kind='file' AND NOT EXISTS(SELECT 1 FROM entries e WHERE e.job=b.job AND e.path=b.path)", (job_id,))
-        for row in rows:
-            checkpoint()
-            path = row["path"]
-            in_scope = any(root == "disk:/" or root == path or path.startswith(root + "/") for root in settings["paths"])
-            if not in_scope or excluded(path, settings) or not selected_type(json.loads(row["meta"]), settings):
-                status = "excluded"
-            elif not job["scan_complete"] or any(path == root or path.startswith(root.rstrip("/") + "/") for root in errors):
-                status = "unknown"
+            if not missing:
+                status = "new" if row["old"] is None else "unchanged" if stamp(json.loads(row["old"])) == stamp(json.loads(row["meta"])) else "changed"
+                batch.append((job_id, row["path"], status, row["old"], row["meta"]))
             else:
-                status = "removed"
-            db.execute("INSERT INTO changes VALUES(?,?,?,?,?)", (job_id, path, status, row["meta"], None))
+                path = row["path"]
+                in_scope = any(root == "disk:/" or root == path or path.startswith(root + "/") for root in settings["paths"])
+                if not in_scope or excluded(path, settings) or not selected_type(json.loads(row["meta"]), settings):
+                    status = "excluded"
+                elif not job["scan_complete"] or any(path == root or path.startswith(root.rstrip("/") + "/") for root in errors):
+                    status = "unknown"
+                else:
+                    status = "removed"
+                batch.append((job_id, path, status, row["meta"], None))
+            if len(batch) == 200:
+                with store.db() as db:
+                    db.executemany("INSERT INTO changes VALUES(?,?,?,?,?)", batch)
+                batch.clear()
+        if batch:
+            with store.db() as db:
+                db.executemany("INSERT INTO changes VALUES(?,?,?,?,?)", batch)
 
 
 def change_summary(store, job_id):
@@ -65,9 +76,9 @@ def folders(store, job_id, path="disk:/", offset=0):
     return {"path": path, "items": [dict(row) for row in rows[:100]], "has_more": len(rows) > 100, "next_offset": offset + min(100, len(rows))}
 
 
-def write_changes(store, job_id):
+def write_changes(store, job_id, checkpoint=lambda: None):
     job = store.job(job_id)
-    compare(store, job_id)
+    compare(store, job_id, checkpoint)
     relative = reserve_output(store, job, f"changes-{job['generation'] + 1}.html")
     temp = temporary_file(job["root"])
     template = Path(__file__).with_name("templates").joinpath("changes.html").read_text(encoding="utf-8")
@@ -80,6 +91,7 @@ def write_changes(store, job_id):
             stream.write('{"summary":' + encoded(change_summary(store, job_id)) + ',"items":[')
             first = True
             for row in store.rows("SELECT path,status,before_meta,after_meta FROM changes WHERE job=? ORDER BY path", (job_id,)):
+                checkpoint()
                 item = {"path": row["path"], "status": row["status"], "before_size": json.loads(row["before_meta"]).get("size") if row["before_meta"] else None, "after_size": json.loads(row["after_meta"]).get("size") if row["after_meta"] else None}
                 stream.write(("" if first else ",") + encoded(item))
                 first = False

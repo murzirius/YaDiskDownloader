@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .file_types import file_type, preview_type, selected_type
 from .exclusions import excluded
+from .api import validate_resource
 
 
 SCHEMA = """
@@ -56,6 +57,7 @@ CREATE TABLE IF NOT EXISTS partials (
  etag TEXT NOT NULL DEFAULT '', total INTEGER,
  PRIMARY KEY(job,path,type), UNIQUE(job,local)
 );
+CREATE TABLE IF NOT EXISTS partial_ownership (job TEXT,local TEXT,PRIMARY KEY(job,local));
 """
 
 
@@ -75,10 +77,17 @@ class Store:
             if "pause_reason" not in {row[1] for row in db.execute("PRAGMA table_info(jobs)")}:
                 db.execute("ALTER TABLE jobs ADD COLUMN pause_reason TEXT NOT NULL DEFAULT ''")
             for row in db.execute("SELECT id,settings FROM jobs").fetchall():
-                settings = json.loads(row["settings"])
+                try:
+                    settings = json.loads(row["settings"])
+                    if not isinstance(settings, dict):
+                        raise ValueError()
+                except (ValueError, TypeError):
+                    db.execute("UPDATE jobs SET phase='failed',error=? WHERE id=?", ("Настройки задания повреждены. Создайте дозагрузку в прежнюю папку.", row["id"]))
+                    continue
                 changed = False
                 if "attempts" not in settings:
-                    settings["attempts"] = max(1, settings.get("retries", 3))
+                    retries = settings.get("retries", 0)
+                    settings["attempts"] = min(9, max(1, retries + 1)) if isinstance(retries, int) and not isinstance(retries, bool) else 1
                     settings["retries"] = settings["attempts"] - 1
                     changed = True
                 if settings.get("adaptive_workers") is not False:
@@ -87,7 +96,12 @@ class Store:
                 if changed:
                     db.execute("UPDATE jobs SET settings=? WHERE id=?", (json.dumps(settings, ensure_ascii=False), row["id"]))
             for row in db.execute("SELECT name,settings FROM profiles").fetchall():
-                settings = json.loads(row["settings"])
+                try:
+                    settings = json.loads(row["settings"])
+                    if not isinstance(settings, dict):
+                        raise ValueError()
+                except (ValueError, TypeError):
+                    continue
                 if settings.get("adaptive_workers") is not False:
                     settings["adaptive_workers"] = False
                     db.execute("UPDATE profiles SET settings=? WHERE name=?", (json.dumps(settings, ensure_ascii=False), row["name"]))
@@ -116,7 +130,12 @@ class Store:
         if not row:
             raise ValueError("Задание не найдено")
         result = dict(row)
-        result["settings"] = json.loads(result["settings"])
+        try:
+            result["settings"] = json.loads(result["settings"])
+            if not isinstance(result["settings"], dict):
+                raise ValueError()
+        except (ValueError, TypeError):
+            result["settings"] = {"_invalid": True, "mode": "fallback", "preview_size": "XXXL", "reports": ["json"], "file_types": ["photos", "videos", "music", "files"], "paths": [], "whole_disk": False, "destination": result["root"], "workers": 8, "attempts": 1, "retries": 0, "timeout": 20}
         return result
 
     def update_job(self, job_id, **fields):
@@ -128,6 +147,7 @@ class Store:
             db.execute("UPDATE entries SET " + ",".join(f"{k}=?" for k in fields) + " WHERE job=? AND path=?", (*fields.values(), job_id, path))
 
     def insert_entry(self, db, job_id, meta, settings=None):
+        validate_resource(meta)
         if settings is not None and excluded(meta["path"], settings):
             return
         if meta["type"] == "file" and settings is not None and not selected_type(meta, settings):

@@ -14,7 +14,7 @@ from pathlib import Path
 import requests
 from PIL import Image
 
-from .api import APIError, Deadline, NetworkError, SIZES, Suspended, attempt_count, retry_delay
+from .api import APIError, Deadline, NetworkError, PREVIEW_MAX_BYTES, SIZES, Suspended, attempt_count, retry_delay, validate_resource
 from .import_state import find_import, inherit, save_import
 from .file_types import FILE_TYPES, file_type, preview_type, selected_type
 from .estimation import RemainingTime
@@ -48,12 +48,12 @@ def file_hash(filename, checkpoint=lambda: None):
 def safe_error(exc):
     if isinstance(exc, (APIError, PathError, Suspended)):
         return str(exc)
+    if isinstance(exc, requests.RequestException):
+        return "Сетевая ошибка или таймаут"
     if isinstance(exc, OSError):
         if exc.errno == 28 or getattr(exc, "winerror", None) == 112:
             return "Недостаточно места на диске"
         return f"Ошибка файловой системы (код {exc.errno or getattr(exc, 'winerror', 0)})"
-    if isinstance(exc, requests.RequestException):
-        return "Сетевая ошибка или таймаут"
     return "Ошибка проверки или обработки файла"
 
 
@@ -192,7 +192,16 @@ class Engine:
                 "paths": normalize_selection(paths, data.get("whole_disk", False)), "whole_disk": data.get("whole_disk", False),
                 "destination": destination, "operation": operation, **values}
 
+    def ensure_idle(self):
+        if any(thread.is_alive() for thread in self.threads.values()):
+            raise ValueError("Дождитесь завершения текущей операции или остановите её")
+
     def create(self, data):
+        with self.lock:
+            self.ensure_idle()
+            return self._create(data)
+
+    def _create(self, data):
         if self.shutting_down:
             raise ValueError("Приложение завершается")
         if not self.api.credentials.connected:
@@ -225,9 +234,23 @@ class Engine:
             db.execute("INSERT INTO jobs(id,settings,root,service,phase,started) VALUES(?,?,?,?,?,?)", (job_id, json.dumps(settings, ensure_ascii=False), str(root), service, "new", now()))
             db.execute("INSERT INTO names(job,identity,local,folded) VALUES(?,?,?,?)", (job_id, "@service", service, service.casefold()))
             db.execute("UPDATE jobs SET generation=? WHERE id=?", (generation, job_id))
-        if previous:
-            inherit(self.store, job_id, previous)
-        self.launch(job_id, "scan")
+        try:
+            if previous:
+                inherit(self.store, job_id, previous)
+            self.launch(job_id, "scan")
+        except Exception:
+            with self.store.db() as db:
+                for table in ("entries", "names", "artifacts", "partials", "partial_ownership", "baseline", "changes", "verification_cache", "scan_errors", "journal_events"):
+                    db.execute("DELETE FROM " + table + " WHERE job=?", (job_id,))
+                db.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+            self.controls.pop(job_id, None)
+            self.threads.pop(job_id, None)
+            if settings["operation"] == "new":
+                try:
+                    os.rmdir(native(root))
+                except OSError:
+                    pass
+            raise
         return job_id
 
     def launch(self, job_id, operation="download", paths=None):
@@ -241,6 +264,8 @@ class Engine:
             control = Control()
             control.journal = Journal(self, job_id, self.journal_interval)
             job = self.store.job(job_id)
+            if job["settings"].get("_invalid"):
+                raise ValueError("Настройки задания повреждены. Создайте дозагрузку в прежнюю папку.")
             control.adaptive = None
             control.rate_limiter = rate_limit.RateLimiter(job["settings"].get("speed_limit_mib", 0), control.active_clock)
             control.space_check = lambda: self.check_space(job_id, control)
@@ -252,8 +277,14 @@ class Engine:
             thread.start()
 
     def action(self, job_id, action, limits=None):
-        job = self.store.job(job_id)
         with self.lock:
+            job = self.store.job(job_id)
+            if job["settings"].get("_invalid") and action not in ("stop",):
+                raise ValueError("Настройки задания повреждены. Создайте дозагрузку в прежнюю папку.")
+            if action in ("start", "resume", "retry", "retry_selected", "pack"):
+                own = self.threads.get(job_id)
+                if not (action == "resume" and own and own.is_alive() and self.controls[job_id].paused):
+                    self.ensure_idle()
             live = self.threads.get(job_id)
             control = self.controls.get(job_id)
             if action == "pause":
@@ -298,6 +329,15 @@ class Engine:
             if action in ("start", "resume", "retry", "retry_selected"):
                 if live and live.is_alive():
                     raise ValueError("Операция ещё выполняется")
+                if action == "retry_selected":
+                    paths = (limits or {}).get("paths")
+                    if not isinstance(paths, list) or not paths or len(paths) > 1000 or any(not isinstance(p, str) for p in paths):
+                        raise ValueError("Выберите от 1 до 1000 файлов для повтора")
+                    paths = sorted(set(remote_path(path) for path in paths))
+                    with self.store.db() as db:
+                        found = db.execute("SELECT COUNT(*) FROM entries WHERE job=? AND kind='file' AND path IN (" + ",".join("?" for _ in paths) + ")", (job_id, *paths)).fetchone()[0]
+                    if found != len(paths):
+                        raise ValueError("Выбранный файл не принадлежит заданию")
                 if limits:
                     keys = ("workers", "attempts", "timeout", "create_zip", "auto_pause", "max_disk_percent", "adaptive_workers", "resume_parts", "speed_limit_mib")
                     validated = self.validate_settings({**job["settings"], **{k: limits[k] for k in keys if k in limits}})
@@ -535,10 +575,14 @@ class Engine:
                 if not isinstance(embedded, dict) or not isinstance(embedded.get("items"), list):
                     raise APIError("API не вернул содержимое папки")
                 items = embedded["items"]
-                if not items and offset < embedded.get("total", offset):
+                total = embedded.get("total")
+                if total is not None and (isinstance(total, bool) or not isinstance(total, int) or total < 0):
+                    raise APIError("API вернул некорректное число объектов папки")
+                if not items and total is not None and offset < total:
                     raise APIError("Пустая страница до окончания списка API")
                 with self.store.db() as db:
                     for item in items:
+                        validate_resource(item)
                         child = remote_path(item.get("path", ""))
                         if parent_path(child) != path or item.get("type") not in ("file", "dir"):
                             raise APIError("API вернул недопустимый дочерний путь")
@@ -562,7 +606,7 @@ class Engine:
         control.check()
         self.phase(job_id, control, "preparing")
         control.progress(settings["paths"][0], 0, None, "Сравнение обходов", unit="objects")
-        compare(self.store, job_id)
+        compare(self.store, job_id, control.check)
 
     def allocate(self, job_id, identity, proposed):
         with self.store.db() as db:
@@ -724,6 +768,11 @@ class Engine:
         with self.store.db() as db:
             db.execute("INSERT OR REPLACE INTO verification_cache VALUES(?,?,?)", (job["id"], relative, signature))
 
+    def partials_digest(self, filename, size, control):
+        from .partials import digest_prefix
+        sha, md5 = digest_prefix(filename, size, control.check)
+        return sha.hexdigest(), md5.hexdigest()
+
     def reusable(self, job, entry, kind, meta, control):
         with self.store.db() as db:
             artifact = db.execute("SELECT * FROM artifacts WHERE job=? AND path=? AND type=?", (job["id"], entry["path"], kind)).fetchone()
@@ -748,7 +797,7 @@ class Engine:
         artifact = dict(artifact)
         try:
             filename = safe_join(job["root"], artifact["local"])
-            valid = artifact["fingerprint"] == fingerprint(meta) and (kind != "preview" or artifact["preview_size"] == job["settings"]["preview_size"])
+            valid = artifact["fingerprint"] == fingerprint(meta) and (kind != "preview" or artifact["preview_size"] == job["settings"]["preview_size"] and artifact["size"] <= PREVIEW_MAX_BYTES)
             if kind == "original" and meta.get("sha256"):
                 valid = valid and artifact["sha256"].lower() == meta["sha256"].lower()
             valid = valid and os.path.isfile(filename) and os.path.getsize(filename) == artifact["size"]
@@ -759,13 +808,26 @@ class Engine:
                 with self.store.db() as db:
                     cached_row = db.execute("SELECT signature FROM verification_cache WHERE job=? AND local=?", (job["id"], artifact["local"])).fetchone()
                 cached = signature[-1] is not None and cached_row is not None and cached_row[0] == encoded
-                valid = cached or file_hash(filename, control.check) == artifact["sha256"]
+                if not cached and kind == "original" and meta.get("md5") and not meta.get("sha256"):
+                    sha, md5 = self.partials_digest(filename, artifact["size"], control)
+                    valid = sha == artifact["sha256"] and md5.lower() == meta["md5"].lower()
+                else:
+                    valid = cached or file_hash(filename, control.check) == artifact["sha256"]
+                if valid and not cached and kind == "preview":
+                    with Image.open(filename) as image:
+                        if image.width * image.height > 16_000_000:
+                            valid = False
+                        else:
+                            image.verify()
+                    if valid:
+                        with Image.open(filename) as image:
+                            image.load()
                 after = os.stat(filename)
                 valid = valid and signature == file_signature(filename, artifact["sha256"])
                 if valid and not cached and signature[-1] is not None:
                     with self.store.db() as db:
                         db.execute("INSERT OR REPLACE INTO verification_cache VALUES(?,?,?)", (job["id"], artifact["local"], encoded))
-        except OSError:
+        except (OSError, ValueError):
             valid = False
         if valid:
             return True
@@ -789,6 +851,7 @@ class Engine:
             self.store.update_entry(job_id, path, error="", original_attempts=0, preview_attempts=0, original_status="not_requested", preview_status="not_requested", fallback=0)
             control.progress(path, 0, None, "Проверка метаданных")
             meta = self.api.metadata(path, job["settings"], control.check, limit=1)
+            validate_resource(meta)
             if meta["type"] != "file":
                 raise APIError("Исходный файл теперь является папкой")
             with self.store.db() as db:
@@ -832,7 +895,7 @@ class Engine:
                 except Exception as exc:
                     outcome = "unavailable" if isinstance(exc, APIError) and exc.status == 404 and kind == "preview" else "failed"
                     errors.append(("Оригинал: " if kind == "original" else "Превью: ") + safe_error(exc))
-                    if isinstance(exc, (OSError, PathError)):
+                    if isinstance(exc, PathError) or isinstance(exc, OSError) and not isinstance(exc, requests.RequestException):
                         other_errors.append(safe_error(exc))
                     control.event(kind, ("Оригинал: " if kind == "original" else "Превью: ") + safe_error(exc), path, "warning")
                 if kind == "original":
@@ -885,6 +948,9 @@ class Engine:
             control.network.wait(control.check)
             response = session = None
             pending_bytes = 0
+            if delay:
+                control.progress(entry["path"], 0, meta.get("size") if kind == "original" else None, f"Ожидание перед попыткой {attempt + 1}/{tries}")
+                self.api.wait(delay, control.check)
             row, temp, sha, md5 = self.partials.prepare(job, entry["path"], kind, stamp, control.check)
             size = offset = row["size"]
             etag, total = row["etag"], row["total"]
@@ -905,9 +971,6 @@ class Engine:
                     self.store.update_entry(job["id"], entry["path"], **{kind + "_attempts": attempt + 1})
                     label = "Оригинал" if kind == "original" else "Превью"
                     control.event(kind, f"{label}: попытка {attempt + 1}/{tries}", entry["path"])
-                    if delay:
-                        control.progress(entry["path"], size, total, f"Ожидание перед попыткой {attempt + 1}/{tries}")
-                        self.api.wait(delay, deadline.check)
                     complete_part = bool(kind == "original" and size and meta.get("size") == size and total in (None, size) and (meta.get("sha256") or meta.get("md5")))
                     if not complete_part:
                         media_settings = {**settings, "_single_attempt": True, "_deadline": deadline}
@@ -960,6 +1023,9 @@ class Engine:
                                     raise Suspended("Диск отключён")
                                 if not chunk:
                                     continue
+                                if kind == "preview" and size + len(chunk) > PREVIEW_MAX_BYTES:
+                                    keep = False
+                                    raise APIError("Превью превышает допустимый объём")
                                 with deadline.hold():
                                     control.rate_limiter.consume(len(chunk), control.check)
                                 stream.write(chunk)
@@ -1076,7 +1142,7 @@ class Engine:
             if control.network.recover(error, connected_check):
                 delay = 0
                 continue
-            if isinstance(error, OSError) or isinstance(error, APIError) and error.status == 404 and kind == "preview" or attempt == tries - 1:
+            if isinstance(error, OSError) and not isinstance(error, requests.RequestException) or isinstance(error, APIError) and error.status == 404 and kind == "preview" or attempt == tries - 1:
                 raise error
             delay = error.retry_after if isinstance(error, APIError) and error.retry_after is not None else retry_delay(None, attempt)
             attempt += 1
@@ -1087,10 +1153,14 @@ class Engine:
         final_phase = "stopped" if manual and (not job["scan_complete"] or summary["cancelled"] or summary["processed"] < summary["files"] or job["phase"] in ("stopped", "interrupted", "failed")) else ("completed_with_errors" if summary["errors"] or summary["scan_errors"] else "completed")
         if control.selected_paths and (not job["scan_complete"] or summary["cancelled"] or summary["processed"] < summary["files"]):
             final_phase = "stopped"
-        self.store.update_job(job_id, phase=final_phase, ended=job["ended"] or now())
+        self.store.update_job(job_id, ended=job["ended"] or now())
+        self.phase(job_id, control, "preparing")
+        control.progress(job["settings"]["paths"][0], 0, None, "Создание отчётов", unit="objects")
         control.check()
-        reports = write_reports(self.store, job_id)
-        reports.append(write_changes(self.store, job_id))
+        reports = write_reports(self.store, job_id, control.check, final_phase=final_phase)
+        reports.append(write_changes(self.store, job_id, control.check))
+        with control.lock:
+            control.active.clear()
         if not manual and not job["settings"].get("create_zip", True):
             self.store.update_job(job_id, phase=final_phase, generation=job["generation"] + 1)
             control.event("archive", "Файлы и отчёты сохранены; создание ZIP выключено", level="success")

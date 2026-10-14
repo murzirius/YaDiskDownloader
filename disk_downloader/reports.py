@@ -40,9 +40,11 @@ def excel_cell(value):
     return "'" + value if value.startswith(("=", "+", "-", "@", "\t", "\r", "\n")) else value
 
 
-def write_reports(store, job_id):
+def write_reports(store, job_id, checkpoint=lambda: None, final_phase=None):
     job = store.job(job_id)
     summary = context(store, job_id)
+    if final_phase:
+        summary["phase"] = final_phase
     generation = job["generation"] + 1
     fields = ["record_type", "source_path", "local_path", "status", "error", "original_attempt", "preview_attempt", "fallback_to_preview", "results", "original_attempts", "preview_attempts"]
     paths = []
@@ -56,6 +58,7 @@ def write_reports(store, job_id):
                     out.write('{"summary":' + json.dumps(summary, ensure_ascii=False) + ',"entries":[')
                     first = True
                     for row in records(store, job_id):
+                        checkpoint()
                         if not first:
                             out.write(",")
                         out.write(json.dumps(row, ensure_ascii=False))
@@ -66,17 +69,20 @@ def write_reports(store, job_id):
                     writer.writerow(["summary", *fields])
                     writer.writerow([excel_cell(json.dumps(summary, ensure_ascii=False)), "summary", *("" for _ in fields[1:])])
                     for row in records(store, job_id):
+                        checkpoint()
                         writer.writerow(["", *[excel_cell(json.dumps(row[k], ensure_ascii=False) if isinstance(row[k], (list, dict)) else row[k]) for k in fields]])
                 elif fmt == "txt":
                     out.write("Локальная копия Яндекс.Диска — отчёт\n\nНастройки и итог:\n")
                     out.write(json.dumps(summary, ensure_ascii=False, indent=2) + "\n\nРесурсы:\n")
                     for row in records(store, job_id):
+                        checkpoint()
                         out.write(json.dumps(row, ensure_ascii=False, indent=2) + "\n")
                 elif fmt == "html":
                     out.write('<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Отчёт Яндекс.Диск</title><style>body{font:14px system-ui;margin:24px;background:#17191d;color:#e5e7eb}table{border-collapse:collapse;width:100%}th,td{border:1px solid #41454d;padding:8px;text-align:left;vertical-align:top;overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere}th{background:#272b33}</style><h1>Отчёт Яндекс.Диск</h1><p>100% обработки может включать ошибки. Превью не является оригиналом.</p><pre>')
                     out.write(html.escape(json.dumps(summary, ensure_ascii=False, indent=2)))
                     out.write("</pre><table><thead><tr>" + "".join("<th>" + html.escape(k) + "</th>" for k in fields) + "</tr></thead><tbody>")
                     for row in records(store, job_id):
+                        checkpoint()
                         out.write("<tr>" + "".join("<td>" + html.escape(json.dumps(row[k], ensure_ascii=False) if isinstance(row[k], (list, dict)) else str(row[k] if row[k] is not None else "")) + "</td>" for k in fields) + "</tr>")
                     out.write("</tbody></table></html>")
             publish(temp, final)
