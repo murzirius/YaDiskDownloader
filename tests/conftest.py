@@ -3,6 +3,7 @@ import hashlib
 import io
 import threading
 import time
+import shutil
 
 import pytest
 from PIL import Image
@@ -11,6 +12,14 @@ from disk_downloader.api import APIError, Credentials, DiskAPI
 from disk_downloader.engine import Engine
 from disk_downloader.paths import parent_path
 from disk_downloader.store import Store
+
+
+@pytest.fixture(autouse=True)
+def simulated_free_space(monkeypatch):
+    original = shutil.disk_usage
+    sample = original(".")
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: type(sample)(sample.total, sample.total // 2, sample.total - sample.total // 2))
+    monkeypatch.setattr("disk_downloader.updates.Updates.start", lambda self, force=False: None)
 
 
 def image_bytes():

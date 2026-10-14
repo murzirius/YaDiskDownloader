@@ -197,7 +197,7 @@ class DiskAPI:
             time.sleep(min(0.2, max(0, until - time.monotonic())))
         checkpoint()
 
-    def _open(self, url, params, auth, timeout, checkpoint, epoch):
+    def _open(self, url, params, auth, timeout, checkpoint, epoch, extra_headers=None):
         self.credentials.check(epoch)
         checkpoint()
         with self.rate_lock:
@@ -214,6 +214,8 @@ class DiskAPI:
             session.mount("https://", DeadlineAdapter(deadline))
             session.mount("http://", DeadlineAdapter(deadline))
         headers = {"Accept-Encoding": "identity", "User-Agent": "DiskLocalDownloader/1.0"}
+        if extra_headers:
+            headers.update({key: value for key, value in extra_headers.items() if key in ("Range", "If-Range")})
         if auth:
             headers["Authorization"] = "OAuth " + token
         token = None
@@ -352,7 +354,14 @@ class DiskAPI:
                 raise APIError("API вернул недопустимый адрес загрузки")
             host = urlsplit(url).hostname
             auth = preview and (host == "cloud-api.yandex.net" or host in ("downloader.disk.yandex.ru", "downloader.disk.yandex.net", "downloader.disk.yandex.com"))
-            response, session = self._open(url, None, auth, settings.get("timeout", 30), check, epoch)
+            offset = settings.get("_range_offset", 0)
+            extra = {"Range": f"bytes={offset}-"} if offset else {}
+            if offset and settings.get("_range_etag"):
+                extra["If-Range"] = settings["_range_etag"]
+            if extra:
+                response, session = self._open(url, None, auth, settings.get("timeout", 30), check, epoch, extra_headers=extra)
+            else:
+                response, session = self._open(url, None, auth, settings.get("timeout", 30), check, epoch)
             if response.status_code in (301, 302, 303, 307, 308):
                 new_url = urljoin(url, response.headers.get("Location", ""))
                 self.close(response, session)
@@ -360,7 +369,7 @@ class DiskAPI:
                     raise APIError("Некорректное перенаправление загрузки")
                 url = new_url
                 continue
-            if response.status_code != 200:
+            if response.status_code not in ((200, 206) if offset else (200,)):
                 try:
                     self.fail_response(response)
                 finally:

@@ -45,6 +45,14 @@ CREATE TABLE IF NOT EXISTS journal_events (
  category TEXT NOT NULL, level TEXT NOT NULL, message TEXT NOT NULL, path TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS journal_job ON journal_events(job,id);
+CREATE TABLE IF NOT EXISTS profiles (name TEXT PRIMARY KEY, settings TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS partials (
+ job TEXT NOT NULL, path TEXT NOT NULL, type TEXT NOT NULL, local TEXT NOT NULL,
+ fingerprint TEXT NOT NULL, size INTEGER NOT NULL DEFAULT 0, sha256 TEXT NOT NULL,
+ etag TEXT NOT NULL DEFAULT '', total INTEGER,
+ PRIMARY KEY(job,path,type), UNIQUE(job,local)
+);
 """
 
 
@@ -61,6 +69,8 @@ class Store:
                 if name not in columns:
                     db.execute(f"ALTER TABLE entries ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0")
             db.execute("CREATE INDEX IF NOT EXISTS queue_priority ON entries(job,kind,status,priority,path)")
+            if "pause_reason" not in {row[1] for row in db.execute("PRAGMA table_info(jobs)")}:
+                db.execute("ALTER TABLE jobs ADD COLUMN pause_reason TEXT NOT NULL DEFAULT ''")
             db.execute("DELETE FROM verification_cache")
             for row in db.execute("SELECT id,settings FROM jobs").fetchall():
                 settings = json.loads(row["settings"])
@@ -154,6 +164,6 @@ class Store:
                              "original_bytes": int(volume[0]), "original_unknown": unknown,
                              "preview_candidates": preview_count,
                              "conditional_preview_sizes": preview_count if mode == "fallback" else 0,
-                             "zip_basis_bytes": known,
-                             "extra_temporary_bytes": 2 * known, "is_estimate": True})
+                             "zip_basis_bytes": known if job["settings"].get("create_zip", True) else 0,
+                             "extra_temporary_bytes": (2 if job["settings"].get("create_zip", True) else 1) * known, "is_estimate": True})
         return job

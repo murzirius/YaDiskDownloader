@@ -6,7 +6,9 @@
   <meta name="csrf-token" content="{{ csrf }}">
   <title>Диск · Локальное скачивание</title>
   <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/features.css">
   <script src="/static/app.js" defer></script>
+  <script src="/static/features.js" defer></script>
 </head>
 <body>
 <header class="topbar">
@@ -19,6 +21,7 @@
   </form>
   <button id="disconnect" hidden>Отключить</button>
   <button id="open-help" class="quiet">Как начать</button>
+  <button id="open-service" class="quiet">Версия {{ version }}</button>
 </header>
 <div id="notice" class="notice" role="status" hidden></div>
 <main>
@@ -51,10 +54,16 @@
       <fieldset id="file-types"><legend>Типы для скачивания</legend><div class="type-options"><label><input type="checkbox" name="file-type" value="photos" checked> Фото</label><label><input type="checkbox" name="file-type" value="videos" checked> Видео</label><label><input type="checkbox" name="file-type" value="music" checked> Музыка</label><label><input type="checkbox" name="file-type" value="files" checked> Другие файлы</label></div><p class="hint">Превью — для фото и видео. Музыка и другие файлы — оригиналы.</p></fieldset>
       <fieldset><legend>Отчёты</legend><label><input type="checkbox" name="report" value="csv" checked> CSV</label><label><input type="checkbox" name="report" value="json" checked> JSON</label><label><input type="checkbox" name="report" value="html"> HTML</label><label><input type="checkbox" name="report" value="txt"> TXT</label></fieldset>
       <details class="advanced-settings"><summary>Дополнительные настройки</summary>
+        <label class="whole"><input id="adaptive-workers" type="checkbox" checked> Умное количество потоков</label>
+        <label class="whole"><input id="resume-parts" type="checkbox" checked> Сохранять части для продолжения</label>
+        <label class="whole"><input id="auto-pause" type="checkbox" checked> Автопауза при заполнении диска</label>
+        <label class="field">Порог заполнения диска, %<input id="max-disk-percent" type="number" min="1" max="99.9" step="0.1" value="95"></label>
         <label class="field">Размер превью<select id="preview-size"><option value="XXXL">Максимальный · 1280 px</option><option value="XXL">1024 px</option><option value="XL">800 px</option><option value="L">500 px</option><option value="M">300 px</option><option value="S">150 px</option></select></label>
         <div class="numeric-settings"><label>Потоки<input id="workers" type="number" min="1" max="8" value="8"></label><label>Попытки всего<input id="retries" type="number" min="1" max="9" value="1"></label><label>Лимит попытки, с<input id="timeout" type="number" min="5" max="180" value="20"></label></div>
         <p class="hint">Превью без обрезки. Файлы, отчёты и ZIP — в папке импорта.</p>
       </details>
+      <label class="whole"><input id="create-zip" type="checkbox" checked> Создать ZIP после загрузки</label>
+      <details class="profile-settings"><summary>Профили настроек</summary><select id="profile-list" aria-label="Профиль настроек"><option value="">Выберите профиль</option></select><div class="actions"><button id="apply-profile">Применить</button><button id="delete-profile">Удалить</button></div><input id="profile-name" aria-label="Название профиля" placeholder="Название профиля" maxlength="80"><button id="save-profile">Сохранить профиль</button></details>
       <button id="estimate" class="primary wide">Оценить выбранное</button>
     </section>
     <section id="job-panel" class="job-panel" role="tabpanel" aria-labelledby="job-tab" hidden>
@@ -80,11 +89,13 @@
           <div id="journal-info" class="hint"></div>
         </details>
         <details id="errors-detail"><summary id="errors-title">Ошибки и замены оригиналов</summary><div id="errors-list"></div><div class="actions"><button id="errors-prev">Назад</button><button id="errors-next">Ещё</button></div></details>
+        <button id="retry-selected" hidden>Повторить выбранные</button>
       </div>
     </section>
   </aside>
 </main>
 {% include 'help.html' %}
+<dialog id="service-dialog"><div class="help-header"><h2>Обновления и диагностика</h2><button id="close-service" aria-label="Закрыть">×</button></div><label class="field">Репозиторий GitHub<input id="update-repository" value="murzirius/YaDiskDownloader" spellcheck="false"></label><label class="whole"><input id="automatic-updates" type="checkbox" checked> Проверять обновления при запуске</label><button id="check-updates">Сохранить и проверить</button><p id="update-status" class="hint"></p><a id="update-link" class="oauth-link" target="_blank" rel="noopener noreferrer" hidden>Открыть релиз</a><hr><h3>Диагностика выбранного задания</h3><p class="hint">Без токенов, имён и путей файлов, содержимого файлов и базы данных. Последние 2000 событий и до 1000 ошибок.</p><button id="preview-diagnostics">Посмотреть состав</button><div id="diagnostics-preview" hidden><pre id="diagnostics-content"></pre><button id="save-diagnostics">Сохранить ZIP диагностики</button></div><p id="diagnostics-status" class="hint"></p></dialog>
 <footer>Только чтение Яндекс.Диска · Сервер на 127.0.0.1 · Превью сохраняются с суффиксом .preview и не заменяют оригиналы</footer>
 </body>
 </html>

@@ -21,6 +21,8 @@ from .estimation import RemainingTime
 from .paths import PathError, component, digest, native, normalize_selection, parent_path, publish, remote_path, reserve_output, safe_join, suffix, temporary_file
 from .reports import write_reports
 from .journal import Journal, PHASES
+from .adaptive import AdaptiveWorkers
+from .partials import Partials, strong_etag
 
 
 def now():
@@ -68,12 +70,20 @@ class Control:
         self.temporary_sizes = {}
         self.remaining_time = RemainingTime(self.active_clock)
         self.journal = None
+        self.space_check = None
+        self.space_lock = threading.Lock()
+        self.next_space_check = 0
+        self.pause_reason = ""
+        self.adaptive = None
+        self.selected_paths = None
 
     def event(self, group, message, path="", level="info"):
         if self.journal:
             self.journal.event(group, message, path, level)
 
     def check(self):
+        if self.space_check and not self.paused:
+            self.space_check()
         with self.condition:
             while self.paused and not self.stopped:
                 self.condition.wait(0.2)
@@ -122,6 +132,7 @@ class Engine:
         self.controls = {}
         self.threads = {}
         self.journal_interval = 300
+        self.partials = Partials(store)
 
     def validate_settings(self, data):
         if "attempts" not in data and "retries" in data and (isinstance(data["retries"], bool) or not isinstance(data["retries"], int) or not 0 <= data["retries"] <= 8):
@@ -155,6 +166,15 @@ class Engine:
         if operation not in ("new", "missing"):
             raise ValueError("Некорректный способ загрузки")
         values["retries"] = values["attempts"] - 1
+        for name, default in (("create_zip", True), ("auto_pause", True), ("resume_parts", True), ("adaptive_workers", True)):
+            value = data.get(name, default)
+            if not isinstance(value, bool):
+                raise ValueError("Некорректная настройка " + name)
+            values[name] = value
+        fullness = data.get("max_disk_percent", 95)
+        if isinstance(fullness, bool) or not isinstance(fullness, (int, float)) or not 1 <= fullness <= 99.9:
+            raise ValueError("Порог заполнения диска: от 1 до 99,9%")
+        values["max_disk_percent"] = fullness
         return {"mode": mode, "preview_size": size, "reports": sorted(set(reports)), "file_types": sorted(set(file_types)),
                 "paths": normalize_selection(paths, data.get("whole_disk", False)), "whole_disk": data.get("whole_disk", False),
                 "destination": destination, "operation": operation, **values}
@@ -193,7 +213,7 @@ class Engine:
         self.launch(job_id, "scan")
         return job_id
 
-    def launch(self, job_id, operation="download"):
+    def launch(self, job_id, operation="download", paths=None):
         with self.lock:
             if any(t.is_alive() for t in self.threads.values()):
                 raise ValueError("Дождитесь завершения текущей операции или остановите её")
@@ -201,6 +221,10 @@ class Engine:
                 raise ValueError("Подключите Диск перед продолжением")
             control = Control()
             control.journal = Journal(self, job_id, self.journal_interval)
+            job = self.store.job(job_id)
+            control.adaptive = AdaptiveWorkers(job["settings"]["workers"], job["settings"].get("adaptive_workers", True), control.active_clock)
+            control.space_check = lambda: self.check_space(job_id, control)
+            control.selected_paths = tuple(paths) if paths else None
             self.controls[job_id] = control
             thread = threading.Thread(target=self.run, args=(job_id, operation, control), daemon=True)
             self.threads[job_id] = thread
@@ -215,7 +239,8 @@ class Engine:
                 if not live or not live.is_alive() or job["phase"] not in ("scanning", "downloading", "packing"):
                     raise ValueError("Нет активной операции для паузы")
                 control.pause()
-                self.store.update_job(job_id, phase="paused")
+                control.pause_reason = ""
+                self.store.update_job(job_id, phase="paused", pause_reason="")
                 control.event("system", "Задание поставлено на паузу")
                 return
             if action == "stop":
@@ -236,19 +261,39 @@ class Engine:
                     raise ValueError("Для изменения ограничений остановите задание и продолжите с новыми параметрами")
                 if not self.api.credentials.connected and not job["scan_complete"]:
                     raise ValueError("Подключите Диск")
-                self.store.update_job(job_id, phase=getattr(control, "phase", "downloading"))
+                if limits:
+                    keys = ("create_zip", "auto_pause", "max_disk_percent", "adaptive_workers", "resume_parts")
+                    validated = self.validate_settings(job["settings"] | {key: limits[key] for key in keys if key in limits})
+                    job["settings"].update({key: validated[key] for key in keys})
+                    self.store.update_job(job_id, settings=json.dumps(job["settings"], ensure_ascii=False))
+                    control.adaptive.configure(validated["adaptive_workers"])
+                if control.pause_reason and self.check_space(job_id, control, force=True):
+                    raise ValueError(control.pause_reason)
+                self.store.update_job(job_id, phase=getattr(control, "phase", "downloading"), pause_reason="")
+                control.pause_reason = ""
                 control.resume()
                 control.event("system", "Работа продолжена после паузы")
                 return
-            if action in ("start", "resume", "retry"):
+            if action in ("start", "resume", "retry", "retry_selected"):
                 if live and live.is_alive():
                     raise ValueError("Операция ещё выполняется")
                 if limits:
-                    validated = self.validate_settings({**job["settings"], **{k: limits[k] for k in ("workers", "attempts", "timeout") if k in limits}})
-                    job["settings"].update({k: validated[k] for k in ("workers", "attempts", "retries", "timeout")})
+                    keys = ("workers", "attempts", "timeout", "create_zip", "auto_pause", "max_disk_percent", "adaptive_workers", "resume_parts")
+                    validated = self.validate_settings({**job["settings"], **{k: limits[k] for k in keys if k in limits}})
+                    job["settings"].update({k: validated[k] for k in (*keys, "retries")})
                     self.store.update_job(job_id, settings=json.dumps(job["settings"], ensure_ascii=False))
                 with self.store.db() as db:
-                    if action == "retry":
+                    if action == "retry_selected":
+                        paths = (limits or {}).get("paths")
+                        if not isinstance(paths, list) or not paths or len(paths) > 1000 or any(not isinstance(p, str) for p in paths):
+                            raise ValueError("Выберите от 1 до 1000 файлов для повтора")
+                        paths = sorted(set(remote_path(path) for path in paths))
+                        placeholders = ",".join("?" for _ in paths)
+                        found = db.execute("SELECT COUNT(*) FROM entries WHERE job=? AND kind='file' AND path IN (" + placeholders + ")", (job_id, *paths)).fetchone()[0]
+                        if found != len(paths):
+                            raise ValueError("Выбранный файл не принадлежит заданию")
+                        db.execute("UPDATE entries SET status='pending',error='' WHERE job=? AND kind='file' AND path IN (" + placeholders + ")", (job_id, *paths))
+                    elif action == "retry":
                         db.execute("UPDATE entries SET status='pending', error='' WHERE job=? AND kind='file' AND (status IN ('error','partial','no_preview','cancelled') OR fallback=1)", (job_id,))
                         db.execute("UPDATE entries SET scanned=0 WHERE job=? AND kind='dir' AND path IN (SELECT path FROM scan_errors WHERE job=?)", (job_id, job_id))
                         has_scan_errors = db.execute("SELECT COUNT(*) FROM scan_errors WHERE job=?", (job_id,)).fetchone()[0]
@@ -256,7 +301,7 @@ class Engine:
                             db.execute("UPDATE jobs SET scan_complete=0 WHERE id=?", (job_id,))
                     else:
                         db.execute("UPDATE entries SET status='pending' WHERE job=? AND kind='file'", (job_id,))
-                self.launch(job_id, "download")
+                self.launch(job_id, "download", paths=paths if action == "retry_selected" else None)
                 return
             if action == "pack":
                 self.launch(job_id, "pack")
@@ -277,6 +322,9 @@ class Engine:
         status["live"] = live
         status["journal_saved"] = control.journal.saved if control and control.journal else None
         status["journal_error"] = control.journal.error if control and control.journal else ""
+        status["pause_reason"] = control.pause_reason if control else status.get("pause_reason", "")
+        status["workers_status"] = control.adaptive.snapshot() if control and control.adaptive else {"current": status["settings"]["workers"], "maximum": status["settings"]["workers"], "enabled": status["settings"].get("adaptive_workers", True), "reason": ""}
+        status["partial_bytes"] = 0
         service_bytes = 0
         counted_outputs = set()
         for row in self.store.rows("SELECT local FROM names WHERE job=? AND identity LIKE '@output:%'", (job_id,)):
@@ -301,6 +349,16 @@ class Engine:
                 except OSError:
                     actual = 0
                 service_bytes += max(actual, written)
+        active_temporary = {name for name, written in temporary} if control else set()
+        for part in self.store.rows("SELECT local FROM partials WHERE job=?", (job_id,)):
+            try:
+                filename = safe_join(status["root"], part["local"])
+                size = os.path.getsize(filename)
+                status["partial_bytes"] += size
+                if filename not in active_temporary:
+                    service_bytes += size
+            except (OSError, PathError):
+                pass
         status["local_bytes"] = status["saved_bytes"] + service_bytes
         status["eta_seconds"] = None
         status["eta_phase"] = None
@@ -341,9 +399,30 @@ class Engine:
         self.store.update_job(job_id, phase="paused" if control.paused else phase)
         control.event("archive" if phase == "packing" else "system", PHASES.get(phase, phase))
 
+    def check_space(self, job_id, control, force=False):
+        with control.space_lock:
+            if not force and time.monotonic() < control.next_space_check:
+                return bool(control.pause_reason)
+            control.next_space_check = time.monotonic() + 0.5
+            job = self.store.job(job_id)
+            if not job["settings"].get("auto_pause", True):
+                return False
+            usage = shutil.disk_usage(job["root"])
+            occupied = (usage.total - usage.free) * 100 / max(1, usage.total)
+            threshold = job["settings"].get("max_disk_percent", 95)
+            if occupied >= threshold or usage.free < 8 * 1024 * 1024:
+                reason = f"Автопауза: диск заполнен на {occupied:.1f}%, порог {threshold:g}%. Освободите место и нажмите «Продолжить»."
+                if not control.pause_reason:
+                    control.pause_reason = reason
+                    control.pause()
+                    self.store.update_job(job_id, phase="paused", pause_reason=reason)
+                    control.event("system", reason, level="warning")
+                return True
+            return False
+
     def run(self, job_id, operation, control):
         try:
-            self.store.update_job(job_id, error="", ended=None)
+            self.store.update_job(job_id, error="", ended=None, pause_reason="")
             control.journal.start(operation)
             if operation == "pack":
                 self.prepare_paths(job_id)
@@ -351,7 +430,7 @@ class Engine:
                 self.store.update_job(job_id, ended=now(), phase="stopped" if not job["scan_complete"] else job["phase"])
                 self.pack(job_id, control, manual=True)
                 return
-            if not self.store.job(job_id)["scan_complete"]:
+            if not self.store.job(job_id)["scan_complete"] and not control.selected_paths:
                 self.phase(job_id, control, "scanning")
                 self.scan(job_id, control)
             self.prepare_paths(job_id)
@@ -490,12 +569,16 @@ class Engine:
                 if stage:
                     self.prioritize(job_id, control)
                 condition = "" if stage else " AND NOT EXISTS(SELECT 1 FROM artifacts a WHERE a.job=entries.job AND a.path=entries.path)"
+                parameters = (job_id,)
+                if control.selected_paths:
+                    condition += " AND path IN (" + ",".join("?" for _ in control.selected_paths) + ")"
+                    parameters += control.selected_paths
                 active = set()
                 while True:
                     control.check()
-                    while len(active) < workers:
+                    while len(active) < (control.adaptive.limit() if control.adaptive else workers):
                         with self.store.db() as db:
-                            entry = db.execute("SELECT * FROM entries WHERE job=? AND kind='file' AND status='pending'" + condition + " ORDER BY priority,path LIMIT 1", (job_id,)).fetchone()
+                            entry = db.execute("SELECT * FROM entries WHERE job=? AND kind='file' AND status='pending'" + condition + " ORDER BY priority,path LIMIT 1", parameters).fetchone()
                             if entry:
                                 db.execute("UPDATE entries SET status='running' WHERE job=? AND path=?", (job_id, entry["path"]))
                         if not entry:
@@ -504,6 +587,8 @@ class Engine:
                     if not active:
                         break
                     done, active = wait(active, timeout=0.2, return_when=FIRST_COMPLETED)
+                    if control.adaptive:
+                        control.adaptive.measure(control.transferred, len(active) + len(done))
                     for future in done:
                         future.result()
 
@@ -646,6 +731,8 @@ class Engine:
             control.stop()
             raise
         except APIError as exc:
+            if control.adaptive:
+                control.adaptive.failure(exc.status)
             if exc.status == 401:
                 control.stop()
                 raise Suspended(str(exc))
@@ -661,77 +748,139 @@ class Engine:
                 control.active.pop(path, None)
 
     def transfer(self, job, entry, kind, meta, control):
+        import re
         settings = job["settings"]
         tries = attempt_count(settings)
         delay = 0
+        stamp = fingerprint(meta) + ":" + kind + (":" + settings["preview_size"] if kind == "preview" else "")
+        persistent = settings.get("resume_parts", True)
         for attempt in range(tries):
+            control.check()
             response = session = None
-            temp = None
             pending_bytes = 0
+            row, temp, sha, md5 = self.partials.prepare(job, entry["path"], kind, stamp, control.check)
+            size = offset = row["size"]
+            etag, total = row["etag"], row["total"]
+            can_resume = persistent and (kind == "original" and (meta.get("sha256") or meta.get("md5")) or bool(etag))
+            if size and not can_resume:
+                with open(temp, "wb"):
+                    pass
+                size = offset = 0
+                sha, md5 = hashlib.sha256(), hashlib.md5()
+            with control.lock:
+                control.temporary.add(temp)
+                control.temporary_sizes[temp] = size
+            keep = persistent and kind == "original"
             deadline = Deadline(settings["timeout"], control.check, control.active_clock, lambda: control.stopped or not self.api.credentials.connected)
             try:
                 with deadline:
                     deadline.check()
-                    temp = temporary_file(job["root"])
                     self.store.update_entry(job["id"], entry["path"], **{kind + "_attempts": attempt + 1})
-                    control.event(kind, f"{'Оригинал' if kind == 'original' else 'Превью'}: попытка {attempt + 1}/{tries}", entry["path"])
+                    label = "Оригинал" if kind == "original" else "Превью"
+                    control.event(kind, f"{label}: попытка {attempt + 1}/{tries}", entry["path"])
                     if delay:
-                        control.progress(entry["path"], 0, None, f"Ожидание перед попыткой {attempt + 1}/{tries}")
+                        control.progress(entry["path"], size, total, f"Ожидание перед попыткой {attempt + 1}/{tries}")
                         self.api.wait(delay, deadline.check)
-                    control.progress(entry["path"], 0, meta.get("size") if kind == "original" else None, f"{'Оригинал' if kind == 'original' else 'Превью'}: попытка {attempt + 1}")
-                    with control.lock:
-                        control.temporary.add(temp)
-                    media_settings = {**settings, "_single_attempt": True, "_deadline": deadline}
-                    if kind == "preview" and attempt == 0:
-                        media_settings["_preview_meta"] = meta
-                    response, session = self.api.media(entry["path"], kind, media_settings, deadline.check)
-                    raw_length = response.headers.get("Content-Length")
-                    expected = int(raw_length) if raw_length and raw_length.isdigit() else None
-                    size, sha, md5 = 0, hashlib.sha256(), hashlib.md5()
-                    pending_bytes, last_flush = 0, time.monotonic()
-                    with open(temp, "wb") as stream:
-                        for chunk in response.iter_content(256 * 1024):
-                            deadline.check()
-                            if not self.api.credentials.connected:
-                                raise Suspended("Диск отключён")
-                            if not chunk:
-                                continue
-                            stream.write(chunk)
-                            sha.update(chunk)
-                            md5.update(chunk)
-                            size += len(chunk)
-                            with control.lock:
-                                control.transferred += len(chunk)
-                                control.temporary_sizes[temp] = size
-                            pending_bytes += len(chunk)
-                            if pending_bytes >= 1024 * 1024 or time.monotonic() - last_flush >= 0.25:
-                                with self.store.db() as db:
-                                    db.execute("UPDATE jobs SET downloaded=downloaded+? WHERE id=?", (pending_bytes, job["id"]))
-                                pending_bytes, last_flush = 0, time.monotonic()
-                            control.progress(entry["path"], size, expected if kind == "preview" else meta.get("size") if meta.get("size") is not None else expected, "Загрузка " + ("оригинала" if kind == "original" else "превью"), kind=kind, source_size=meta.get("size"))
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                    deadline.check()
-                    if expected is not None and not response.headers.get("Content-Encoding") and size != expected:
-                        raise APIError("Получен неполный ответ загрузки")
+                    complete_part = bool(kind == "original" and size and meta.get("size") == size and total in (None, size) and (meta.get("sha256") or meta.get("md5")))
+                    if not complete_part:
+                        media_settings = {**settings, "_single_attempt": True, "_deadline": deadline}
+                        if offset:
+                            media_settings.update(_range_offset=offset, _range_etag=etag)
+                        if kind == "preview" and attempt == 0:
+                            media_settings["_preview_meta"] = meta
+                        control.progress(entry["path"], size, meta.get("size") if kind == "original" else total, f"{label}: попытка {attempt + 1}")
+                        response, session = self.api.media(entry["path"], kind, media_settings, deadline.check)
+                        raw_length = response.headers.get("Content-Length")
+                        expected = int(raw_length) if raw_length and raw_length.isdigit() else None
+                        new_etag = strong_etag(response.headers.get("ETag", ""))
+                        if response.headers.get("Content-Encoding", "identity").lower() not in ("", "identity"):
+                            keep = False
+                            raise APIError("Сжатый ответ нельзя безопасно продолжить")
+                        if response.status_code == 206:
+                            match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", response.headers.get("Content-Range", ""))
+                            if not offset or not match:
+                                keep = False
+                                raise APIError("Некорректный ответ продолжения файла")
+                            begin, finish, full = map(int, match.groups())
+                            if begin != offset or finish < begin or finish >= full or total is not None and full != total or kind == "original" and meta.get("size") is not None and full != meta["size"] or etag and new_etag != etag or expected is not None and expected != finish - begin + 1:
+                                keep = False
+                                raise APIError("Сервер вернул несовместимую часть файла")
+                            total = full
+                            control.event(kind, f"Продолжение с байта {offset}", entry["path"])
+                        elif response.status_code == 200:
+                            if offset:
+                                control.event(kind, "Сервер не подтвердил продолжение; загрузка начата заново", entry["path"], "warning")
+                            offset = size = 0
+                            sha, md5 = hashlib.sha256(), hashlib.md5()
+                            total = expected
+                        else:
+                            raise APIError(f"Ошибка загрузки HTTP {response.status_code}", response.status_code)
+                        if kind == "original" and meta.get("size") is not None and total is not None and total != meta["size"]:
+                            keep = False
+                            raise APIError("Размер ответа оригинала не совпадает с метаданными")
+                        etag = new_etag
+                        keep = persistent and (kind == "original" or bool(etag))
+                        last_flush = last_checkpoint = time.monotonic()
+                        checkpoint_size = size
+                        with open(temp, "r+b") as stream:
+                            stream.seek(offset)
+                            stream.truncate(offset)
+                            self.partials.save(job, entry["path"], kind, size, sha, etag, total)
+                            for chunk in response.iter_content(256 * 1024):
+                                deadline.check()
+                                if not self.api.credentials.connected:
+                                    raise Suspended("Диск отключён")
+                                if not chunk:
+                                    continue
+                                stream.write(chunk)
+                                sha.update(chunk)
+                                md5.update(chunk)
+                                size += len(chunk)
+                                with control.lock:
+                                    control.transferred += len(chunk)
+                                    control.temporary_sizes[temp] = size
+                                pending_bytes += len(chunk)
+                                current = time.monotonic()
+                                if pending_bytes >= 1024 * 1024 or current - last_flush >= 0.25:
+                                    with self.store.db() as db:
+                                        db.execute("UPDATE jobs SET downloaded=downloaded+? WHERE id=?", (pending_bytes, job["id"]))
+                                    pending_bytes, last_flush = 0, current
+                                if size - checkpoint_size >= 4 * 1024 * 1024 or current - last_checkpoint >= 1:
+                                    stream.flush()
+                                    os.fsync(stream.fileno())
+                                    self.partials.save(job, entry["path"], kind, size, sha, etag, total)
+                                    checkpoint_size, last_checkpoint = size, current
+                                control.progress(entry["path"], size, meta.get("size") if kind == "original" and meta.get("size") is not None else total, "Загрузка " + ("оригинала" if kind == "original" else "превью"), kind=kind, source_size=meta.get("size"))
+                            stream.flush()
+                            os.fsync(stream.fileno())
+                        self.partials.save(job, entry["path"], kind, size, sha, etag, total)
+                        deadline.check()
+                        if expected is not None and size - offset != expected or total is not None and size != total:
+                            raise APIError("Получен неполный ответ загрузки")
                     if kind == "original":
                         if meta.get("size") is not None and size != meta["size"]:
+                            keep = False
                             raise APIError("Размер оригинала не совпадает с метаданными")
                         if meta.get("sha256") and sha.hexdigest().lower() != meta["sha256"].lower():
+                            keep = False
                             raise APIError("SHA-256 оригинала не совпадает")
                         if meta.get("md5") and md5.hexdigest().lower() != meta["md5"].lower():
+                            keep = False
                             raise APIError("MD5 оригинала не совпадает")
                         proposed = entry["local"]
                     else:
+                        keep = False
                         with Image.open(temp) as image:
                             fmt = image.format
                             if image.width * image.height > 16_000_000:
+                                keep = False
                                 raise APIError("Превью превышает безопасный размер изображения")
                             image.verify()
                         with Image.open(temp) as image:
                             image.load()
                         extensions = {"JPEG": "jpg", "PNG": "png", "GIF": "gif", "WEBP": "webp", "BMP": "bmp", "TIFF": "tif", "AVIF": "avif"}
                         if fmt not in extensions:
+                            keep = False
                             raise APIError("Неизвестный формат изображения превью")
                         proposed = entry["local"] + ".preview." + extensions[fmt]
                     identity = entry["path"] if kind == "original" else entry["path"] + "@preview"
@@ -747,26 +896,44 @@ class Engine:
                         target = safe_join(job["root"], relative)
                     deadline.check()
                     publish(temp, target)
+                    self.partials.discard(job, entry["path"], kind, remove=False)
                     with self.store.db() as db:
                         db.execute("INSERT OR REPLACE INTO artifacts VALUES(?,?,?,?,?,?,?,?)", (job["id"], entry["path"], kind, relative, size, sha.hexdigest(), fingerprint(meta), settings["preview_size"] if kind == "preview" else None))
+                    if control.adaptive:
+                        control.adaptive.success()
                     return
             except Suspended:
                 raise
             except Exception as exc:
                 error = APIError(f"Превышен лимит попытки: {settings['timeout']} с") if deadline.expired.is_set() else exc
+                if control.adaptive and not isinstance(error, OSError):
+                    control.adaptive.failure(error.status if isinstance(error, APIError) else None)
                 control.event("errors", f"{'Оригинал' if kind == 'original' else 'Превью'} · попытка {attempt + 1}/{tries}: {safe_error(error)}", entry["path"], "warning" if attempt < tries - 1 else "error")
+                if isinstance(error, APIError) and error.status == 416:
+                    keep = False
             finally:
                 if response is not None:
                     self.api.close(response, session)
                 if pending_bytes:
                     with self.store.db() as db:
                         db.execute("UPDATE jobs SET downloaded=downloaded+? WHERE id=?", (pending_bytes, job["id"]))
-                if temp and os.path.exists(temp):
-                    os.unlink(temp)
+                if os.path.exists(temp):
+                    try:
+                        if keep and size:
+                            with open(temp, "r+b") as saved:
+                                saved.truncate(size)
+                                saved.flush()
+                                os.fsync(saved.fileno())
+                            self.partials.save(job, entry["path"], kind, size, sha, etag, total)
+                        else:
+                            os.unlink(temp)
+                            self.partials.discard(job, entry["path"], kind, remove=False)
+                    except OSError:
+                        pass
                 with control.lock:
                     control.temporary.discard(temp)
                     control.temporary_sizes.pop(temp, None)
-            if isinstance(error, OSError) or (isinstance(error, APIError) and error.status == 404 and kind == "preview") or attempt == tries - 1:
+            if isinstance(error, OSError) or isinstance(error, APIError) and error.status == 404 and kind == "preview" or attempt == tries - 1:
                 raise error
             delay = error.retry_after if isinstance(error, APIError) and error.retry_after is not None else retry_delay(None, attempt)
 
@@ -774,8 +941,15 @@ class Engine:
         job = self.store.job(job_id)
         summary = self.store.summary(job_id)
         final_phase = "stopped" if manual and (not job["scan_complete"] or summary["cancelled"] or summary["processed"] < summary["files"] or job["phase"] in ("stopped", "interrupted", "failed")) else ("completed_with_errors" if summary["errors"] or summary["missing_previews"] or summary["scan_errors"] or summary["replacements"] else "completed")
+        if control.selected_paths and (not job["scan_complete"] or summary["cancelled"] or summary["processed"] < summary["files"]):
+            final_phase = "stopped"
         self.store.update_job(job_id, phase=final_phase, ended=job["ended"] or now())
+        control.check()
         reports = write_reports(self.store, job_id)
+        if not manual and not job["settings"].get("create_zip", True):
+            self.store.update_job(job_id, phase=final_phase, generation=job["generation"] + 1)
+            control.event("archive", "Файлы и отчёты сохранены; создание ZIP выключено", level="success")
+            return
         total = summary["saved_bytes"] + sum(os.path.getsize(safe_join(job["root"], r)) for r in reports)
         generation = job["generation"] + 1
         archive_rel = reserve_output(self.store, job, f"result-{generation}.zip")

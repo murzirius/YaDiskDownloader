@@ -2,6 +2,7 @@ import io
 import os
 import secrets
 import threading
+import json
 from pathlib import Path
 
 from flask import Flask, abort, jsonify, render_template, request, send_file, session
@@ -13,6 +14,9 @@ from .engine import Engine, safe_error
 from .paths import remote_path, safe_join
 from .store import Store
 from .file_types import preview_type
+from .updates import Updates
+from .diagnostics import bundle, write_bundle
+from . import __version__
 
 
 def create_app(state_dir=None, api=None, port=8766):
@@ -24,7 +28,8 @@ def create_app(state_dir=None, api=None, port=8766):
     credentials = api.credentials if api else Credentials()
     api = api or DiskAPI(credentials)
     engine = Engine(store, api)
-    app.extensions.update(engine=engine, store=store, disk_api=api)
+    updates = Updates(store)
+    app.extensions.update(engine=engine, store=store, disk_api=api, updates=updates)
     thumbnail_slots = threading.BoundedSemaphore(3)
     dialog_lock = threading.Lock()
     origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
@@ -72,7 +77,60 @@ def create_app(state_dir=None, api=None, port=8766):
     def index():
         if "csrf" not in session:
             session["csrf"] = secrets.token_urlsafe(32)
-        return render_template("index.html", csrf=session["csrf"], default_destination=str(Path(__file__).resolve().parents[1] / "downloads"))
+        updates.start()
+        return render_template("index.html", csrf=session["csrf"], version=__version__, default_destination=str(Path(__file__).resolve().parents[1] / "downloads"))
+
+    @app.get("/api/updates")
+    def update_status():
+        return jsonify(updates.snapshot())
+
+    @app.post("/api/updates")
+    def check_updates():
+        data = payload()
+        if "repository" in data or "automatic" in data:
+            updates.save(data)
+        updates.start(force=True)
+        return jsonify(updates.snapshot())
+
+    @app.get("/api/profiles")
+    def profiles():
+        return jsonify(items=[{"name": row["name"], "settings": json.loads(row["settings"])} for row in store.rows("SELECT * FROM profiles ORDER BY name")])
+
+    @app.post("/api/profiles")
+    def save_profile():
+        data = payload()
+        name = data.get("name", "")
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 80 or any(ord(char) < 32 for char in name):
+            raise ValueError("Название профиля: от 1 до 80 символов")
+        name = name.strip()
+        if data.get("delete"):
+            with store.db() as db:
+                db.execute("DELETE FROM profiles WHERE name=?", (name,))
+            return jsonify(ok=True)
+        value = data.get("settings")
+        if not isinstance(value, dict):
+            raise ValueError("Некорректные настройки профиля")
+        empty_sources = not value.get("whole_disk") and not value.get("paths")
+        validated = engine.validate_settings(value | {"whole_disk": True} if empty_sources else value)
+        if empty_sources:
+            validated.update(paths=[], whole_disk=False)
+        with store.db() as db:
+            if db.execute("SELECT COUNT(*) FROM profiles").fetchone()[0] >= 100 and not db.execute("SELECT 1 FROM profiles WHERE name=?", (name,)).fetchone():
+                raise ValueError("Можно сохранить до 100 профилей")
+            db.execute("INSERT OR REPLACE INTO profiles VALUES(?,?)", (name, json.dumps(validated, ensure_ascii=False)))
+        return jsonify(ok=True)
+
+    @app.get("/api/jobs/<job_id>/diagnostics-preview")
+    def preview_diagnostics(job_id):
+        return jsonify(files=bundle(engine, job_id))
+
+    @app.post("/api/jobs/<job_id>/diagnostics")
+    def diagnostics(job_id):
+        local = write_bundle(engine, job_id)
+        job = store.job(job_id)
+        if os.name == "nt":
+            os.startfile(safe_join(job["root"], ""), "explore")
+        return jsonify(local=local)
 
     @app.get("/api/status")
     def status():
@@ -186,7 +244,10 @@ def create_app(state_dir=None, api=None, port=8766):
         data = payload()
         if data.get("limits") is not None and not isinstance(data["limits"], dict):
             raise ValueError("Некорректные ограничения")
-        engine.action(job_id, data.get("action"), data.get("limits"))
+        limits = dict(data.get("limits") or {})
+        if "paths" in data:
+            limits["paths"] = data["paths"]
+        engine.action(job_id, data.get("action"), limits or None)
         return jsonify(ok=True)
 
     @app.post("/api/jobs/<job_id>/open-output")

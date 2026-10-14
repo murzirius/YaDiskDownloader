@@ -45,6 +45,10 @@ def inherit(store, job_id, previous):
                     remote_path(row[0])
                     safe_join(root, row[2])
                     target.execute("INSERT OR IGNORE INTO artifacts VALUES(?,?,?,?,?,?,?,?)", (job_id, *row))
+                for row in source.execute("SELECT path,type,local,fingerprint,size,sha256,etag,total FROM partials WHERE job=?", (previous["id"],)):
+                    remote_path(row[0])
+                    safe_join(root, row[2])
+                    target.execute("INSERT OR IGNORE INTO partials VALUES(?,?,?,?,?,?,?,?,?)", (job_id, *row))
         else:
             with closing(sqlite3.connect(previous["file"].resolve().as_uri() + "?mode=ro", uri=True)) as source:
                 for row in source.execute("SELECT identity,local,folded FROM names"):
@@ -54,6 +58,11 @@ def inherit(store, job_id, previous):
                     remote_path(row[0])
                     safe_join(root, row[2])
                     target.execute("INSERT OR IGNORE INTO artifacts VALUES(?,?,?,?,?,?,?,?)", (job_id, *row))
+                if source.execute("SELECT 1 FROM sqlite_master WHERE name='partials'").fetchone():
+                    for row in source.execute("SELECT path,type,local,fingerprint,size,sha256,etag,total FROM partials"):
+                        remote_path(row[0])
+                        safe_join(root, row[2])
+                        target.execute("INSERT OR IGNORE INTO partials VALUES(?,?,?,?,?,?,?,?,?)", (job_id, *row))
 
 
 def save_import(store, job_id):
@@ -77,11 +86,12 @@ def save_import(store, job_id):
     temp = temporary_file(job["root"])
     try:
         with closing(sqlite3.connect(temp)) as db:
-            db.executescript("CREATE TABLE import_meta(key TEXT PRIMARY KEY,value TEXT); CREATE TABLE names(identity TEXT PRIMARY KEY,local TEXT,folded TEXT); CREATE TABLE artifacts(path TEXT,type TEXT,local TEXT,size INTEGER,sha256 TEXT,fingerprint TEXT,preview_size TEXT,PRIMARY KEY(path,type));")
+            db.executescript("CREATE TABLE import_meta(key TEXT PRIMARY KEY,value TEXT); CREATE TABLE names(identity TEXT PRIMARY KEY,local TEXT,folded TEXT); CREATE TABLE artifacts(path TEXT,type TEXT,local TEXT,size INTEGER,sha256 TEXT,fingerprint TEXT,preview_size TEXT,PRIMARY KEY(path,type)); CREATE TABLE partials(path TEXT,type TEXT,local TEXT,fingerprint TEXT,size INTEGER,sha256 TEXT,etag TEXT,total INTEGER,PRIMARY KEY(path,type));")
             db.executemany("INSERT INTO import_meta VALUES(?,?)", [("format", FORMAT), ("settings", json.dumps(job["settings"], ensure_ascii=False)), ("service", job["service"]), ("generation", str(job["generation"]))])
             with store.db() as source:
                 db.executemany("INSERT INTO names VALUES(?,?,?)", source.execute("SELECT identity,local,folded FROM names WHERE job=?", (job_id,)))
                 db.executemany("INSERT INTO artifacts VALUES(?,?,?,?,?,?,?)", source.execute("SELECT path,type,local,size,sha256,fingerprint,preview_size FROM artifacts WHERE job=?", (job_id,)))
+                db.executemany("INSERT INTO partials VALUES(?,?,?,?,?,?,?,?)", source.execute("SELECT path,type,local,fingerprint,size,sha256,etag,total FROM partials WHERE job=?", (job_id,)))
             db.commit()
         target = safe_join(job["root"], local)
         if owned and os.path.exists(target):
