@@ -27,7 +27,7 @@ def find_import(store, root):
                     settings = json.loads(meta["settings"])
                     if not isinstance(settings, dict) or not isinstance(settings.get("paths"), list):
                         continue
-                    return {"job": {"settings": settings, "service": meta["service"], "generation": int(meta["generation"])}, "file": filename}
+                    return {"job": {"settings": settings, "service": meta["service"], "generation": int(meta["generation"])}, "file": filename, "inventory_available": bool(db.execute("SELECT 1 FROM sqlite_master WHERE name='inventory'").fetchone())}
         except (sqlite3.Error, OSError, ValueError, KeyError):
             continue
     return None
@@ -38,9 +38,18 @@ def inherit(store, job_id, previous):
     with store.db() as target:
         if previous.get("store"):
             with previous["store"].db() as source:
+                for row in source.execute("SELECT path,kind,meta FROM entries WHERE job=?", (previous["id"],)):
+                    remote_path(row[0])
+                    target.execute("INSERT OR IGNORE INTO baseline VALUES(?,?,?,?)", (job_id, *row))
+                for row in source.execute("SELECT b.path,b.kind,b.meta FROM baseline b LEFT JOIN changes c ON c.job=b.job AND c.path=b.path WHERE b.job=? AND (c.status='unknown' OR ?=0)", (previous["id"], previous["job"]["scan_complete"])):
+                    remote_path(row[0])
+                    target.execute("INSERT OR IGNORE INTO baseline VALUES(?,?,?,?)", (job_id, *row))
                 for row in source.execute("SELECT identity,local,folded FROM names WHERE job=?", (previous["id"],)):
                     safe_join(root, row[1])
                     target.execute("INSERT OR IGNORE INTO names VALUES(?,?,?,?)", (job_id, *row))
+                for row in source.execute("SELECT local,signature FROM verification_cache WHERE job=?", (previous["id"],)):
+                    safe_join(root, row[0])
+                    target.execute("INSERT OR IGNORE INTO verification_cache VALUES(?,?,?)", (job_id, *row))
                 for row in source.execute("SELECT path,type,local,size,sha256,fingerprint,preview_size FROM artifacts WHERE job=?", (previous["id"],)):
                     remote_path(row[0])
                     safe_join(root, row[2])
@@ -51,6 +60,14 @@ def inherit(store, job_id, previous):
                     target.execute("INSERT OR IGNORE INTO partials VALUES(?,?,?,?,?,?,?,?,?)", (job_id, *row))
         else:
             with closing(sqlite3.connect(previous["file"].resolve().as_uri() + "?mode=ro", uri=True)) as source:
+                if source.execute("SELECT 1 FROM sqlite_master WHERE name='verification_cache'").fetchone():
+                    for row in source.execute("SELECT local,signature FROM verification_cache"):
+                        safe_join(root, row[0])
+                        target.execute("INSERT OR IGNORE INTO verification_cache VALUES(?,?,?)", (job_id, *row))
+                if source.execute("SELECT 1 FROM sqlite_master WHERE name='inventory'").fetchone():
+                    for row in source.execute("SELECT path,kind,meta FROM inventory"):
+                        remote_path(row[0])
+                        target.execute("INSERT OR IGNORE INTO baseline VALUES(?,?,?,?)", (job_id, *row))
                 for row in source.execute("SELECT identity,local,folded FROM names"):
                     safe_join(root, row[1])
                     target.execute("INSERT OR IGNORE INTO names VALUES(?,?,?,?)", (job_id, *row))
@@ -86,9 +103,13 @@ def save_import(store, job_id):
     temp = temporary_file(job["root"])
     try:
         with closing(sqlite3.connect(temp)) as db:
-            db.executescript("CREATE TABLE import_meta(key TEXT PRIMARY KEY,value TEXT); CREATE TABLE names(identity TEXT PRIMARY KEY,local TEXT,folded TEXT); CREATE TABLE artifacts(path TEXT,type TEXT,local TEXT,size INTEGER,sha256 TEXT,fingerprint TEXT,preview_size TEXT,PRIMARY KEY(path,type)); CREATE TABLE partials(path TEXT,type TEXT,local TEXT,fingerprint TEXT,size INTEGER,sha256 TEXT,etag TEXT,total INTEGER,PRIMARY KEY(path,type));")
+            db.executescript("CREATE TABLE import_meta(key TEXT PRIMARY KEY,value TEXT); CREATE TABLE names(identity TEXT PRIMARY KEY,local TEXT,folded TEXT); CREATE TABLE artifacts(path TEXT,type TEXT,local TEXT,size INTEGER,sha256 TEXT,fingerprint TEXT,preview_size TEXT,PRIMARY KEY(path,type)); CREATE TABLE partials(path TEXT,type TEXT,local TEXT,fingerprint TEXT,size INTEGER,sha256 TEXT,etag TEXT,total INTEGER,PRIMARY KEY(path,type)); CREATE TABLE inventory(path TEXT PRIMARY KEY,kind TEXT,meta TEXT);")
+            db.execute("CREATE TABLE verification_cache(local TEXT PRIMARY KEY,signature TEXT NOT NULL)")
             db.executemany("INSERT INTO import_meta VALUES(?,?)", [("format", FORMAT), ("settings", json.dumps(job["settings"], ensure_ascii=False)), ("service", job["service"]), ("generation", str(job["generation"]))])
             with store.db() as source:
+                db.executemany("INSERT INTO verification_cache VALUES(?,?)", source.execute("SELECT local,signature FROM verification_cache WHERE job=?", (job_id,)))
+                db.executemany("INSERT INTO inventory VALUES(?,?,?)", source.execute("SELECT path,kind,meta FROM entries WHERE job=?", (job_id,)))
+                db.executemany("INSERT OR IGNORE INTO inventory VALUES(?,?,?)", source.execute("SELECT b.path,b.kind,b.meta FROM baseline b LEFT JOIN changes c ON c.job=b.job AND c.path=b.path WHERE b.job=? AND (c.status='unknown' OR ?=0)", (job_id, job["scan_complete"])))
                 db.executemany("INSERT INTO names VALUES(?,?,?)", source.execute("SELECT identity,local,folded FROM names WHERE job=?", (job_id,)))
                 db.executemany("INSERT INTO artifacts VALUES(?,?,?,?,?,?,?)", source.execute("SELECT path,type,local,size,sha256,fingerprint,preview_size FROM artifacts WHERE job=?", (job_id,)))
                 db.executemany("INSERT INTO partials VALUES(?,?,?,?,?,?,?,?)", source.execute("SELECT path,type,local,fingerprint,size,sha256,etag,total FROM partials WHERE job=?", (job_id,)))

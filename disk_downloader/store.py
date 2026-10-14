@@ -4,9 +4,12 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 
 from .file_types import file_type, preview_type, selected_type
+from .exclusions import excluded
 
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS baseline (job TEXT,path TEXT,kind TEXT,meta TEXT,PRIMARY KEY(job,path));
+CREATE TABLE IF NOT EXISTS changes (job TEXT,path TEXT,status TEXT,before_meta TEXT,after_meta TEXT,PRIMARY KEY(job,path));
 CREATE TABLE IF NOT EXISTS jobs (
  id TEXT PRIMARY KEY, settings TEXT NOT NULL, root TEXT NOT NULL,
  service TEXT NOT NULL, phase TEXT NOT NULL, scan_complete INTEGER DEFAULT 0,
@@ -71,15 +74,27 @@ class Store:
             db.execute("CREATE INDEX IF NOT EXISTS queue_priority ON entries(job,kind,status,priority,path)")
             if "pause_reason" not in {row[1] for row in db.execute("PRAGMA table_info(jobs)")}:
                 db.execute("ALTER TABLE jobs ADD COLUMN pause_reason TEXT NOT NULL DEFAULT ''")
-            db.execute("DELETE FROM verification_cache")
             for row in db.execute("SELECT id,settings FROM jobs").fetchall():
                 settings = json.loads(row["settings"])
+                changed = False
                 if "attempts" not in settings:
                     settings["attempts"] = max(1, settings.get("retries", 3))
                     settings["retries"] = settings["attempts"] - 1
+                    changed = True
+                if settings.get("adaptive_workers") is not False:
+                    settings["adaptive_workers"] = False
+                    changed = True
+                if changed:
                     db.execute("UPDATE jobs SET settings=? WHERE id=?", (json.dumps(settings, ensure_ascii=False), row["id"]))
-            db.execute("UPDATE jobs SET phase='interrupted', error='Процесс был перезапущен. Подключите Диск и продолжите.' WHERE phase IN ('scanning','downloading','packing','pausing','stopping')")
+            for row in db.execute("SELECT name,settings FROM profiles").fetchall():
+                settings = json.loads(row["settings"])
+                if settings.get("adaptive_workers") is not False:
+                    settings["adaptive_workers"] = False
+                    db.execute("UPDATE profiles SET settings=? WHERE name=?", (json.dumps(settings, ensure_ascii=False), row["name"]))
+            db.execute("UPDATE entries SET error='' WHERE status IN ('done','existing','partial') AND EXISTS(SELECT 1 FROM artifacts a WHERE a.job=entries.job AND a.path=entries.path) AND (error LIKE 'Оригинал:%' OR error LIKE 'Превью:%') AND error NOT LIKE '%места%' AND error NOT LIKE '%файловой системы%' AND error NOT LIKE '%локальный путь%' AND error NOT LIKE '%пределы папки%'")
+            db.execute("UPDATE jobs SET phase='interrupted', error='Процесс был перезапущен. Подключите Диск и продолжите.' WHERE phase IN ('scanning','preparing','downloading','packing','pausing','stopping')")
             db.execute("UPDATE entries SET status='pending' WHERE status='running'")
+            db.execute("UPDATE jobs SET phase='completed' WHERE phase='completed_with_errors' AND error='' AND NOT EXISTS(SELECT 1 FROM scan_errors s WHERE s.job=jobs.id) AND NOT EXISTS(SELECT 1 FROM entries e WHERE e.job=jobs.id AND e.kind='file' AND (e.error!='' OR e.status IN ('pending','running','error','no_preview','cancelled')))")
 
     @contextmanager
     def db(self):
@@ -113,6 +128,8 @@ class Store:
             db.execute("UPDATE entries SET " + ",".join(f"{k}=?" for k in fields) + " WHERE job=? AND path=?", (*fields.values(), job_id, path))
 
     def insert_entry(self, db, job_id, meta, settings=None):
+        if settings is not None and excluded(meta["path"], settings):
+            return
         if meta["type"] == "file" and settings is not None and not selected_type(meta, settings):
             return
         safe = {k: meta[k] for k in ("path", "name", "type", "size", "md5", "sha256", "modified", "resource_id", "mime_type", "media_type") if k in meta}
@@ -136,6 +153,8 @@ class Store:
             scan_errors = db.execute("SELECT COUNT(*) FROM scan_errors WHERE job=?", (job_id,)).fetchone()[0]
             missing = db.execute("SELECT COUNT(*) FROM entries WHERE job=? AND preview_status='unavailable'", (job_id,)).fetchone()[0]
             replaced = db.execute("SELECT COUNT(*) FROM entries WHERE job=? AND fallback=1 AND status IN ('done','existing')", (job_id,)).fetchone()[0]
+            failures = db.execute("SELECT COUNT(*) FROM entries WHERE job=? AND kind='file' AND status NOT IN ('pending','running','cancelled') AND (status IN ('error','no_preview') OR error!='')", (job_id,)).fetchone()[0]
+            previous_results = db.execute("SELECT COUNT(DISTINCT e.path) FROM entries e JOIN artifacts a ON a.job=e.job AND a.path=e.path WHERE e.job=? AND e.kind='file' AND e.priority>0", (job_id,)).fetchone()[0]
         found = dict(found)
         total = found.get("file", 0)
         processed = sum(counts.get(k, 0) for k in ("done", "existing", "partial", "error", "no_preview", "cancelled", "filtered"))
@@ -150,20 +169,21 @@ class Store:
             originals_volume = db.execute("SELECT COALESCE(SUM(json_extract(e.meta,'$.size')),0),COALESCE(SUM(json_extract(e.meta,'$.size') IS NULL),0) FROM entries e WHERE e.job=? AND e.kind='file' AND " + original_condition, (job_id, mode)).fetchone()
             pending_original = original_condition + " AND e.original_status NOT IN ('failed','downloaded_verified','existing_verified')"
             pending = db.execute("SELECT COALESCE(SUM(CASE WHEN " + pending_original + " THEN COALESCE(json_extract(e.meta,'$.size'),0) ELSE 0 END),0),COALESCE(SUM(CASE WHEN " + pending_original + " THEN json_extract(e.meta,'$.size') IS NULL ELSE CASE WHEN COALESCE(json_extract(e.meta,'$.file_type'),'photos') IN ('photos','videos') AND e.original_status!='existing_verified' AND (?!='fallback' OR e.original_status='failed') THEN 1 ELSE 0 END END),0),COUNT(*),COALESCE(SUM(COALESCE(json_extract(e.meta,'$.file_type'),'photos') IN ('photos','videos')),0) FROM entries e WHERE e.job=? AND e.kind='file' AND e.status IN ('pending','running')", (mode, mode, mode, job_id)).fetchone()
-        known = int(originals_volume[0])
-        unknown_downloads = int(originals_volume[1])
+        missing_operation = job["settings"].get("operation") == "missing"
+        known = int(pending[0]) if missing_operation else int(originals_volume[0])
+        unknown_downloads = int(pending[1]) if missing_operation else int(originals_volume[1])
         if mode in ("previews", "both"):
             unknown_downloads += preview_count
         job.update(counts=counts, files=total, folders=found.get("dir", 0), processed=processed,
                    percent=round(processed * 100 / total, 2) if job["scan_complete"] and total else (100 if job["scan_complete"] else None),
                    originals=originals, previews=previews, replacements=replaced, existing=counts.get("existing", 0),
-                   missing_previews=missing, cancelled=counts.get("cancelled", 0), errors=counts.get("error", 0) + counts.get("partial", 0),
-                   scan_errors=scan_errors, saved_bytes=saved,
+                   missing_previews=missing, cancelled=counts.get("cancelled", 0), errors=failures,
+                   scan_errors=scan_errors, saved_bytes=saved, previous_results=previous_results,
                    remaining_work={"bytes": int(pending[0]), "unknown_files": int(pending[1]), "files": int(pending[2]), "preview_files": int(pending[3])},
                    estimate={"known_bytes": known, "unknown_sizes": unknown_downloads,
                              "original_bytes": int(volume[0]), "original_unknown": unknown,
                              "preview_candidates": preview_count,
-                             "conditional_preview_sizes": preview_count if mode == "fallback" else 0,
+                             "conditional_preview_sizes": (int(pending[3]) if missing_operation else preview_count) if mode == "fallback" else 0,
                              "zip_basis_bytes": known if job["settings"].get("create_zip", True) else 0,
                              "extra_temporary_bytes": (2 if job["settings"].get("create_zip", True) else 1) * known, "is_estimate": True})
         return job

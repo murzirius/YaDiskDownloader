@@ -252,7 +252,7 @@ def test_updates_use_github_without_disk_token(system, monkeypatch):
         def __exit__(self, *args):
             pass
         def iter_content(self, size):
-            yield json.dumps({"tag_name": "v1.2.0", "html_url": "https://github.com/murzirius/YaDiskDownloader/releases/tag/v1.2.0"}).encode()
+            yield json.dumps({"tag_name": "v9.0.0", "html_url": "https://github.com/murzirius/YaDiskDownloader/releases/tag/v9.0.0"}).encode()
 
     def get(self, url, **kwargs):
         calls.append((url, kwargs))
@@ -261,7 +261,7 @@ def test_updates_use_github_without_disk_token(system, monkeypatch):
     monkeypatch.setattr(module.requests.Session, "get", get)
     updater.check()
     result = updater.snapshot()
-    assert result["available"] and result["latest"] == "v1.2.0"
+    assert result["available"] and result["latest"] == "v9.0.0"
     assert "api.github.com/repos/murzirius/YaDiskDownloader/releases/latest" in calls[0][0]
     assert "Authorization" not in calls[0][1]["headers"] and "fake-token" not in json.dumps(calls)
 

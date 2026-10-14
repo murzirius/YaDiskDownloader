@@ -3,6 +3,7 @@ import os
 import re
 import tempfile
 import time
+from functools import lru_cache
 from pathlib import Path
 
 
@@ -57,6 +58,39 @@ def native(path):
     if os.name == "nt" and not path.startswith("\\\\?\\"):
         return "\\\\?\\UNC\\" + path[2:] if path.startswith("\\\\") else "\\\\?\\" + path
     return path
+
+
+@lru_cache(maxsize=1)
+def change_time_api():
+    import ctypes
+    from ctypes import wintypes
+    class BasicInfo(ctypes.Structure):
+        _fields_ = [("created", ctypes.c_longlong), ("accessed", ctypes.c_longlong), ("written", ctypes.c_longlong), ("changed", ctypes.c_longlong), ("attributes", wintypes.DWORD)]
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.GetFileInformationByHandleEx.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
+    kernel.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+    return kernel, BasicInfo
+
+
+def file_signature(filename, sha):
+    info = os.stat(filename)
+    changed = info.st_ctime_ns
+    if os.name == "nt":
+        import ctypes
+        kernel, BasicInfo = change_time_api()
+        handle = kernel.CreateFileW(str(filename), 128, 7, None, 3, 0, None)
+        changed = None
+        if handle not in (None, ctypes.c_void_p(-1).value):
+            try:
+                basic = BasicInfo()
+                if kernel.GetFileInformationByHandleEx(handle, 0, ctypes.byref(basic), ctypes.sizeof(basic)):
+                    changed = basic.changed
+            finally:
+                kernel.CloseHandle(handle)
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, sha, changed)
 
 
 def publish(temp, target):

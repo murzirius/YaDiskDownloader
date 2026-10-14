@@ -12,7 +12,7 @@ from .paths import PathError, publish, replace_owned, reserve_output, safe_join,
 
 
 GROUPS = {"system": "Задание", "scan": "Обход диска", "original": "Оригиналы", "preview": "Превью", "cache": "Уже скачанное", "errors": "Ошибки и повторы", "archive": "Отчёты и ZIP"}
-PHASES = {"new": "Новое задание", "scanning": "Обход диска", "ready": "Готово к загрузке", "downloading": "Загрузка", "packing": "Создание ZIP", "paused": "Пауза", "stopping": "Остановка", "stopped": "Остановлено", "failed": "Ошибка", "interrupted": "Прервано", "completed": "Завершено", "completed_with_errors": "Завершено с замечаниями"}
+PHASES = {"new": "Новое задание", "scanning": "Обход диска", "preparing": "Подготовка результатов обхода", "ready": "Готово к загрузке", "downloading": "Загрузка", "packing": "Создание ZIP", "paused": "Пауза", "stopping": "Остановка", "stopped": "Остановлено", "failed": "Ошибка", "interrupted": "Прервано", "completed": "Завершено", "completed_with_errors": "Завершено с замечаниями"}
 
 
 def encoded(value):

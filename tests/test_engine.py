@@ -101,7 +101,9 @@ def test_independent_both_and_absent_preview(system):
     api.fail[("disk:/one.bin", "original")] = [APIError("Нет оригинала", 403), APIError("Нет оригинала", 403)]
     job = run_job(system, mode="both")
     assert job["previews"] == 1 and job["originals"] == 1
-    assert job["errors"] == 2 and job["missing_previews"] == 1
+    assert job["errors"] == 0 and job["missing_previews"] == 1
+    assert job["phase"] == "completed"
+    assert all(row["error"] == "" for row in entries(engine, job["id"]))
     assert all(r["status"] == "partial" for r in entries(engine, job["id"]))
 
 

@@ -17,13 +17,16 @@ from .file_types import preview_type
 from .updates import Updates
 from .diagnostics import bundle, write_bundle
 from . import __version__
+from .inventory import folders, change_summary, LABELS
+from .issues import draft
+from .runtime import state_folder, destination_folder, frozen
 
 
 def create_app(state_dir=None, api=None, port=8766):
     app = Flask(__name__)
     app.secret_key = secrets.token_bytes(32)
     app.config.update(MAX_CONTENT_LENGTH=1024 * 1024, SESSION_COOKIE_NAME=f"disk_downloader_{port}", SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Strict", SEND_FILE_MAX_AGE_DEFAULT=0)
-    state = Path(state_dir or Path(__file__).resolve().parents[1] / ".state")
+    state = Path(state_dir or state_folder())
     store = Store(state / "jobs.sqlite3")
     credentials = api.credentials if api else Credentials()
     api = api or DiskAPI(credentials)
@@ -78,7 +81,55 @@ def create_app(state_dir=None, api=None, port=8766):
         if "csrf" not in session:
             session["csrf"] = secrets.token_urlsafe(32)
         updates.start()
-        return render_template("index.html", csrf=session["csrf"], version=__version__, default_destination=str(Path(__file__).resolve().parents[1] / "downloads"))
+        return render_template("index.html", csrf=session["csrf"], version=__version__, default_destination=str(destination_folder()))
+
+    @app.get("/api/runtime")
+    def runtime():
+        tray = app.extensions.get("tray")
+        return jsonify(version=__version__, frozen=frozen(), tray=tray.status() if tray else {"visible": False, "error": ""}, can_exit=bool(app.extensions.get("quit_app")), migration=app.extensions.get("migration", {"jobs": 0, "failed_sources": 0}))
+
+    @app.post("/api/exit")
+    def exit_app():
+        quit_app = app.extensions.get("quit_app")
+        if not quit_app:
+            raise ValueError("Завершение недоступно в этом режиме запуска")
+        threading.Timer(0.3, quit_app).start()
+        return jsonify(ok=True)
+
+    @app.post("/api/issue-draft")
+    def issue_draft():
+        return jsonify(draft(payload(), engine, updates.settings()["repository"]))
+
+    @app.get("/api/jobs/<job_id>/folders")
+    def folder_sizes(job_id):
+        offset = request.args.get("offset", "0")
+        if not offset.isdigit() or len(offset) > 8:
+            raise ValueError("Некорректное смещение")
+        return jsonify(folders(store, job_id, remote_path(request.args.get("path", "disk:/")), int(offset)))
+
+    @app.get("/api/jobs/<job_id>/changes")
+    def changes(job_id):
+        summary = change_summary(store, job_id)
+        status, offset = request.args.get("status", "all"), request.args.get("offset", "0")
+        if status not in (*LABELS, "all") or not offset.isdigit() or len(offset) > 8:
+            raise ValueError("Некорректные параметры изменений")
+        rows = list(store.rows("SELECT path,status,before_meta,after_meta FROM changes WHERE job=? AND (?='all' OR status=?) ORDER BY path LIMIT 101 OFFSET ?", (job_id, status, status, int(offset))))
+        items = [{"path": row["path"], "status": row["status"], "before_size": json.loads(row["before_meta"]).get("size") if row["before_meta"] else None, "after_size": json.loads(row["after_meta"]).get("size") if row["after_meta"] else None} for row in rows[:100]]
+        return jsonify(summary=summary, items=items, has_more=len(rows) > 100, next_offset=int(offset) + len(items))
+
+    @app.post("/api/jobs/<job_id>/open-changes")
+    def open_changes(job_id):
+        job = store.job(job_id)
+        relative = job["settings"].get("changes_local")
+        if not relative:
+            raise ValueError("Отчёт появится после загрузки или сборки ZIP")
+        filename = safe_join(job["root"], relative)
+        with open(filename, encoding="utf-8") as stream:
+            if not stream.read(150).startswith('<!doctype html><html lang="ru" data-changes="' + job_id + '">'):
+                raise ValueError("Файл отчёта заменён другим файлом")
+        if os.name == "nt":
+            os.startfile(filename, "open")
+        return jsonify(path=str(Path(job["root"]) / relative))
 
     @app.get("/api/updates")
     def update_status():
@@ -236,7 +287,7 @@ def create_app(state_dir=None, api=None, port=8766):
         offset = request.args.get("offset", "0")
         if not offset.isdigit():
             raise ValueError("Некорректное смещение")
-        rows = list(store.rows("SELECT path,status,error,original_status,preview_status,fallback FROM entries WHERE job=? AND kind='file' AND (error!='' OR status IN ('error','partial','no_preview')) UNION ALL SELECT path,'scan_error',error,'not_requested','not_requested',0 FROM scan_errors WHERE job=? LIMIT 100 OFFSET ?", (job_id, job_id, int(offset))))
+        rows = list(store.rows("SELECT path,status,error,original_status,preview_status,fallback FROM entries WHERE job=? AND kind='file' AND status NOT IN ('pending','running','cancelled') AND (error!='' OR status IN ('error','no_preview')) UNION ALL SELECT path,'scan_error',error,'not_requested','not_requested',0 FROM scan_errors WHERE job=? LIMIT 100 OFFSET ?", (job_id, job_id, int(offset))))
         return jsonify(items=rows, next_offset=int(offset) + len(rows), has_more=len(rows) == 100)
 
     @app.post("/api/jobs/<job_id>/action")

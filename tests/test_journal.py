@@ -38,10 +38,12 @@ def test_journal_independent_of_report_formats_and_outside_zip(system):
     assert data["summary"]["processed"] == 1
     assert {event["category"] for event in data["events"]} >= {"system", "scan", "original", "preview", "archive"}
     assert "Сохранено" in html and "Найти файл или событие" in html
-    assert list(Path(job["root"]).glob("*.html")) == [filename]
+    assert list(Path(job["root"]).glob("log-*.html")) == [filename]
+    assert Path(job["root"], job["settings"]["changes_local"]).is_file()
     assert not list(Path(job["root"]).glob("*.part"))
     with zipfile.ZipFile(Path(job["root"], job["zip_path"])) as archive:
-        assert not any(name.endswith(".html") for name in archive.namelist())
+        assert not any(name.rsplit("/", 1)[-1].startswith("log-") for name in archive.namelist())
+        assert any(name.endswith("/changes.html") for name in archive.namelist())
     assert not engine.controls[job["id"]].journal.thread.is_alive()
 
 

@@ -29,7 +29,7 @@ def bundle(engine, job_id):
     settings = {key: status["settings"][key] for key in SETTINGS if key in status["settings"]}
     environment = {"app_version": __version__, "python": sys.version.split()[0], "system": platform.system(), "system_release": platform.release(), "architecture": platform.machine(), "created": datetime.now(timezone.utc).isoformat()}
     entries = []
-    for row in engine.store.rows("SELECT path,status,error,original_status,preview_status,original_attempts,preview_attempts FROM entries WHERE job=? AND kind='file' AND (error!='' OR status IN ('error','partial','cancelled','no_preview')) LIMIT 1000", (job_id,)):
+    for row in engine.store.rows("SELECT path,status,error,original_status,preview_status,original_attempts,preview_attempts FROM entries WHERE job=? AND kind='file' AND (error!='' OR status IN ('error','cancelled','no_preview')) LIMIT 1000", (job_id,)):
         row["source_id"] = hashlib.sha256(row.pop("path").encode()).hexdigest()[:16]
         row["error_type"] = error_kind(row.pop("error"))
         entries.append(row)

@@ -9,6 +9,7 @@
   <link rel="stylesheet" href="/static/features.css">
   <script src="/static/app.js" defer></script>
   <script src="/static/features.js" defer></script>
+  <script src="/static/extended.js" defer></script>
 </head>
 <body>
 <header class="topbar">
@@ -54,15 +55,16 @@
       <fieldset id="file-types"><legend>Типы для скачивания</legend><div class="type-options"><label><input type="checkbox" name="file-type" value="photos" checked> Фото</label><label><input type="checkbox" name="file-type" value="videos" checked> Видео</label><label><input type="checkbox" name="file-type" value="music" checked> Музыка</label><label><input type="checkbox" name="file-type" value="files" checked> Другие файлы</label></div><p class="hint">Превью — для фото и видео. Музыка и другие файлы — оригиналы.</p></fieldset>
       <fieldset><legend>Отчёты</legend><label><input type="checkbox" name="report" value="csv" checked> CSV</label><label><input type="checkbox" name="report" value="json" checked> JSON</label><label><input type="checkbox" name="report" value="html"> HTML</label><label><input type="checkbox" name="report" value="txt"> TXT</label></fieldset>
       <details class="advanced-settings"><summary>Дополнительные настройки</summary>
-        <label class="whole"><input id="adaptive-workers" type="checkbox" checked> Умное количество потоков</label>
         <label class="whole"><input id="resume-parts" type="checkbox" checked> Сохранять части для продолжения</label>
         <label class="whole"><input id="auto-pause" type="checkbox" checked> Автопауза при заполнении диска</label>
         <label class="field">Порог заполнения диска, %<input id="max-disk-percent" type="number" min="1" max="99.9" step="0.1" value="95"></label>
+        <label class="field">Общая скорость, МиБ/с<input id="speed-limit" type="number" min="0" max="10000" step="0.1" value="0"></label><p class="hint">0 — без ограничения. Лимит общий для всех потоков.</p>
         <label class="field">Размер превью<select id="preview-size"><option value="XXXL">Максимальный · 1280 px</option><option value="XXL">1024 px</option><option value="XL">800 px</option><option value="L">500 px</option><option value="M">300 px</option><option value="S">150 px</option></select></label>
         <div class="numeric-settings"><label>Потоки<input id="workers" type="number" min="1" max="8" value="8"></label><label>Попытки всего<input id="retries" type="number" min="1" max="9" value="1"></label><label>Лимит попытки, с<input id="timeout" type="number" min="5" max="180" value="20"></label></div>
         <p class="hint">Превью без обрезки. Файлы, отчёты и ZIP — в папке импорта.</p>
       </details>
       <label class="whole"><input id="create-zip" type="checkbox" checked> Создать ZIP после загрузки</label>
+      <details class="exclusion-settings"><summary>Исключения папок и файлов</summary><label class="field">Один путь или шаблон на строку<textarea id="exclusions" rows="4" placeholder="disk:/Фото/Черновики&#10;*.tmp&#10;*.bak" spellcheck="false"></textarea></label><p class="hint">Путь disk:/… исключает файл или всю папку. Шаблоны имён действуют на любой глубине, без учёта регистра.</p><button id="exclude-selected">Исключить выбранное</button></details>
       <details class="profile-settings"><summary>Профили настроек</summary><select id="profile-list" aria-label="Профиль настроек"><option value="">Выберите профиль</option></select><div class="actions"><button id="apply-profile">Применить</button><button id="delete-profile">Удалить</button></div><input id="profile-name" aria-label="Название профиля" placeholder="Название профиля" maxlength="80"><button id="save-profile">Сохранить профиль</button></details>
       <button id="estimate" class="primary wide">Оценить выбранное</button>
     </section>
@@ -75,7 +77,9 @@
         <div id="counters" class="counters"></div>
         <div id="active-files" class="active-files"></div>
         <div id="estimate-info" class="estimate-info"></div>
+        <div class="actions"><button id="folder-volumes">Объём по папкам</button><button id="show-changes">Изменения</button></div>
         <div class="actions"><button id="start-job" class="primary">Начать</button><button id="pause-job">Пауза</button><button id="resume-job">Продолжить</button><button id="stop-job" class="danger">Остановить</button></div>
+        <div id="network-warning" class="network-warning" role="status" aria-live="polite" hidden></div>
         <div id="result-info" class="result-info"></div>
         <div class="actions"><button id="retry-job">Повторить неудачные</button><button id="pack-job">Собрать ZIP результатов</button></div>
         <div id="zip-saved" class="hint" hidden></div>
@@ -88,7 +92,7 @@
           <button id="open-journal" hidden>Открыть HTML-журнал</button>
           <div id="journal-info" class="hint"></div>
         </details>
-        <details id="errors-detail"><summary id="errors-title">Ошибки и замены оригиналов</summary><div id="errors-list"></div><div class="actions"><button id="errors-prev">Назад</button><button id="errors-next">Ещё</button></div></details>
+        <details id="errors-detail"><summary id="errors-title">Ошибки</summary><div id="errors-list"></div><div class="actions"><button id="errors-prev">Назад</button><button id="errors-next">Ещё</button></div></details>
         <button id="retry-selected" hidden>Повторить выбранные</button>
       </div>
     </section>
@@ -97,5 +101,7 @@
 {% include 'help.html' %}
 <dialog id="service-dialog"><div class="help-header"><h2>Обновления и диагностика</h2><button id="close-service" aria-label="Закрыть">×</button></div><label class="field">Репозиторий GitHub<input id="update-repository" value="murzirius/YaDiskDownloader" spellcheck="false"></label><label class="whole"><input id="automatic-updates" type="checkbox" checked> Проверять обновления при запуске</label><button id="check-updates">Сохранить и проверить</button><p id="update-status" class="hint"></p><a id="update-link" class="oauth-link" target="_blank" rel="noopener noreferrer" hidden>Открыть релиз</a><hr><h3>Диагностика выбранного задания</h3><p class="hint">Без токенов, имён и путей файлов, содержимого файлов и базы данных. Последние 2000 событий и до 1000 ошибок.</p><button id="preview-diagnostics">Посмотреть состав</button><div id="diagnostics-preview" hidden><pre id="diagnostics-content"></pre><button id="save-diagnostics">Сохранить ZIP диагностики</button></div><p id="diagnostics-status" class="hint"></p></dialog>
 <footer>Только чтение Яндекс.Диска · Сервер на 127.0.0.1 · Превью сохраняются с суффиксом .preview и не заменяют оригиналы</footer>
+<dialog id="inventory-dialog"><div class="help-header"><h2 id="inventory-title">Объём по папкам</h2><button id="close-inventory" aria-label="Закрыть">×</button></div><p id="inventory-note" class="hint"></p><div id="inventory-nav" class="actions"></div><select id="change-filter" aria-label="Тип изменений" hidden></select><div class="table-wrap"><table class="files-table"><thead id="inventory-head"></thead><tbody id="inventory-body"></tbody></table></div><div class="actions"><button id="inventory-prev">Назад</button><button id="inventory-next">Ещё</button><button id="open-changes-report" hidden>Открыть HTML-отчёт</button></div></dialog>
+<dialog id="issue-dialog"><div class="help-header"><h2>Сообщить об ошибке</h2><button id="close-issue" aria-label="Закрыть">×</button></div><label class="field">Что произошло<input id="issue-title" maxlength="120" placeholder="Краткий заголовок"></label><label class="field">Шаги и ожидаемый результат<textarea id="issue-description" rows="5" maxlength="2500" placeholder="Что вы сделали, что ожидали и что получилось"></textarea></label><p class="hint">Будут добавлены версия, ОС и счётчики выбранного задания. Проверьте свой текст: не указывайте токены и личные данные. Отправка происходит только после подтверждения на GitHub.</p><button id="prepare-issue">Подготовить сообщение</button><div id="issue-preview" hidden><pre id="issue-content"></pre><a id="issue-link" class="oauth-link" target="_blank" rel="noopener noreferrer">Открыть форму GitHub</a><p class="hint">При необходимости приложите ZIP из раздела диагностики.</p></div></dialog>
 </body>
 </html>

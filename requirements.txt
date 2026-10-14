@@ -3,3 +3,4 @@ requests==2.34.2
 urllib3==2.8.0
 Pillow==12.3.0
 waitress==3.0.2
+pystray==0.19.5; sys_platform == 'win32'

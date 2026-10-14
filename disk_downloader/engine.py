@@ -14,15 +14,18 @@ from pathlib import Path
 import requests
 from PIL import Image
 
-from .api import APIError, Deadline, SIZES, Suspended, attempt_count, retry_delay
+from .api import APIError, Deadline, NetworkError, SIZES, Suspended, attempt_count, retry_delay
 from .import_state import find_import, inherit, save_import
 from .file_types import FILE_TYPES, file_type, preview_type, selected_type
 from .estimation import RemainingTime
-from .paths import PathError, component, digest, native, normalize_selection, parent_path, publish, remote_path, reserve_output, safe_join, suffix, temporary_file
+from .paths import file_signature, PathError, component, digest, native, normalize_selection, parent_path, publish, remote_path, reserve_output, safe_join, suffix, temporary_file
 from .reports import write_reports
 from .journal import Journal, PHASES
-from .adaptive import AdaptiveWorkers
 from .partials import Partials, strong_etag
+from .folder_usage import FolderUsage
+from . import exclusions, rate_limit
+from .inventory import compare, write_changes
+from .network import NetworkWait
 
 
 def now():
@@ -68,14 +71,16 @@ class Control:
         self.finished = None
         self.temporary = set()
         self.temporary_sizes = {}
-        self.remaining_time = RemainingTime(self.active_clock)
+        self.remaining_time = RemainingTime(self.statistics_clock)
         self.journal = None
+        self.network = NetworkWait(self.event, clock=self.active_clock)
         self.space_check = None
         self.space_lock = threading.Lock()
         self.next_space_check = 0
         self.pause_reason = ""
         self.adaptive = None
         self.selected_paths = None
+        self.rate_limiter = rate_limit.RateLimiter(0)
 
     def event(self, group, message, path="", level="info"):
         if self.journal:
@@ -115,13 +120,16 @@ class Control:
 
     def snapshot(self):
         with self.lock:
-            elapsed = (self.finished or self.pause_started or time.monotonic()) - self.started - self.elapsed_before
+            elapsed = (self.finished or self.pause_started or time.monotonic()) - self.started - self.elapsed_before - self.network.elapsed
             return {"active": list(self.active.values()), "speed": self.transferred / max(0.1, elapsed)}
 
     def active_clock(self):
         with self.condition:
-            current = time.monotonic()
+            current = self.finished or time.monotonic()
             return current - self.elapsed_before - (current - self.pause_started if self.pause_started is not None else 0)
+
+    def statistics_clock(self):
+        return self.active_clock() - self.network.elapsed
 
 
 class Engine:
@@ -133,6 +141,8 @@ class Engine:
         self.threads = {}
         self.journal_interval = 300
         self.partials = Partials(store)
+        self.shutting_down = False
+        self.folder_usage = FolderUsage()
 
     def validate_settings(self, data):
         if "attempts" not in data and "retries" in data and (isinstance(data["retries"], bool) or not isinstance(data["retries"], int) or not 0 <= data["retries"] <= 8):
@@ -166,7 +176,7 @@ class Engine:
         if operation not in ("new", "missing"):
             raise ValueError("Некорректный способ загрузки")
         values["retries"] = values["attempts"] - 1
-        for name, default in (("create_zip", True), ("auto_pause", True), ("resume_parts", True), ("adaptive_workers", True)):
+        for name, default in (("create_zip", True), ("auto_pause", True), ("resume_parts", True), ("adaptive_workers", False)):
             value = data.get(name, default)
             if not isinstance(value, bool):
                 raise ValueError("Некорректная настройка " + name)
@@ -174,12 +184,17 @@ class Engine:
         fullness = data.get("max_disk_percent", 95)
         if isinstance(fullness, bool) or not isinstance(fullness, (int, float)) or not 1 <= fullness <= 99.9:
             raise ValueError("Порог заполнения диска: от 1 до 99,9%")
+        values["adaptive_workers"] = False
         values["max_disk_percent"] = fullness
+        values["exclusions"] = exclusions.validate(data.get("exclusions", []))
+        values["speed_limit_mib"] = rate_limit.validate(data.get("speed_limit_mib", 0))
         return {"mode": mode, "preview_size": size, "reports": sorted(set(reports)), "file_types": sorted(set(file_types)),
                 "paths": normalize_selection(paths, data.get("whole_disk", False)), "whole_disk": data.get("whole_disk", False),
                 "destination": destination, "operation": operation, **values}
 
     def create(self, data):
+        if self.shutting_down:
+            raise ValueError("Приложение завершается")
         if not self.api.credentials.connected:
             raise ValueError("Сначала подключите Диск")
         data = dict(data)
@@ -195,6 +210,8 @@ class Engine:
                 data["paths"] = previous["job"]["settings"]["paths"]
                 data["whole_disk"] = previous["job"]["settings"].get("whole_disk", False)
         settings = self.validate_settings(data)
+        if previous:
+            settings["comparison_available"] = bool(previous.get("store") or previous.get("inventory_available"))
         job_id = uuid.uuid4().hex
         root = Path(settings["destination"]) if settings["operation"] == "missing" else Path(settings["destination"]) / ("Disk-" + job_id[:12])
         if settings["operation"] == "new":
@@ -215,6 +232,8 @@ class Engine:
 
     def launch(self, job_id, operation="download", paths=None):
         with self.lock:
+            if self.shutting_down:
+                raise ValueError("Приложение завершается")
             if any(t.is_alive() for t in self.threads.values()):
                 raise ValueError("Дождитесь завершения текущей операции или остановите её")
             if operation != "pack" and not self.api.credentials.connected:
@@ -222,9 +241,11 @@ class Engine:
             control = Control()
             control.journal = Journal(self, job_id, self.journal_interval)
             job = self.store.job(job_id)
-            control.adaptive = AdaptiveWorkers(job["settings"]["workers"], job["settings"].get("adaptive_workers", True), control.active_clock)
+            control.adaptive = None
+            control.rate_limiter = rate_limit.RateLimiter(job["settings"].get("speed_limit_mib", 0), control.active_clock)
             control.space_check = lambda: self.check_space(job_id, control)
             control.selected_paths = tuple(paths) if paths else None
+            control.reuse_scanned = operation == "download" and not paths and job["phase"] == "ready" and job["settings"].get("operation") == "missing"
             self.controls[job_id] = control
             thread = threading.Thread(target=self.run, args=(job_id, operation, control), daemon=True)
             self.threads[job_id] = thread
@@ -236,7 +257,7 @@ class Engine:
             live = self.threads.get(job_id)
             control = self.controls.get(job_id)
             if action == "pause":
-                if not live or not live.is_alive() or job["phase"] not in ("scanning", "downloading", "packing"):
+                if not live or not live.is_alive() or job["phase"] not in ("scanning", "preparing", "downloading", "packing"):
                     raise ValueError("Нет активной операции для паузы")
                 control.pause()
                 control.pause_reason = ""
@@ -257,16 +278,16 @@ class Engine:
                         control.journal.flush()
                 return
             if action == "resume" and live and live.is_alive() and control.paused:
-                if limits and any(limits.get(k, job["settings"].get(k)) != job["settings"].get(k, attempt_count(job["settings"]) if k == "attempts" else None) for k in ("workers", "attempts", "timeout")):
+                if limits and any(limits.get(k, job["settings"].get(k, 0 if k == "speed_limit_mib" else None)) != job["settings"].get(k, attempt_count(job["settings"]) if k == "attempts" else 0 if k == "speed_limit_mib" else None) for k in ("workers", "attempts", "timeout", "speed_limit_mib")):
                     raise ValueError("Для изменения ограничений остановите задание и продолжите с новыми параметрами")
                 if not self.api.credentials.connected and not job["scan_complete"]:
                     raise ValueError("Подключите Диск")
                 if limits:
-                    keys = ("create_zip", "auto_pause", "max_disk_percent", "adaptive_workers", "resume_parts")
+                    keys = ("create_zip", "auto_pause", "max_disk_percent", "adaptive_workers", "resume_parts", "speed_limit_mib")
                     validated = self.validate_settings(job["settings"] | {key: limits[key] for key in keys if key in limits})
                     job["settings"].update({key: validated[key] for key in keys})
                     self.store.update_job(job_id, settings=json.dumps(job["settings"], ensure_ascii=False))
-                    control.adaptive.configure(validated["adaptive_workers"])
+
                 if control.pause_reason and self.check_space(job_id, control, force=True):
                     raise ValueError(control.pause_reason)
                 self.store.update_job(job_id, phase=getattr(control, "phase", "downloading"), pause_reason="")
@@ -278,7 +299,7 @@ class Engine:
                 if live and live.is_alive():
                     raise ValueError("Операция ещё выполняется")
                 if limits:
-                    keys = ("workers", "attempts", "timeout", "create_zip", "auto_pause", "max_disk_percent", "adaptive_workers", "resume_parts")
+                    keys = ("workers", "attempts", "timeout", "create_zip", "auto_pause", "max_disk_percent", "adaptive_workers", "resume_parts", "speed_limit_mib")
                     validated = self.validate_settings({**job["settings"], **{k: limits[k] for k in keys if k in limits}})
                     job["settings"].update({k: validated[k] for k in (*keys, "retries")})
                     self.store.update_job(job_id, settings=json.dumps(job["settings"], ensure_ascii=False))
@@ -300,7 +321,10 @@ class Engine:
                         if has_scan_errors:
                             db.execute("UPDATE jobs SET scan_complete=0 WHERE id=?", (job_id,))
                     else:
-                        db.execute("UPDATE entries SET status='pending' WHERE job=? AND kind='file'", (job_id,))
+                        if job["phase"] == "ready" and job["settings"].get("operation") == "missing":
+                            db.execute("UPDATE entries SET status='pending' WHERE job=? AND kind='file' AND NOT (status='existing' AND original_status='existing_verified')", (job_id,))
+                        else:
+                            db.execute("UPDATE entries SET status='pending' WHERE job=? AND kind='file'", (job_id,))
                 self.launch(job_id, "download", paths=paths if action == "retry_selected" else None)
                 return
             if action == "pack":
@@ -320,10 +344,14 @@ class Engine:
         control = self.controls.get(job_id)
         status.update(control.snapshot() if control else {"active": [], "speed": 0})
         status["live"] = live
+        status["network_waiting"] = bool(live and control and control.network.offline.is_set())
+        status["network_warning"] = control.network.message if status["network_waiting"] else ""
+        if status["network_waiting"]:
+            status["speed"] = 0
         status["journal_saved"] = control.journal.saved if control and control.journal else None
         status["journal_error"] = control.journal.error if control and control.journal else ""
         status["pause_reason"] = control.pause_reason if control else status.get("pause_reason", "")
-        status["workers_status"] = control.adaptive.snapshot() if control and control.adaptive else {"current": status["settings"]["workers"], "maximum": status["settings"]["workers"], "enabled": status["settings"].get("adaptive_workers", True), "reason": ""}
+        status["workers_status"] = control.adaptive.snapshot() if control and control.adaptive else {"current": status["settings"]["workers"], "maximum": status["settings"]["workers"], "enabled": False, "reason": ""}
         status["partial_bytes"] = 0
         service_bytes = 0
         counted_outputs = set()
@@ -360,9 +388,13 @@ class Engine:
             except (OSError, PathError):
                 pass
         status["local_bytes"] = status["saved_bytes"] + service_bytes
+        usage = self.folder_usage.snapshot(status["root"])
+        status["folder_bytes"] = usage["bytes"] if usage["bytes"] is not None else status["local_bytes"]
+        status["folder_bytes_scanning"] = usage["scanning"]
+        status["folder_bytes_updated"] = usage["updated"]
         status["eta_seconds"] = None
         status["eta_phase"] = None
-        if live and control and status["phase"] in ("downloading", "packing"):
+        if live and control and not status["network_waiting"] and status["phase"] in ("downloading", "packing"):
             phase = status["phase"]
             work = status["remaining_work"]
             remaining_bytes, unknown_files = work["bytes"], work["unknown_files"]
@@ -421,11 +453,12 @@ class Engine:
             return False
 
     def run(self, job_id, operation, control):
+        saved_scan = False
         try:
             self.store.update_job(job_id, error="", ended=None, pause_reason="")
             control.journal.start(operation)
             if operation == "pack":
-                self.prepare_paths(job_id)
+                self.prepare_paths(job_id, control)
                 job = self.store.job(job_id)
                 self.store.update_job(job_id, ended=now(), phase="stopped" if not job["scan_complete"] else job["phase"])
                 self.pack(job_id, control, manual=True)
@@ -433,9 +466,11 @@ class Engine:
             if not self.store.job(job_id)["scan_complete"] and not control.selected_paths:
                 self.phase(job_id, control, "scanning")
                 self.scan(job_id, control)
-            self.prepare_paths(job_id)
-            save_import(self.store, job_id)
+            self.phase(job_id, control, "preparing")
+            self.prepare_paths(job_id, control, prime=operation == "scan" or getattr(control, "reuse_scanned", False))
             if operation == "scan":
+                save_import(self.store, job_id)
+                saved_scan = True
                 self.store.update_job(job_id, phase="ready")
                 return
             self.phase(job_id, control, "downloading")
@@ -456,7 +491,8 @@ class Engine:
             control.event("system", PHASES.get(self.store.job(job_id)["phase"], "Операция завершена"))
             control.journal.close()
             try:
-                save_import(self.store, job_id)
+                if not saved_scan:
+                    save_import(self.store, job_id)
             except (OSError, sqlite3.Error, ValueError):
                 pass
             with control.lock:
@@ -468,6 +504,8 @@ class Engine:
         settings = job["settings"]
         for path in settings["paths"]:
             control.check()
+            if exclusions.excluded(path, settings):
+                continue
             with self.store.db() as db:
                 exists = db.execute("SELECT 1 FROM entries WHERE job=? AND path=?", (job_id, path)).fetchone()
             if exists:
@@ -490,7 +528,7 @@ class Engine:
             if not directory:
                 break
             path, offset = directory
-            control.progress(path, offset, None, "Обход папки")
+            control.progress(path, offset, None, "Обход папки", unit="objects")
             try:
                 meta = self.api.metadata(path, settings, control.check, offset=offset, limit=200)
                 embedded = meta.get("_embedded")
@@ -521,6 +559,10 @@ class Engine:
         with control.lock:
             control.active.clear()
         self.store.update_job(job_id, scan_complete=1)
+        control.check()
+        self.phase(job_id, control, "preparing")
+        control.progress(settings["paths"][0], 0, None, "Сравнение обходов", unit="objects")
+        compare(self.store, job_id)
 
     def allocate(self, job_id, identity, proposed):
         with self.store.db() as db:
@@ -548,26 +590,67 @@ class Engine:
             local = self.allocate(job_id, source, proposed)
         return local
 
-    def prepare_paths(self, job_id):
+    def prepare_paths(self, job_id, control=None, prime=False):
         job = self.store.job(job_id)
-        for entry in self.store.rows("SELECT path,kind,meta FROM entries WHERE job=? ORDER BY path COLLATE BINARY", (job_id,)):
-            relative = self.map_path(job_id, entry["path"])
-            self.store.update_entry(job_id, entry["path"], local=relative)
-            if entry["kind"] == "file":
-                meta = json.loads(entry["meta"])
-                with self.store.db() as db:
-                    db.execute("DELETE FROM artifacts WHERE job=? AND path=? AND fingerprint!=?", (job_id, entry["path"], fingerprint(meta)))
-                    if not preview_type(meta):
-                        db.execute("DELETE FROM artifacts WHERE job=? AND path=? AND type='preview'", (job_id, entry["path"]))
-            if entry["kind"] == "dir":
+        cursor = ""
+        count = 0
+        cache = {"disk:/": ""}
+        while True:
+            if control:
+                control.check()
+            with self.store.db() as db:
+                rows = db.execute("SELECT path,kind,meta,local FROM entries WHERE job=? AND path>? AND (local IS NULL OR kind='dir') ORDER BY path COLLATE BINARY LIMIT 500", (job_id, cursor)).fetchall()
+                if not rows:
+                    break
+                directories = []
+                for entry in rows:
+                    relative = entry["local"]
+                    if relative is None:
+                        source, relative = "disk:/", ""
+                        for part in entry["path"][6:].split("/") if entry["path"] != "disk:/" else []:
+                            source = source.rstrip("/") + "/" + part
+                            if source in cache:
+                                relative = cache[source]
+                                continue
+                            existing = db.execute("SELECT local FROM names WHERE job=? AND identity=?", (job_id, source)).fetchone()
+                            if existing:
+                                relative = existing[0]
+                            else:
+                                proposed = (relative + "/" if relative else "") + component(part, source)
+                                relative, counter = proposed, 0
+                                while db.execute("SELECT 1 FROM names WHERE job=? AND folded=?", (job_id, relative.casefold())).fetchone():
+                                    counter += 1
+                                    parent, _, name = proposed.rpartition("/")
+                                    relative = (parent + "/" if parent else "") + suffix(name, digest(source + str(counter)))
+                                db.execute("INSERT INTO names VALUES(?,?,?,?)", (job_id, source, relative, relative.casefold()))
+                            if len(cache) > 8192:
+                                cache = {"disk:/": ""}
+                            cache[source] = relative
+                        db.execute("UPDATE entries SET local=? WHERE job=? AND path=?", (relative, job_id, entry["path"]))
+                    if entry["kind"] == "file":
+                        meta = json.loads(entry["meta"])
+                        db.execute("DELETE FROM artifacts WHERE job=? AND path=? AND fingerprint!=?", (job_id, entry["path"], fingerprint(meta)))
+                        if not preview_type(meta):
+                            db.execute("DELETE FROM artifacts WHERE job=? AND path=? AND type='preview'", (job_id, entry["path"]))
+                    else:
+                        directories.append(relative)
+            for relative in directories:
+                if control:
+                    control.check()
                 os.makedirs(safe_join(job["root"], relative), exist_ok=True)
+            count += len(rows)
+            cursor = rows[-1]["path"]
+            if control:
+                control.progress(job["settings"]["paths"][0], count, None, "Подготовка локальных путей", unit="objects")
+        self.prioritize(job_id, control, prime=prime)
+        if control:
+            with control.lock:
+                control.active.clear()
 
     def download(self, job_id, control):
         workers = self.store.job(job_id)["settings"]["workers"]
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="disk-download") as pool:
             for stage in range(2):
-                if stage:
-                    self.prioritize(job_id, control)
                 condition = "" if stage else " AND NOT EXISTS(SELECT 1 FROM artifacts a WHERE a.job=entries.job AND a.path=entries.path)"
                 parameters = (job_id,)
                 if control.selected_paths:
@@ -592,20 +675,54 @@ class Engine:
                     for future in done:
                         future.result()
 
-    def prioritize(self, job_id, control):
+    def prioritize(self, job_id, control, prime=False):
         job = self.store.job(job_id)
         with self.store.db() as db:
-            db.execute("DELETE FROM verification_cache WHERE job=?", (job_id,))
-            db.execute("UPDATE entries SET priority=0 WHERE job=? AND status='pending'", (job_id,))
-        for entry in self.store.rows("SELECT e.* FROM entries e WHERE e.job=? AND e.kind='file' AND e.status='pending' AND EXISTS(SELECT 1 FROM artifacts a WHERE a.job=e.job AND a.path=e.path)", (job_id,)):
-            control.check()
-            control.progress(entry["path"], 0, None, "Проверка ранее скачанного")
-            meta = json.loads(entry["meta"])
-            original = self.reusable(job, entry, "original", meta, control)
-            preview = self.reusable(job, entry, "preview", meta, control)
-            self.store.update_entry(job_id, entry["path"], priority=2 if original else 1 if preview else 0)
-            with control.lock:
-                control.active.pop(entry["path"], None)
+            rows = db.execute("SELECT e.path,e.meta,e.status,a.type,a.local,a.size,a.sha256,a.fingerprint,v.signature FROM entries e JOIN artifacts a ON a.job=e.job AND a.path=e.path LEFT JOIN verification_cache v ON v.job=a.job AND v.local=a.local WHERE e.job=? AND e.kind='file' AND (? OR e.status='pending') ORDER BY e.path,a.type", (job_id, prime)).fetchall()
+        candidates = {}
+        for index, row in enumerate(rows):
+            if control:
+                control.check()
+                if index % 250 == 0:
+                    control.progress(job["settings"]["paths"][0], index, None, "Учёт прежних результатов", unit="objects")
+            meta = json.loads(row["meta"])
+            valid, confirmed = False, False
+            try:
+                filename = safe_join(job["root"], row["local"])
+                info = os.stat(filename)
+                valid = os.path.isfile(filename) and info.st_size == row["size"] and row["fingerprint"] == fingerprint(meta)
+                if row["type"] == "original" and meta.get("sha256"):
+                    valid = valid and row["sha256"].lower() == meta["sha256"].lower()
+                signature = file_signature(filename, row["sha256"])
+                encoded = json.dumps(signature)
+                confirmed = valid and signature[-1] is not None and row["signature"] == encoded
+                if row["signature"] and not confirmed:
+                    previous_signature = json.loads(row["signature"])
+                    valid = valid and isinstance(previous_signature, list) and len(previous_signature) == 6 and previous_signature == list(signature[:6])
+            except (OSError, ValueError):
+                pass
+            value = candidates.setdefault(row["path"], {"priority": 0, "original": False, "status": row["status"]})
+            if valid:
+                value["priority"] = max(value["priority"], 2 if row["type"] == "original" else 1)
+            if row["type"] == "original" and confirmed:
+                value["original"] = True
+        with self.store.db() as db:
+            for path, value in candidates.items():
+                db.execute("UPDATE entries SET priority=? WHERE job=? AND path=?", (value["priority"], job_id, path))
+                if prime and (job["settings"].get("operation") == "missing" or job["generation"] > 0):
+                    if value["original"]:
+                        db.execute("UPDATE entries SET status='existing',error='',original_status='existing_verified',preview_status='not_needed',fallback=0 WHERE job=? AND path=?", (job_id, path))
+                        db.execute("DELETE FROM artifacts WHERE job=? AND path=? AND type='preview'", (job_id, path))
+                    elif value["status"] == "existing":
+                        db.execute("UPDATE entries SET status='pending' WHERE job=? AND path=?", (job_id, path))
+
+    def remember_file(self, job, relative, sha):
+        signature = file_signature(safe_join(job["root"], relative), sha)
+        if signature[-1] is None:
+            return
+        signature = json.dumps(signature)
+        with self.store.db() as db:
+            db.execute("INSERT OR REPLACE INTO verification_cache VALUES(?,?,?)", (job["id"], relative, signature))
 
     def reusable(self, job, entry, kind, meta, control):
         with self.store.db() as db:
@@ -626,23 +743,26 @@ class Engine:
                 return False
             with self.store.db() as db:
                 db.execute("INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)", (job["id"], entry["path"], kind, entry["local"], os.path.getsize(filename), sha.hexdigest(), fingerprint(meta), None))
+            self.remember_file(job, entry["local"], sha.hexdigest())
             return True
         artifact = dict(artifact)
         try:
             filename = safe_join(job["root"], artifact["local"])
             valid = artifact["fingerprint"] == fingerprint(meta) and (kind != "preview" or artifact["preview_size"] == job["settings"]["preview_size"])
+            if kind == "original" and meta.get("sha256"):
+                valid = valid and artifact["sha256"].lower() == meta["sha256"].lower()
             valid = valid and os.path.isfile(filename) and os.path.getsize(filename) == artifact["size"]
             if valid:
                 info = os.stat(filename)
-                signature = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, artifact["sha256"])
+                signature = file_signature(filename, artifact["sha256"])
                 encoded = json.dumps(signature)
                 with self.store.db() as db:
                     cached_row = db.execute("SELECT signature FROM verification_cache WHERE job=? AND local=?", (job["id"], artifact["local"])).fetchone()
-                cached = cached_row is not None and cached_row[0] == encoded
+                cached = signature[-1] is not None and cached_row is not None and cached_row[0] == encoded
                 valid = cached or file_hash(filename, control.check) == artifact["sha256"]
                 after = os.stat(filename)
-                valid = valid and signature[:5] == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
-                if valid and not cached:
+                valid = valid and signature == file_signature(filename, artifact["sha256"])
+                if valid and not cached and signature[-1] is not None:
                     with self.store.db() as db:
                         db.execute("INSERT OR REPLACE INTO verification_cache VALUES(?,?,?)", (job["id"], artifact["local"], encoded))
         except OSError:
@@ -660,12 +780,13 @@ class Engine:
         if job["settings"].get("operation") == "missing" or job["generation"] > 0:
             mode = "fallback"
         errors = []
+        other_errors = []
         completed, reused = [], []
         original_status = preview_status = "not_requested"
         fallback = False
         try:
             control.check()
-            self.store.update_entry(job_id, path, original_attempts=0, preview_attempts=0, original_status="not_requested", preview_status="not_requested", fallback=0)
+            self.store.update_entry(job_id, path, error="", original_attempts=0, preview_attempts=0, original_status="not_requested", preview_status="not_requested", fallback=0)
             control.progress(path, 0, None, "Проверка метаданных")
             meta = self.api.metadata(path, job["settings"], control.check, limit=1)
             if meta["type"] != "file":
@@ -711,7 +832,9 @@ class Engine:
                 except Exception as exc:
                     outcome = "unavailable" if isinstance(exc, APIError) and exc.status == 404 and kind == "preview" else "failed"
                     errors.append(("Оригинал: " if kind == "original" else "Превью: ") + safe_error(exc))
-                    control.event("errors", ("Оригинал: " if kind == "original" else "Превью: ") + safe_error(exc), path, "warning" if outcome == "unavailable" else "error")
+                    if isinstance(exc, (OSError, PathError)):
+                        other_errors.append(safe_error(exc))
+                    control.event(kind, ("Оригинал: " if kind == "original" else "Превью: ") + safe_error(exc), path, "warning")
                 if kind == "original":
                     original_status = outcome
                     self.store.update_entry(job_id, path, original_status=outcome)
@@ -725,7 +848,9 @@ class Engine:
                 status = "error"
             else:
                 status = "existing" if len(reused) == len(completed) else "done"
-            self.store.update_entry(job_id, path, status=status, error="; ".join(errors), original_status=original_status, preview_status=preview_status, fallback=int(fallback))
+            if not completed or other_errors:
+                control.event("errors", "; ".join(errors if not completed else other_errors), path, "error")
+            self.store.update_entry(job_id, path, status=status, error="; ".join(errors if not completed else other_errors), original_status=original_status, preview_status=preview_status, fallback=int(fallback))
         except Suspended:
             self.store.update_entry(job_id, path, status="pending", original_status=original_status, preview_status=preview_status)
             control.stop()
@@ -754,8 +879,10 @@ class Engine:
         delay = 0
         stamp = fingerprint(meta) + ":" + kind + (":" + settings["preview_size"] if kind == "preview" else "")
         persistent = settings.get("resume_parts", True)
-        for attempt in range(tries):
+        attempt = 0
+        while attempt < tries:
             control.check()
+            control.network.wait(control.check)
             response = session = None
             pending_bytes = 0
             row, temp, sha, md5 = self.partials.prepare(job, entry["path"], kind, stamp, control.check)
@@ -826,12 +953,15 @@ class Engine:
                             stream.seek(offset)
                             stream.truncate(offset)
                             self.partials.save(job, entry["path"], kind, size, sha, etag, total)
-                            for chunk in response.iter_content(256 * 1024):
+                            chunk_size = min(65536, max(1024, int(settings.get("speed_limit_mib", 0) * 1024 * 1024 / 10))) if settings.get("speed_limit_mib", 0) else 256 * 1024
+                            for chunk in response.iter_content(chunk_size):
                                 deadline.check()
                                 if not self.api.credentials.connected:
                                     raise Suspended("Диск отключён")
                                 if not chunk:
                                     continue
+                                with deadline.hold():
+                                    control.rate_limiter.consume(len(chunk), control.check)
                                 stream.write(chunk)
                                 sha.update(chunk)
                                 md5.update(chunk)
@@ -901,14 +1031,20 @@ class Engine:
                         db.execute("INSERT OR REPLACE INTO artifacts VALUES(?,?,?,?,?,?,?,?)", (job["id"], entry["path"], kind, relative, size, sha.hexdigest(), fingerprint(meta), settings["preview_size"] if kind == "preview" else None))
                     if control.adaptive:
                         control.adaptive.success()
+                    self.remember_file(job, relative, sha.hexdigest())
                     return
             except Suspended:
                 raise
             except Exception as exc:
-                error = APIError(f"Превышен лимит попытки: {settings['timeout']} с") if deadline.expired.is_set() else exc
+                error = exc
+                if deadline.network_aborted.is_set():
+                    error = NetworkError(offline=True)
+                elif deadline.expired.is_set():
+                    error_type = NetworkError if isinstance(exc, (requests.RequestException, NetworkError)) else APIError
+                    error = error_type(f"Превышен лимит попытки: {settings['timeout']} с")
                 if control.adaptive and not isinstance(error, OSError):
                     control.adaptive.failure(error.status if isinstance(error, APIError) else None)
-                control.event("errors", f"{'Оригинал' if kind == 'original' else 'Превью'} · попытка {attempt + 1}/{tries}: {safe_error(error)}", entry["path"], "warning" if attempt < tries - 1 else "error")
+                control.event(kind, f"{'Оригинал' if kind == 'original' else 'Превью'} · попытка {attempt + 1}/{tries}: {safe_error(error)}", entry["path"], "warning")
                 if isinstance(error, APIError) and error.status == 416:
                     keep = False
             finally:
@@ -933,19 +1069,28 @@ class Engine:
                 with control.lock:
                     control.temporary.discard(temp)
                     control.temporary_sizes.pop(temp, None)
+            def connected_check():
+                control.check()
+                if not self.api.credentials.connected:
+                    raise Suspended("Диск отключён")
+            if control.network.recover(error, connected_check):
+                delay = 0
+                continue
             if isinstance(error, OSError) or isinstance(error, APIError) and error.status == 404 and kind == "preview" or attempt == tries - 1:
                 raise error
             delay = error.retry_after if isinstance(error, APIError) and error.retry_after is not None else retry_delay(None, attempt)
+            attempt += 1
 
     def pack(self, job_id, control, manual=False):
         job = self.store.job(job_id)
         summary = self.store.summary(job_id)
-        final_phase = "stopped" if manual and (not job["scan_complete"] or summary["cancelled"] or summary["processed"] < summary["files"] or job["phase"] in ("stopped", "interrupted", "failed")) else ("completed_with_errors" if summary["errors"] or summary["missing_previews"] or summary["scan_errors"] or summary["replacements"] else "completed")
+        final_phase = "stopped" if manual and (not job["scan_complete"] or summary["cancelled"] or summary["processed"] < summary["files"] or job["phase"] in ("stopped", "interrupted", "failed")) else ("completed_with_errors" if summary["errors"] or summary["scan_errors"] else "completed")
         if control.selected_paths and (not job["scan_complete"] or summary["cancelled"] or summary["processed"] < summary["files"]):
             final_phase = "stopped"
         self.store.update_job(job_id, phase=final_phase, ended=job["ended"] or now())
         control.check()
         reports = write_reports(self.store, job_id)
+        reports.append(write_changes(self.store, job_id))
         if not manual and not job["settings"].get("create_zip", True):
             self.store.update_job(job_id, phase=final_phase, generation=job["generation"] + 1)
             control.event("archive", "Файлы и отчёты сохранены; создание ZIP выключено", level="success")
@@ -962,7 +1107,7 @@ class Engine:
         pending_zip, last_flush = 0, time.monotonic()
         try:
             with zipfile.ZipFile(temp, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as output:
-                for row in self.store.rows("SELECT local FROM names WHERE job=? AND identity NOT LIKE '%@%' ORDER BY local", (job_id,)):
+                for row in self.store.rows("SELECT local FROM entries WHERE job=? AND kind='dir' AND local!='' ORDER BY local", (job_id,)):
                     control.check()
                     relative = row["local"]
                     if os.path.isdir(safe_join(job["root"], relative)):
@@ -972,7 +1117,7 @@ class Engine:
                 artifacts = self.store.rows("SELECT a.local,a.size,a.sha256 FROM artifacts a JOIN entries e ON e.job=a.job AND e.path=a.path WHERE a.job=? ORDER BY a.local", (job_id,))
                 files = ((r["local"], r["size"], r["sha256"], r["local"]) for r in artifacts)
                 import itertools
-                report_files = ((r, os.path.getsize(safe_join(job["root"], r)), None, report_folder + "/report." + r.rsplit(".", 1)[1]) for r in reports)
+                report_files = ((r, os.path.getsize(safe_join(job["root"], r)), None, report_folder + ("/changes.html" if r == reports[-1] else "/report." + r.rsplit(".", 1)[1])) for r in reports)
                 for relative, expected_size, expected_sha, archive_name in itertools.chain(files, report_files):
                     control.check()
                     filename = safe_join(job["root"], relative)

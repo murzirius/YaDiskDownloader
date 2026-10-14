@@ -1,7 +1,7 @@
 import threading
 import socket
 import time
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import urljoin, urlsplit
@@ -28,6 +28,12 @@ class APIError(Exception):
         self.retry_after = retry_after
 
 
+class NetworkError(APIError):
+    def __init__(self, message="Сетевая ошибка или таймаут", offline=False):
+        super().__init__(message)
+        self.offline = offline
+
+
 def attempt_count(settings):
     return settings.get("attempts", settings.get("retries", 0) + 1)
 
@@ -38,7 +44,11 @@ class Deadline:
         self.checkpoint = checkpoint
         self.clock = clock
         self.cancelled = cancelled
+        self.network = getattr(getattr(checkpoint, "__self__", None), "network", None)
+        self.network_aborted = threading.Event()
         self.started = clock()
+        self.held = 0
+        self.hold_started = None
         self.finished = threading.Event()
         self.expired = threading.Event()
         self.lock = threading.Lock()
@@ -47,22 +57,38 @@ class Deadline:
         self.thread = threading.Thread(target=self.watch, daemon=True)
 
     def __enter__(self):
+        if self.network:
+            self.network.register(self)
         self.thread.start()
         return self
 
     def __exit__(self, kind, value, traceback):
         self.finished.set()
+        if self.network:
+            self.network.unregister(self)
         self.abort()
         self.thread.join(0.2)
 
     def remaining(self):
-        return max(0, self.seconds - (self.clock() - self.started))
+        current = self.clock()
+        return max(0, self.seconds - ((self.hold_started if self.hold_started is not None else current) - self.started - self.held))
+
+    @contextmanager
+    def hold(self):
+        self.hold_started = self.clock()
+        try:
+            yield
+        finally:
+            self.held += self.clock() - self.hold_started
+            self.hold_started = None
 
     def check(self):
         self.checkpoint()
+        if self.network_aborted.is_set() or self.network and self.network.offline.is_set():
+            raise NetworkError(offline=True)
         if self.expired.is_set() or self.remaining() <= 0:
             self.expired.set()
-            raise APIError(f"Превышен лимит попытки: {self.seconds} с")
+            raise NetworkError(f"Превышен лимит попытки: {self.seconds} с")
 
     def attach(self, connection=None, response=None):
         with self.lock:
@@ -86,12 +112,18 @@ class Deadline:
                 except OSError:
                     pass
                 try:
-                    sock.close()
+                    descriptor = sock.detach()
+                    if descriptor != -1:
+                        socket.close(descriptor)
                 except OSError:
                     pass
 
     def watch(self):
         while not self.finished.wait(0.025):
+            if self.network_aborted.is_set() or self.network and self.network.offline.is_set():
+                self.network_aborted.set()
+                self.abort()
+                continue
             if self.cancelled() or self.remaining() <= 0:
                 self.expired.set()
                 self.abort()
@@ -234,8 +266,12 @@ class DiskAPI:
                 response.close()
             session.close()
             if deadline:
+                if deadline.network_aborted.is_set():
+                    raise NetworkError(offline=True) from None
+                if deadline.expired.is_set():
+                    raise NetworkError(f"Превышен лимит попытки: {timeout} с") from None
                 deadline.check()
-            raise APIError("Сетевая ошибка или таймаут") from None
+            raise NetworkError() from None
         except BaseException:
             if response is not None:
                 response.close()
@@ -275,11 +311,15 @@ class DiskAPI:
 
         budget = None
         delay = 0
-        for attempt in range(tries):
+        control = getattr(checkpoint, "__self__", None)
+        network = getattr(control, "network", None)
+        owner = settings.get("_deadline")
+        attempt = 0
+        while attempt < tries:
             response = session = None
+            if network and not owner:
+                network.wait(checkpoint)
             try:
-                owner = settings.get("_deadline")
-                control = getattr(checkpoint, "__self__", None)
                 with nullcontext(owner) if owner else Deadline(timeout, checkpoint, getattr(control, "active_clock", time.monotonic), lambda: getattr(control, "stopped", False) or not self.credentials.connected) as budget:
                     check.deadline = budget
                     if delay:
@@ -303,18 +343,26 @@ class DiskAPI:
                         raise APIError("Некорректный ответ API")
                     return result
             except (requests.RequestException, AttributeError, OSError):
-                error = APIError(f"Превышен лимит попытки: {timeout} с" if budget and budget.expired.is_set() else "Сетевая ошибка или таймаут")
+                error = NetworkError(offline=True) if budget and budget.network_aborted.is_set() else NetworkError(f"Превышен лимит попытки: {timeout} с" if budget and budget.expired.is_set() else "Сетевая ошибка или таймаут")
             except (ValueError, UnicodeError):
-                error = APIError("Некорректный JSON API")
+                error = NetworkError(offline=True) if budget and budget.network_aborted.is_set() else APIError("Некорректный JSON API")
             except APIError as exc:
                 error = exc
             finally:
                 if response is not None:
                     self.close(response, session)
             budget = None
+            if network and not owner:
+                def connected_check():
+                    self.credentials.check(epoch)
+                    checkpoint()
+                if network.recover(error, connected_check):
+                    delay = 0
+                    continue
             if attempt == tries - 1 or (error.status is not None and error.status != 429 and error.status < 500):
                 raise error
             delay = error.retry_after if error.retry_after is not None else retry_delay(None, attempt)
+            attempt += 1
 
     def metadata(self, path, settings=None, checkpoint=lambda: None, offset=0, limit=200, sort="name", preview_size=None):
         settings = settings or {}
