@@ -26,6 +26,7 @@ from .maintenance import Maintenance
 from .recovery import recover_publications
 from .updater import Installer
 from .service_outputs import root_key, digest_file
+from .limits import normalize_saved_workers
 
 
 def create_app(state_dir=None, api=None, port=8766):
@@ -175,6 +176,7 @@ def create_app(state_dir=None, api=None, port=8766):
                 value = json.loads(row["settings"])
                 if not isinstance(value, dict):
                     raise ValueError()
+                normalize_saved_workers(value)
                 empty_sources = not value.get("whole_disk") and not value.get("paths")
                 validated = engine.validate_settings(value | {"whole_disk": True} if empty_sources else value)
                 if empty_sources:
@@ -226,7 +228,13 @@ def create_app(state_dir=None, api=None, port=8766):
         for row in store.rows("SELECT id FROM jobs WHERE archived=0 ORDER BY started DESC LIMIT 30"):
             job = store.job(row["id"])
             jobs.append({k: job[k] for k in ("id", "title", "phase", "started", "root")})
-        return jsonify(connected=credentials.connected, jobs=jobs)
+        active = None
+        for job_id, thread in tuple(engine.threads.items()):
+            if thread.is_alive():
+                job = store.job(job_id)
+                active = {key: job[key] for key in ('id', 'phase', 'scan_complete')}
+                break
+        return jsonify(connected=credentials.connected, jobs=jobs, active_job=active)
 
     @app.get('/api/history')
     def history():

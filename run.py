@@ -14,6 +14,7 @@ from disk_downloader.web import create_app
 from disk_downloader.runtime import frozen, state_folder, program_folder
 from disk_downloader.migration import migrate, candidates
 from disk_downloader.tray import Tray
+from disk_downloader.lifecycle import Shutdown
 
 
 def message(text):
@@ -86,33 +87,7 @@ def main():
     url = f"http://127.0.0.1:{args.port}"
     if sys.stdout:
         print(f"Приложение доступно: {url}", flush=True)
-    stopping = threading.Event()
-    stopped = threading.Event()
-    shutdown_lock = threading.Lock()
-    tray = None
-    def shutdown():
-        with shutdown_lock:
-            if stopping.is_set():
-                return
-            stopping.set()
-        engine = app.extensions["engine"]
-        app.extensions['management'].stopped.set()
-        app.extensions['maintenance'].cancel.set()
-        with engine.lock:
-            engine.shutting_down = True
-            for control in engine.controls.values():
-                control.stop()
-        server.close()
-        for channel in list(server._map.values()):
-            channel.close()
-        engine.disconnect()
-        for thread in list(engine.threads.values()):
-            thread.join(10)
-        server.task_dispatcher.shutdown(timeout=5)
-        if tray:
-            tray.stop()
-        state_lock.close()
-        stopped.set()
+    shutdown = Shutdown(app, server, state_lock)
     app.extensions["quit_app"] = shutdown
     app.extensions['management'].start()
     if os.name == "nt" and not args.no_tray:
@@ -136,9 +111,12 @@ def main():
         server.run()
     except KeyboardInterrupt:
         pass
+    except OSError:
+        if not shutdown.requested.is_set():
+            raise
     finally:
         shutdown()
-        stopped.wait(20)
+        shutdown.done.wait(shutdown.force_after + 1)
     return 0
 
 

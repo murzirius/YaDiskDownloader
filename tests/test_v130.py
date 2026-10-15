@@ -20,11 +20,11 @@ from disk_downloader.service_outputs import digest_file, root_key
 from disk_downloader.updater import download_url, validate_archive
 
 
-def test_twenty_workers_are_supported_and_bounded(system):
+def test_eight_workers_are_supported_and_bounded(system):
     engine,api,tmp=system
-    settings={'destination':str(tmp/'results'),'whole_disk':True,'workers':20}
-    assert engine.validate_settings(settings)['workers']==20
-    with pytest.raises(ValueError): engine.validate_settings(settings|{'workers':21})
+    settings={'destination':str(tmp/'results'),'whole_disk':True,'workers':8}
+    assert engine.validate_settings(settings)['workers']==8
+    with pytest.raises(ValueError): engine.validate_settings(settings|{'workers':9})
     for n in range(40): api.file('disk:/file-'+str(n)+'.bin',preview=False)
     job_id=engine.create(settings|{'mode':'fallback','create_zip':False})
     wait_job(engine,job_id);engine.action(job_id,'start')

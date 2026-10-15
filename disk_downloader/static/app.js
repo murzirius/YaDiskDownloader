@@ -2,7 +2,7 @@ const $ = id => document.getElementById(id);
 const csrf = document.querySelector('meta[name="csrf-token"]').content;
 const selected = new Set();
 const errorSelections = new Set();
-const state = {limitsJob:null,restoreLimits:false,limitsTouched:false,connected:false,path:'disk:/',offset:0,items:[],total:null,hasMore:false,view:'table',history:[],job:null,jobStatus:null,errorOffset:0,browseVersion:0,thumbVersion:0,urls:[],polling:false};
+const state = {closing:false,actionPending:false,activeJob:null,limitsJob:null,restoreLimits:false,limitsTouched:false,connected:false,path:'disk:/',offset:0,items:[],total:null,hasMore:false,view:'table',history:[],job:null,jobStatus:null,errorOffset:0,browseVersion:0,thumbVersion:0,urls:[],polling:false};
 const phases = {new:'Новое задание',scanning:'Обход Диска',preparing:'Подготовка результатов',ready:'Оценка готова',downloading:'Скачивание',paused:'Пауза',stopping:'Остановка…',stopped:'Остановлено',interrupted:'Требуется продолжение',packing:'Создание ZIP',completed:'Завершено',completed_with_errors:'Завершено с неполным результатом',failed:'Операция завершилась ошибкой'};
 const modes = {previews:'Только превью',both:'Оригиналы и превью',fallback:'Оригинал, превью при неудаче'};
 const typeLabels = {photos:'фото',videos:'видео',music:'музыка',files:'другие файлы'};
@@ -106,7 +106,7 @@ const dismissedNotices = new Set();
 function notice(message){const boxes=[$('notice'),...document.querySelectorAll('.dialog-notice')];if(!message){for(const box of boxes)box.hidden=true;dismissedNotices.clear();return;}if(dismissedNotices.has(message))return;const dialog=document.querySelector('dialog[open]');if(dialog&&!dialog.querySelector('.dialog-notice')){const local=node('div',undefined,'notice dialog-notice');local.role='status';dialog.prepend(local);boxes.push(local);}for(const box of boxes){box.replaceChildren(node('span',message));const close=node('button','×','notice-close');close.setAttribute('aria-label','Закрыть уведомление');close.onclick=()=>{dismissedNotices.add(message);for(const holder of boxes)holder.hidden=true;};box.append(close);box.hidden=!!dialog&&box===$('notice');}}
 async function api(path,data){const controller=new AbortController();const timer=path==='/api/folder'?null:setTimeout(()=>controller.abort(),45000);const options={headers:{'X-CSRF-Token':csrf},credentials:'same-origin',cache:'no-store',signal:controller.signal};if(data!==undefined){options.method='POST';options.headers['Content-Type']='application/json';options.body=JSON.stringify(data);}try{const response=await fetch(path,options);const result=await response.json();if(!response.ok)throw new Error(result.error||`HTTP ${response.status}`);return result;}catch(error){if(error.name==='AbortError')throw new Error('Сервис не ответил вовремя. Проверьте, что приложение запущено.');throw error;}finally{if(timer!==null)clearTimeout(timer);}}
 async function safely(fn){try{notice('');await fn();}catch(error){notice(error.message);}}
-function connection(connected){state.connected=connected;$('connection').textContent=connected?'Диск подключён':'Не подключён';$('connection').classList.toggle('online',connected);$('auth-form').hidden=connected;$('disconnect').hidden=!connected;$('estimate').disabled=!connected;$('refresh').disabled=!connected;$('next-page').disabled=!connected||!state.hasMore;$('prev-page').disabled=!connected||state.offset===0;}
+function connection(connected){state.connected=connected;$('connection').textContent=connected?'Диск подключён':'Не подключён';$('connection').classList.toggle('online',connected);$('auth-form').hidden=connected;$('disconnect').hidden=!connected;$('estimate').disabled=!connected||!!state.activeJob;$('refresh').disabled=!connected;$('next-page').disabled=!connected||!state.hasMore;$('prev-page').disabled=!connected||state.offset===0;}
 function breadcrumb(){const holder=$('breadcrumbs');holder.replaceChildren();const parts=state.path==='disk:/'?[]:state.path.slice(6).split('/');let path='disk:/';const root=node('button','Диск');root.onclick=()=>safely(()=>browse('disk:/',0,true));holder.append(root);for(const part of parts){holder.append(node('span','/','muted'));path=path.replace(/\/$/,'')+'/'+part;const target=path;const button=node('button',part);button.onclick=()=>safely(()=>browse(target,0,true));holder.append(button);}$('up').disabled=parts.length===0||!state.connected;$('back').disabled=!state.history.length||!state.connected;}
 async function browse(path=state.path,offset=0,remember=false){if(!state.connected)return;const version=++state.browseVersion;$('file-list').replaceChildren(node('div','Загрузка списка…','empty'));if(remember&&path!==state.path)state.history.push({path:state.path,offset:state.offset});const result=await api('/api/browse?'+new URLSearchParams({path,offset,sort:$('sort').value}));if(version!==state.browseVersion)return;Object.assign(state,{path:result.path,offset:result.offset,items:result.items,total:result.total,hasMore:result.has_more});breadcrumb();renderFiles();$('page-info').textContent=`${state.items.length?state.offset+1:0}–${state.offset+state.items.length}${state.total===null?'':' из '+state.total} · выбор не ограничен страницей`;$('prev-page').disabled=state.offset===0;$('next-page').disabled=!state.hasMore;}
 function updateSelection(){const whole=$('whole-disk').checked;$('selection-count').textContent=whole?'Выбран весь Диск':`Выбрано: ${selected.size}`;const items=visibleItems();$('select-page').disabled=whole||!items.length;$('select-page').checked=items.length>0&&items.every(item=>selected.has(item.path));$('select-page').indeterminate=items.some(item=>selected.has(item.path))&&!$('select-page').checked;const holder=$('selected-paths');holder.replaceChildren();if(whole){holder.textContent='disk:/ · весь Диск';return;}if(!selected.size){holder.textContent='Выбор пуст';return;}for(const path of selected){const row=node('div',path);holder.append(row);}}
@@ -118,7 +118,7 @@ function renderFiles(){state.thumbVersion++;state.thumbnailObserver?.disconnect(
 function loadThumbnails(){const version=state.thumbVersion;const queue=[];let running=0;const observer=new IntersectionObserver(entries=>{for(const entry of entries){if(entry.isIntersecting){observer.unobserve(entry.target);queue.push(entry.target);}}pump();},{root:$('file-list'),rootMargin:'100px'});state.thumbnailObserver=observer;for(const el of $('file-list').querySelectorAll('[data-preview-path]'))observer.observe(el);async function pump(){if(version!==state.thumbVersion){observer.disconnect();return;}while(running<2&&queue.length){const el=queue.shift();running++;const controller=new AbortController();state.thumbnailControllers.add(controller);(async()=>{try{const response=await fetch('/api/thumbnail?'+new URLSearchParams({path:el.dataset.previewPath,size:state.view==='grid'?'M':'S'}),{headers:{'X-CSRF-Token':csrf},credentials:'same-origin',cache:'no-store',signal:controller.signal});if(!response.ok)return;const blob=await response.blob();if(version!==state.thumbVersion||!state.connected)return;const url=URL.createObjectURL(blob);state.urls.push(url);const img=node('img');img.src=url;img.alt='';el.replaceChildren(img);}catch{}finally{state.thumbnailControllers.delete(controller);running--;pump();}})();}}}
 function advancedSettings(){return {create_zip:$('create-zip').checked,adaptive_workers:false,resume_parts:$('resume-parts').checked,auto_pause:$('auto-pause').checked,max_disk_percent:Number($('max-disk-percent').value),speed_limit_mib:Number($('speed-limit').value),exclusions:$('exclusions').value.split(/\r?\n/).map(value=>value.trim()).filter(Boolean)};}
 function settings(){return {operation:$('operation').value,paths:[...selected],whole_disk:$('whole-disk').checked,destination:$('destination').value,mode:$('mode').value,file_types:$('file-types')?[...document.querySelectorAll('input[name=file-type]:checked')].map(el=>el.value):['photos','videos','music','files'],preview_size:$('preview-size').value,workers:Number($('workers').value),attempts:Number($('retries').value),timeout:Number($('timeout').value),reports:[...document.querySelectorAll('input[name=report]:checked')].map(el=>el.value),...advancedSettings()};}
-async function refreshJobs(){const result=await api('/api/status');connection(result.connected);const history=$('job-history');history.replaceChildren();if(!result.jobs.length){history.append(new Option('Нет заданий',''));$('job-content').hidden=true;return;}for(const job of result.jobs)history.append(new Option(`${job.id.slice(0,8)} · ${phases[job.phase]||job.phase}`,job.id));if(!state.job||!result.jobs.some(job=>job.id===state.job))state.job=result.jobs[0].id;history.value=state.job;showPanel('job');await pollJob();}
+async function refreshJobs(){const result=await api('/api/status');renderRunning(result.active_job);connection(result.connected);const history=$('job-history');history.replaceChildren();if(!result.jobs.length){history.append(new Option('Нет заданий',''));$('job-content').hidden=true;return;}for(const job of result.jobs)history.append(new Option(`${job.id.slice(0,8)} · ${phases[job.phase]||job.phase}`,job.id));if(!state.job||!result.jobs.some(job=>job.id===state.job))state.job=result.jobs[0].id;history.value=state.job;showPanel('job');await pollJob();}
 function counter(holder,label,value,wide=false){const div=node('div',undefined,wide?'storage-counter':undefined);div.append(node('span',label),node('strong',String(value)));holder.append(div);}
 function renderJobCounters(job){
   const main=$('counters');
@@ -126,7 +126,7 @@ function renderJobCounters(job){
   main.replaceChildren();
   extra.replaceChildren();
   for(const [label,value,wide] of [
-    ['Файлы',`${job.processed} / ${job.files}`],
+    [!job.scan_complete?'Найдено файлов':'Файлы',!job.scan_complete?String(job.files):`${job.processed} / ${job.files}`],
     ['Скорость',bytes(job.speed)+'/с'],
     ['На устройстве',bytes(job.folder_bytes??job.local_bytes)+(job.folder_bytes_scanning?' · уточняется':''),true],
     ['Свободно на диске',bytes(job.free_bytes),true],
@@ -167,7 +167,7 @@ function renderEstimate(job){
   details.append(node('p','Показатель «На устройстве» учитывает всё содержимое папки, включая прежние загрузки, отчёты, ZIP и недокачанные части. Обновляется примерно каждые 10 секунд; ссылки на внешние папки не обходятся.'));
 }
 async function pollJob(){
-  if(!state.job||state.polling)return;
+  if(!state.job||state.polling||state.closing)return;
   state.polling=true;
   try{
     const id=state.job;
@@ -216,15 +216,21 @@ async function pollJob(){
     renderEstimate(job);
     $('job-settings').textContent=`${modes[job.settings.mode]} · ${(job.settings.file_types||Object.keys(typeLabels)).map(value=>typeLabels[value]).join(', ')} · ${job.settings.preview_size} · ${job.settings.workers} потока · ${job.settings.reports.join(', ')} · ${job.settings.whole_disk?'весь Диск':job.settings.paths.length+' исходных путей'}`;
     const live=job.live;
+    const scanOnly=!job.scan_complete||job.settings.scan_only_pending;
+    $('resume-job').textContent=scanOnly?'Продолжить обход':'Продолжить загрузку';
+    $('stop-job').textContent=job.phase==='stopping'?'Останавливаем…':scanOnly?'Остановить обход':job.phase==='packing'?'Остановить ZIP':'Остановить загрузку';
+    $('job-hint').textContent=state.closing?'Завершаем приложение…':job.phase==='stopping'?'Отменяем запросы и сохраняем прогресс…':job.phase==='ready'?'Список готов. Нажмите «Начать скачивание».':job.phase==='scanning'?'Составляем список файлов. Можно остановить и продолжить позже.':job.phase==='preparing'?'Проверяем локальные файлы и подготавливаем результаты.':job.phase==='paused'?'Работа на паузе. Для продолжения нажмите кнопку выше.':['stopped','interrupted'].includes(job.phase)?(scanOnly?'Обход остановлен. «Продолжить обход» вернёт вас к оценке.':'Прогресс сохранён. Можно продолжить загрузку.'):'Закрытие вкладки не останавливает работу. Для выхода используйте «Выход». ';
+    if(live)renderRunning({id:job.id,phase:job.phase,scan_complete:job.scan_complete});
     const hasIssues=job.errors||job.scan_errors;
     const hasRetry=hasIssues||job.replacements||job.counts.partial;
     $('start-job').hidden=job.phase!=='ready';
-    $('start-job').disabled=live||!state.connected;
+    $('start-job').disabled=state.actionPending||live||!state.connected;
+    $('pause-job').disabled=state.actionPending||job.phase==='stopping';
     $('pause-job').hidden=!live||!['scanning','preparing','downloading','packing'].includes(job.phase);
     $('resume-job').hidden=!['paused','stopped','interrupted','failed'].includes(job.phase);
-    $('resume-job').disabled=job.phase!=='paused'&&(!state.connected||live);
+    $('resume-job').disabled=state.actionPending||(job.phase!=='paused'&&(!state.connected||live));
     $('stop-job').hidden=!live;
-    $('stop-job').disabled=job.phase==='stopping';
+    $('stop-job').disabled=state.actionPending||job.phase==='stopping';
     $('retry-job').hidden=!hasRetry;
     $('retry-job').textContent=hasIssues?'Повторить неудачные':'Повторить недостающий вариант';
     $('retry-job').disabled=live||!state.connected;
@@ -256,7 +262,39 @@ async function pollJob(){
 }
 async function loadErrors(){if(!state.job)return;const jobId=state.job,offset=state.errorOffset;const result=await api(`/api/jobs/${jobId}/errors?offset=${offset}`);if(jobId!==state.job||offset!==state.errorOffset)return;const holder=$('errors-list');holder.replaceChildren();if(!result.items.length)holder.append(node('p','Нет записей на этой странице','muted'));for(const item of result.items){const div=node('div',undefined,'error-item'),label=node('label',undefined,'error-selection'),check=node('input');check.type='checkbox';check.checked=errorSelections.has(item.path);check.disabled=item.status==='scan_error';check.setAttribute('aria-label','Выбрать '+item.path);check.onchange=()=>{if(check.checked)errorSelections.add(item.path);else errorSelections.delete(item.path);$('retry-selected').hidden=!errorSelections.size;$('retry-selected').textContent='Повторить выбранные ('+errorSelections.size+')';};label.append(check,node('strong',item.path));div.append(label,node('p',item.error),node('span',`Оригинал: ${outcomes[item.original_status]||item.original_status}. Превью: ${outcomes[item.preview_status]||item.preview_status}.${item.fallback?' Переход к превью после неудачи оригинала.':''}`));if(item.status!=='scan_error'){const retry=node('button','Повторить этот файл');retry.disabled=state.jobStatus?.live||!state.connected;retry.onclick=()=>safely(()=>retrySelected([item.path]));div.append(retry);}holder.append(div);}$('errors-prev').disabled=state.errorOffset===0;$('errors-next').disabled=!result.has_more;}
 function runtimeLimits(){const previous=state.jobStatus?.settings;if(!state.limitsTouched&&state.limitsJob!==state.job&&previous)return Object.fromEntries(['workers','attempts','timeout','create_zip','adaptive_workers','resume_parts','auto_pause','max_disk_percent','speed_limit_mib'].filter(key=>previous[key]!==undefined).map(key=>[key,previous[key]]));return {workers:Number($('workers').value),attempts:Number($('retries').value),timeout:Number($('timeout').value),...advancedSettings()};}
-async function action(action){await api('/api/jobs/'+state.job+'/action',{action,limits:['start','resume','retry'].includes(action)?runtimeLimits():undefined});await pollJob();}
+async function action(verb){
+  if(state.actionPending||!state.job)return;
+  state.actionPending=true;
+  for(const id of ['start-job','pause-job','resume-job','stop-job','stop-active'])$(id).disabled=true;
+  if(verb==='stop'){$('phase').textContent='Останавливаем…';$('job-hint').textContent='Отменяем запросы и сохраняем прогресс…';}
+  try{
+    const scanOnly=state.jobStatus&&(!state.jobStatus.scan_complete||state.jobStatus.settings.scan_only_pending);
+    const command=verb==='resume'&&scanOnly?'continue_scan':verb;
+    await api('/api/jobs/'+state.job+'/action',{action:command,limits:['start','resume','retry'].includes(verb)?runtimeLimits():undefined});
+  }finally{state.actionPending=false;await pollJob();}
+}
+function renderRunning(job){
+  state.activeJob=job||null;$('estimate').disabled=!state.connected||!!job||state.closing;$('running-bar').hidden=!job||state.closing;
+  if(!job)return;
+  $('running-label').textContent=phases[job.phase]||'Задание выполняется';
+  const stopping=job.phase==='stopping';
+  $('stop-active').textContent=stopping?'Останавливаем…':!job.scan_complete?'Остановить обход':'Остановить';
+  $('stop-active').disabled=state.actionPending||stopping||['completed','completed_with_errors'].includes(job.phase);
+}
+async function refreshActivity(){if(state.closing)return;const result=await api('/api/status');renderRunning(result.active_job);}
+async function exitApplication(){
+  if(state.closing)return;
+  if(typeof askConfirmation==='function'&&!await askConfirmation('Завершить приложение? Текущая работа остановится, прогресс сохранится.'))return;
+  await api('/api/exit',{});state.closing=true;renderRunning(null);
+  $('quit-app').disabled=true;$('quit-app').textContent='Завершаем…';
+  document.querySelectorAll('dialog[open]').forEach(dialog=>dialog.close());
+  notice('Приложение завершается. Прогресс сохранён; эту вкладку можно закрыть.');
+}
+$('show-active').onclick=()=>safely(async()=>{if(!state.activeJob)return;state.job=state.activeJob.id;state.restoreLimits=true;state.jobStatus=null;showPanel('job');await pollJob();});
+$('stop-active').onclick=()=>safely(async()=>{if(!state.activeJob||state.actionPending)return;const id=state.activeJob.id;$('stop-active').disabled=true;state.actionPending=true;try{await api('/api/jobs/'+id+'/action',{action:'stop'});}finally{state.actionPending=false;await refreshActivity();await pollJob();}});
+$('quit-app').onclick=()=>safely(exitApplication);
+setInterval(()=>{if(!state.closing)refreshActivity().catch(()=>{});},3000);
+
 async function retrySelected(paths){await api('/api/jobs/'+state.job+'/action',{action:'retry_selected',paths,limits:runtimeLimits()});errorSelections.clear();await pollJob();}
 $('auth-form').onsubmit=event=>{event.preventDefault();safely(async()=>{const input=$('token');const token=input.value;input.value='';await api('/api/connect',{token});connection(true);await browse('disk:/');await refreshJobs();});};
 $('disconnect').onclick=()=>safely(async()=>{await api('/api/disconnect',{});connection(false);state.browseVersion++;state.thumbVersion++;for(const url of state.urls)URL.revokeObjectURL(url);state.urls=[];state.items=[];$('file-list').replaceChildren(node('div','Диск отключён. Токен удалён из состояния приложения.','empty'));await pollJob();});
@@ -274,7 +312,7 @@ $('select-page').onchange=()=>{for(const item of visibleItems()){if($('select-pa
 $('clear-selection').onclick=()=>{selected.clear();renderFiles();};
 $('whole-disk').onchange=renderFiles;
 $('choose-folder').onclick=()=>safely(async()=>{$('choose-folder').disabled=true;try{const result=await api('/api/folder',{});if(result.path)$('destination').value=result.path;}finally{$('choose-folder').disabled=false;}});
-$('estimate').onclick=()=>safely(async()=>{$('estimate').disabled=true;try{const result=await api('/api/jobs',settings());state.job=result.id;state.restoreLimits=true;state.limitsTouched=false;state.errorOffset=0;errorSelections.clear();await refreshJobs();}finally{$('estimate').disabled=!state.connected;}});
+$('estimate').onclick=()=>safely(async()=>{$('estimate').disabled=true;try{const result=await api('/api/jobs',settings());state.job=result.id;state.restoreLimits=true;state.limitsTouched=false;state.errorOffset=0;errorSelections.clear();await refreshJobs();}finally{$('estimate').disabled=!state.connected||!!state.activeJob;}});
 $('refresh-jobs').onclick=()=>safely(refreshJobs);
 $('job-history').onchange=()=>{state.job=$('job-history').value;state.restoreLimits=true;state.limitsTouched=false;state.errorOffset=0;errorSelections.clear();safely(pollJob);};
 for(const id of ['workers','retries','timeout'])$(id).oninput=()=>{state.limitsTouched=true;};
@@ -288,7 +326,7 @@ $('retry-selected').onclick=()=>safely(()=>retrySelected([...errorSelections]));
 $('settings-tab').onclick=()=>showPanel('settings');
 $('job-tab').onclick=()=>showPanel('job');
 initializePanel();initializeHelp();connection(false);breadcrumb();updateSelection();safely(async()=>{await refreshJobs();if(state.connected)await browse();});
-setInterval(()=>pollJob().catch(error=>notice(error.message)),1000);
+setInterval(()=>{if(!state.closing)pollJob().catch(error=>{if(!state.closing)notice(error.message);});},1000);
 
 function excludePaths(paths){const input=$('exclusions');input.value=[...new Set([...input.value.split(/\r?\n/).filter(Boolean),...paths])].join('\n');for(const path of paths)selected.delete(path);renderFiles();notice('Добавлено в исключения: '+paths.length);}
 function excludeButton(item){const button=node('button','⊖','exclude-button');button.title='Исключить '+item.name;button.setAttribute('aria-label',button.title);button.onclick=()=>excludePaths([item.path]);return button;}

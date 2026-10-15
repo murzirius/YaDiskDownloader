@@ -26,13 +26,23 @@ class Tray:
         self.notification_stop = threading.Event()
         self.notification_thread = None
         self.seen = {}
+        self.exiting = threading.Event()
+
+    def exit(self):
+        if not self.exiting.is_set():
+            self.exiting.set()
+            self.notification_stop.set()
+            self.quit_app()
 
     def active(self):
-        with self.engine.lock:
-            for job_id, thread in self.engine.threads.items():
-                if thread.is_alive():
-                    return job_id, self.engine.controls[job_id]
+        for job_id, thread in tuple(self.engine.threads.items()):
+            control = self.engine.controls.get(job_id)
+            if control and thread.is_alive():
+                return job_id, control
         return None
+
+    def toggle_async(self):
+        threading.Thread(target=self.toggle, name='disk-tray-action', daemon=True).start()
 
     def toggle(self):
         active = self.active()
@@ -62,9 +72,9 @@ class Tray:
             icon_class=ClickableIcon
         self.icon = icon_class("YaDiskDownloader", image(), "YaDiskDownloader", menu=pystray.Menu(
             pystray.MenuItem("Открыть приложение", lambda icon, item: webbrowser.open(self.url), default=True),
-            pystray.MenuItem(lambda item: self.pause_label(), lambda icon, item: self.toggle(), enabled=lambda item: bool(self.active())),
+            pystray.MenuItem(lambda item: self.pause_label(), lambda icon, item: self.toggle_async(), enabled=lambda item: bool(self.active())),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Завершить приложение", lambda icon, item: threading.Thread(target=self.quit_app, daemon=True).start())
+            pystray.MenuItem("Завершить приложение", lambda icon, item: self.exit(), enabled=lambda item: not self.exiting.is_set())
         ))
         def setup(icon):
             icon.visible = True

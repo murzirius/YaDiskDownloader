@@ -26,6 +26,7 @@ from .folder_usage import FolderUsage
 from . import exclusions, rate_limit
 from .inventory import compare, write_changes
 from .network import NetworkWait
+from .limits import MAX_WORKERS
 
 
 def now():
@@ -113,6 +114,7 @@ class Control:
         with self.condition:
             self.stopped = True
             self.condition.notify_all()
+        self.network.abort_requests()
 
     def progress(self, path, done, size, action, **details):
         with self.lock:
@@ -168,7 +170,7 @@ class Engine:
             raise ValueError("Укажите абсолютный путь локальной папки назначения")
         destination = str(Path(destination).resolve())
         values = {}
-        for name, default, low, high in (("workers", 8, 1, 20), ("attempts", attempt_count(data), 1, 9), ("timeout", 20, 5, 180)):
+        for name, default, low, high in (("workers", 8, 1, MAX_WORKERS), ("attempts", attempt_count(data), 1, 9), ("timeout", 20, 5, 180)):
             value = data.get(name, default)
             if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
                 raise ValueError(f"{name}: допустимый диапазон {low}–{high}")
@@ -267,6 +269,9 @@ class Engine:
             job = self.store.job(job_id)
             if job["settings"].get("_invalid"):
                 raise ValueError("Настройки задания повреждены. Создайте дозагрузку в прежнюю папку.")
+            if operation in ('scan', 'download'):
+                job['settings']['scan_only_pending'] = operation == 'scan'
+                self.store.update_job(job_id, settings=json.dumps(job['settings'], ensure_ascii=False))
             control.adaptive = None
             control.rate_limiter = rate_limit.RateLimiter(job["settings"].get("speed_limit_mib", 0), control.active_clock)
             control.space_check = lambda: self.check_space(job_id, control)
@@ -278,8 +283,17 @@ class Engine:
             thread.start()
 
     def action(self, job_id, action, limits=None):
+        if action == 'stop':
+            control = self.controls.get(job_id)
+            if control:
+                control.stop()
         with self.lock:
             job = self.store.job(job_id)
+            scan_only = action == 'continue_scan'
+            if scan_only:
+                if job['scan_complete'] and not job['settings'].get('scan_only_pending'):
+                    raise ValueError('Обход уже завершён. Нажмите «Начать скачивание».')
+                action = 'resume'
             if job["settings"].get("_invalid") and action not in ("stop",):
                 raise ValueError("Настройки задания повреждены. Создайте дозагрузку в прежнюю папку.")
             if action in ("start", "resume", "retry", "retry_selected", "pack"):
@@ -298,9 +312,10 @@ class Engine:
                 return
             if action == "stop":
                 if live and live.is_alive():
-                    self.store.update_job(job_id, phase="stopping")
-                    control.event("system", "Запрошена остановка задания", level="warning")
                     control.stop()
+                    with self.store.db() as db:
+                        db.execute("UPDATE jobs SET phase='stopping' WHERE id=? AND phase IN ('new','scanning','preparing','downloading','packing','paused')", (job_id,))
+                    control.event("system", "Запрошена остановка задания", level="warning")
                 else:
                     self.store.update_job(job_id, phase="stopped", ended=now())
                     with self.store.db() as db:
@@ -366,7 +381,7 @@ class Engine:
                             db.execute("UPDATE entries SET status='pending' WHERE job=? AND kind='file' AND NOT (status='existing' AND original_status='existing_verified')", (job_id,))
                         else:
                             db.execute("UPDATE entries SET status='pending' WHERE job=? AND kind='file'", (job_id,))
-                self.launch(job_id, "download", paths=paths if action == "retry_selected" else None)
+                self.launch(job_id, "scan" if scan_only else "download", paths=paths if action == "retry_selected" else None)
                 return
             if action == "pack":
                 self.launch(job_id, "pack")
@@ -499,6 +514,10 @@ class Engine:
             return False
 
     def run(self, job_id, operation, control):
+        with self.store.activity():
+            self._run(job_id, operation, control)
+
+    def _run(self, job_id, operation, control):
         saved_scan = False
         try:
             self.store.update_job(job_id, error="", ended=None, pause_reason="")
@@ -713,16 +732,15 @@ class Engine:
                 active = set()
                 while True:
                     control.check()
-                    while len(active) < (control.adaptive.limit() if control.adaptive else workers):
+                    capacity = (control.adaptive.limit() if control.adaptive else workers) - len(active)
+                    if capacity > 0:
                         with self.store.db() as db:
-                            entry = db.execute("SELECT * FROM entries WHERE job=? AND kind='file' AND status='pending'" + condition + " ORDER BY priority,path LIMIT 1", parameters).fetchone()
-                            if entry:
-                                db.execute("UPDATE entries SET status='running' WHERE job=? AND path=?", (job_id, entry["path"]))
-                        if not entry:
-                            break
-                        if not stage:
-                            first_stage_work = True
-                        active.add(pool.submit(self.process, job_id, dict(entry), control))
+                            entries = db.execute("SELECT * FROM entries WHERE job=? AND kind='file' AND status='pending'" + condition + " ORDER BY priority,path LIMIT ?", (*parameters, capacity)).fetchall()
+                            db.executemany("UPDATE entries SET status='running' WHERE job=? AND path=?", ((job_id, entry['path']) for entry in entries))
+                        for entry in entries:
+                            if not stage:
+                                first_stage_work = True
+                            active.add(pool.submit(self.process, job_id, dict(entry), control))
                     if not active:
                         break
                     done, active = wait(active, timeout=0.2, return_when=FIRST_COMPLETED)

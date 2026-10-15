@@ -25,6 +25,7 @@
   <button id="disconnect" hidden>Отключить</button>
   <button id="open-help" class="quiet">Как начать</button>
   <button id="open-service" class="quiet">Версия {{ version }}</button>
+  <button id="quit-app" class="quiet" title="Остановить работу и закрыть приложение, включая значок в трее">Выход</button>
 </header>
 <div id="notice" class="notice" role="status" hidden></div>
 <main>
@@ -47,6 +48,7 @@
     <details class="selected-detail"><summary>Выбранные исходные пути</summary><div id="selected-paths">Выбор пуст</div></details>
   </section>
   <aside>
+    <div id="running-bar" class="running-bar" hidden><span id="running-label"></span><button id="show-active" class="quiet">К заданию</button><button id="stop-active" class="danger">Остановить обход</button></div>
     <div class="panel-tabs" role="tablist" aria-label="Панель скачивания"><button id="settings-tab" role="tab" aria-selected="true" aria-controls="settings-panel">Параметры</button><button id="job-tab" role="tab" aria-selected="false" aria-controls="job-panel">Задание</button></div>
     <section id="settings-panel" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab">
       <h1>Скачивание</h1>
@@ -62,7 +64,7 @@
         <label class="field">Порог заполнения диска, %<input id="max-disk-percent" type="number" min="1" max="99.9" step="0.1" value="95"></label>
         <label class="field">Общая скорость, МиБ/с<input id="speed-limit" type="number" min="0" max="10000" step="0.1" value="0"></label><p class="hint">0 — без ограничения. Лимит общий для всех потоков.</p>
         <label class="field">Размер превью<select id="preview-size"><option value="XXXL">Максимальный · 1280 px</option><option value="XXL">1024 px</option><option value="XL">800 px</option><option value="L">500 px</option><option value="M">300 px</option><option value="S">150 px</option></select></label>
-        <div class="numeric-settings"><label>Потоки<input id="workers" type="number" min="1" max="20" value="8"></label><label>Попытки всего<input id="retries" type="number" min="1" max="9" value="1"></label><label>Лимит попытки, с<input id="timeout" type="number" min="5" max="180" value="20"></label></div>
+        <div class="numeric-settings"><label>Потоки<input id="workers" type="number" min="1" max="8" value="8" title="От 1 до 8 одновременных загрузок. При ограничениях Яндекса попробуйте 2–4."></label><label>Попытки всего<input id="retries" type="number" min="1" max="9" value="1" title="Включая первую попытку. Оригинал и превью имеют отдельные пределы."></label><label>Лимит попытки, с<input id="timeout" type="number" min="5" max="180" value="20" title="Время одной попытки. Для больших оригиналов увеличьте лимит."></label></div>
         <p class="hint">Превью без обрезки. Файлы, отчёты и ZIP — в папке импорта.</p>
       </details>
       <label class="whole"><input id="create-zip" type="checkbox" checked> Создать ZIP после загрузки</label>
@@ -76,11 +78,12 @@
       <div id="job-content" hidden>
         <div class="phase-line"><strong id="phase">—</strong><span id="percentage">—</span></div>
         <progress id="progress" max="100" value="0" aria-label="Прогресс задания"></progress>
+        <div class="actions job-controls"><button id="start-job" class="primary">Начать скачивание</button><button id="pause-job" title="Приостановить работу без потери прогресса">Пауза</button><button id="resume-job">Продолжить</button><button id="stop-job" class="danger" title="Остановить текущее задание и сохранить прогресс">Остановить</button></div>
+        <p id="job-hint" class="hint" role="status" aria-live="polite"></p>
         <div id="counters" class="counters"></div>
         <div id="active-files" class="active-files"></div>
         <div id="estimate-info" class="estimate-info"></div>
         <div class="actions"><button id="folder-volumes">Объём по папкам</button><button id="show-changes">Изменения</button></div>
-        <div class="actions"><button id="start-job" class="primary">Начать</button><button id="pause-job">Пауза</button><button id="resume-job">Продолжить</button><button id="stop-job" class="danger">Остановить</button></div>
         <div id="network-warning" class="network-warning" role="status" aria-live="polite" hidden></div>
         <div id="result-info" class="result-info"></div>
         <div class="actions"><button id="retry-job">Повторить неудачные</button><button id="pack-job">Собрать ZIP результатов</button></div>

@@ -6,6 +6,7 @@ from pathlib import Path
 from .file_types import file_type, preview_type, selected_type
 from .exclusions import excluded
 from .api import validate_resource
+from .limits import normalize_saved_workers
 
 
 SCHEMA = """
@@ -97,7 +98,7 @@ class Store:
                 except (ValueError, TypeError):
                     db.execute("UPDATE jobs SET phase='failed',error=? WHERE id=?", ("Настройки задания повреждены. Создайте дозагрузку в прежнюю папку.", row["id"]))
                     continue
-                changed = False
+                changed = normalize_saved_workers(settings)
                 if "attempts" not in settings:
                     retries = settings.get("retries", 0)
                     settings["attempts"] = min(9, max(1, retries + 1)) if isinstance(retries, int) and not isinstance(retries, bool) else 1
@@ -115,14 +116,27 @@ class Store:
                         raise ValueError()
                 except (ValueError, TypeError):
                     continue
-                if settings.get("adaptive_workers") is not False:
+                workers_changed = normalize_saved_workers(settings)
+                if workers_changed or settings.get("adaptive_workers") is not False:
                     settings["adaptive_workers"] = False
                     db.execute("UPDATE profiles SET settings=? WHERE name=?", (json.dumps(settings, ensure_ascii=False), row["name"]))
             db.execute("UPDATE entries SET error='' WHERE status IN ('done','existing','partial') AND EXISTS(SELECT 1 FROM artifacts a WHERE a.job=entries.job AND a.path=entries.path) AND (error LIKE 'Оригинал:%' OR error LIKE 'Превью:%') AND error NOT LIKE '%места%' AND error NOT LIKE '%файловой системы%' AND error NOT LIKE '%локальный путь%' AND error NOT LIKE '%пределы папки%'")
-            db.execute("UPDATE jobs SET phase='interrupted', error='Процесс был перезапущен. Подключите Диск и продолжите.' WHERE phase IN ('scanning','preparing','downloading','packing','pausing','stopping')")
+            db.execute("UPDATE jobs SET phase='interrupted', error='Процесс был перезапущен. Подключите Диск и продолжите.' WHERE phase IN ('new','scanning','preparing','downloading','packing','pausing','stopping')")
             db.execute("UPDATE entries SET status='pending' WHERE status='running'")
             db.execute("UPDATE job_queue SET state='waiting',error='' WHERE state='running'")
             db.execute("UPDATE jobs SET phase='completed' WHERE phase='completed_with_errors' AND error='' AND NOT EXISTS(SELECT 1 FROM scan_errors s WHERE s.job=jobs.id) AND NOT EXISTS(SELECT 1 FROM entries e WHERE e.job=jobs.id AND e.kind='file' AND (e.error!='' OR e.status IN ('pending','running','error','no_preview','cancelled')))")
+
+    @contextmanager
+    def activity(self):
+        """Keep WAL open during a job without holding a read/write transaction.
+
+        Individual db() calls still commit with synchronous=FULL. Keeping one
+        idle connection avoids checkpointing/reopening WAL after every short
+        transaction when the last worker connection happens to close.
+        """
+        with self.db() as connection:
+            connection.execute('SELECT COUNT(*) FROM sqlite_master').fetchall()
+            yield
 
     @contextmanager
     def db(self):
@@ -149,6 +163,7 @@ class Store:
             result["settings"] = json.loads(result["settings"])
             if not isinstance(result["settings"], dict):
                 raise ValueError()
+            normalize_saved_workers(result['settings'])
         except (ValueError, TypeError):
             result["settings"] = {"_invalid": True, "mode": "fallback", "preview_size": "XXXL", "reports": ["json"], "file_types": ["photos", "videos", "music", "files"], "paths": [], "whole_disk": False, "destination": result["root"], "workers": 8, "attempts": 1, "retries": 0, "timeout": 20}
         return result

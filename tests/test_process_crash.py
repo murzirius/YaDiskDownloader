@@ -45,9 +45,17 @@ def test_abrupt_process_termination_preserves_confirmed_results(tmp_path,phase):
         if phase=='zip':
             assert not list(Path(job['root']).glob('*.zip'))
         engine=Engine(store,api)
-        engine.action(job_id,'resume',{'workers':20,'timeout':60})
-        result=wait_job(engine,job_id,timeout=90)
+        engine.action(job_id,'resume',{'workers':8,'timeout':60})
+        # Scan recovery also transfers all 451 files with durable filesystem
+        # and FULL SQLite commits. Allow for slower hosted Windows disks while
+        # keeping a finite deadline and the same recovery/data assertions.
+        result=wait_job(engine,job_id,timeout=180 if phase=='scan' else 90)
         assert result['phase']=='completed',result
+        if phase=='scan':
+            assert result['files']==451 and result['originals']==451
+            assert len(list(store.rows("SELECT * FROM entries WHERE job=? AND kind='file'",(job_id,))))==451
+            for n in range(450):
+                assert (Path(result['root'])/('item-'+str(n)+'.bin')).read_bytes()==b'item'
         assert (Path(result['root'])/'one.bin').read_bytes()==b'x'*(8*1024*1024)
         assert json.loads((Path(result['root'])/'report.json').read_text(encoding='utf-8'))['summary']['phase']=='completed'
     finally:
