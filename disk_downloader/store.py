@@ -7,6 +7,7 @@ from .file_types import file_type, preview_type, selected_type
 from .exclusions import excluded
 from .api import validate_resource
 from .limits import normalize_saved_workers
+from .sqlite_support import journal_mode
 
 
 SCHEMA = """
@@ -71,12 +72,13 @@ CREATE TABLE IF NOT EXISTS pending_service_outputs (root TEXT,kind TEXT,local TE
 
 class Store:
     def __init__(self, filename):
+        mode = journal_mode()
         self.filename = str(filename)
         Path(filename).parent.mkdir(parents=True, exist_ok=True)
         from .backups import before_upgrade
         before_upgrade(Path(filename))
         with closing(sqlite3.connect(self.filename, timeout=30)) as setup:
-            setup.execute("PRAGMA journal_mode=WAL")
+            setup.execute("PRAGMA journal_mode=" + mode)
         with self.db() as db:
             db.executescript(SCHEMA)
             columns = {row[1] for row in db.execute("PRAGMA table_info(entries)")}
@@ -99,6 +101,9 @@ class Store:
                     db.execute("UPDATE jobs SET phase='failed',error=? WHERE id=?", ("Настройки задания повреждены. Создайте дозагрузку в прежнюю папку.", row["id"]))
                     continue
                 changed = normalize_saved_workers(settings)
+                if 'total_timeout' not in settings:
+                    settings['total_timeout'] = settings.get('timeout', 20)
+                    changed = True
                 if "attempts" not in settings:
                     retries = settings.get("retries", 0)
                     settings["attempts"] = min(9, max(1, retries + 1)) if isinstance(retries, int) and not isinstance(retries, bool) else 1
@@ -117,6 +122,9 @@ class Store:
                 except (ValueError, TypeError):
                     continue
                 workers_changed = normalize_saved_workers(settings)
+                if 'total_timeout' not in settings:
+                    settings['total_timeout'] = settings.get('timeout', 20)
+                    workers_changed = True
                 if workers_changed or settings.get("adaptive_workers") is not False:
                     settings["adaptive_workers"] = False
                     db.execute("UPDATE profiles SET settings=? WHERE name=?", (json.dumps(settings, ensure_ascii=False), row["name"]))
@@ -205,6 +213,12 @@ class Store:
             replaced = db.execute("SELECT COUNT(*) FROM entries WHERE job=? AND fallback=1 AND status IN ('done','existing')", (job_id,)).fetchone()[0]
             failures = db.execute("SELECT COUNT(*) FROM entries WHERE job=? AND kind='file' AND status NOT IN ('pending','running','cancelled') AND (status IN ('error','no_preview') OR error!='')", (job_id,)).fetchone()[0]
             previous_results = db.execute("SELECT COUNT(DISTINCT e.path) FROM entries e JOIN artifacts a ON a.job=e.job AND a.path=e.path WHERE e.job=? AND e.kind='file' AND e.priority>0", (job_id,)).fetchone()[0]
+            completeness = db.execute("""SELECT COUNT(*),COALESCE(SUM(has_original),0),
+                COALESCE(SUM(NOT has_original AND has_preview),0),
+                COALESCE(SUM(NOT has_original AND NOT has_preview),0) FROM (
+                SELECT EXISTS(SELECT 1 FROM artifacts a WHERE a.job=e.job AND a.path=e.path AND a.type='original') has_original,
+                       EXISTS(SELECT 1 FROM artifacts a WHERE a.job=e.job AND a.path=e.path AND a.type='preview') has_preview
+                FROM entries e WHERE e.job=? AND e.kind='file' AND e.status!='filtered')""", (job_id,)).fetchone()
         found = dict(found)
         total = found.get("file", 0)
         processed = sum(counts.get(k, 0) for k in ("done", "existing", "partial", "error", "no_preview", "cancelled", "filtered"))
@@ -229,6 +243,7 @@ class Store:
                    originals=originals, previews=previews, replacements=replaced, existing=counts.get("existing", 0),
                    missing_previews=missing, cancelled=counts.get("cancelled", 0), errors=failures,
                    scan_errors=scan_errors, saved_bytes=saved, previous_results=previous_results,
+                   completeness=dict(zip(('selected', 'originals', 'preview_only', 'no_result'), map(int, completeness))),
                    remaining_work={"bytes": int(pending[0]), "unknown_files": int(pending[1]), "files": int(pending[2]), "preview_files": int(pending[3])},
                    estimate={"known_bytes": known, "unknown_sizes": unknown_downloads,
                              "original_bytes": int(volume[0]), "original_unknown": unknown,

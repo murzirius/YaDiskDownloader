@@ -100,7 +100,9 @@ def create_app(state_dir=None, api=None, port=8766):
     @app.get("/api/runtime")
     def runtime():
         tray = app.extensions.get("tray")
-        return jsonify(version=__version__, frozen=frozen(), tray=tray.status() if tray else {"visible": False, "error": ""}, can_exit=bool(app.extensions.get("quit_app")), migration=app.extensions.get("migration", {"jobs": 0, "failed_sources": 0}))
+        from .sqlite_support import safe_wal
+        import sqlite3
+        return jsonify(sqlite=sqlite3.sqlite_version, safe_sqlite_wal=safe_wal(), version=__version__, frozen=frozen(), tray=tray.status() if tray else {"visible": False, "error": ""}, can_exit=bool(app.extensions.get("quit_app")), migration=app.extensions.get("migration", {"jobs": 0, "failed_sources": 0}))
 
     @app.post("/api/exit")
     def exit_app():

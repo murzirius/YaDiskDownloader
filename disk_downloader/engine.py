@@ -170,7 +170,7 @@ class Engine:
             raise ValueError("Укажите абсолютный путь локальной папки назначения")
         destination = str(Path(destination).resolve())
         values = {}
-        for name, default, low, high in (("workers", 8, 1, MAX_WORKERS), ("attempts", attempt_count(data), 1, 9), ("timeout", 20, 5, 180)):
+        for name, default, low, high in (("workers", 8, 1, MAX_WORKERS), ("attempts", attempt_count(data), 1, 9), ("timeout", 20, 5, 3600), ("total_timeout", 0, 0, 86400)):
             value = data.get(name, default)
             if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
                 raise ValueError(f"{name}: допустимый диапазон {low}–{high}")
@@ -325,7 +325,7 @@ class Engine:
                         control.journal.flush()
                 return
             if action == "resume" and live and live.is_alive() and control.paused:
-                if limits and any(limits.get(k, job["settings"].get(k, 0 if k == "speed_limit_mib" else None)) != job["settings"].get(k, attempt_count(job["settings"]) if k == "attempts" else 0 if k == "speed_limit_mib" else None) for k in ("workers", "attempts", "timeout", "speed_limit_mib")):
+                if limits and any(limits.get(k, job["settings"].get(k, 0 if k == "speed_limit_mib" else None)) != job["settings"].get(k, attempt_count(job["settings"]) if k == "attempts" else 0 if k == "speed_limit_mib" else None) for k in ("workers", "attempts", "timeout", "total_timeout", "speed_limit_mib")):
                     raise ValueError("Для изменения ограничений остановите задание и продолжите с новыми параметрами")
                 if not self.api.credentials.connected and not job["scan_complete"]:
                     raise ValueError("Подключите Диск")
@@ -355,7 +355,7 @@ class Engine:
                     if found != len(paths):
                         raise ValueError("Выбранный файл не принадлежит заданию")
                 if limits:
-                    keys = ("workers", "attempts", "timeout", "create_zip", "auto_pause", "max_disk_percent", "adaptive_workers", "resume_parts", "speed_limit_mib")
+                    keys = ("workers", "attempts", "timeout", "total_timeout", "create_zip", "auto_pause", "max_disk_percent", "adaptive_workers", "resume_parts", "speed_limit_mib")
                     validated = self.validate_settings({**job["settings"], **{k: limits[k] for k in keys if k in limits}})
                     job["settings"].update({k: validated[k] for k in (*keys, "retries")})
                     self.store.update_job(job_id, settings=json.dumps(job["settings"], ensure_ascii=False))
@@ -1048,7 +1048,7 @@ class Engine:
                 control.temporary.add(temp)
                 control.temporary_sizes[temp] = size
             keep = persistent and kind == "original"
-            deadline = Deadline(settings["timeout"], control.check, control.active_clock, lambda: control.stopped or not self.api.credentials.connected)
+            deadline = Deadline(settings.get("total_timeout", settings["timeout"]), control.check, control.active_clock, lambda: control.stopped or not self.api.credentials.connected, idle_seconds=settings["timeout"])
             try:
                 with deadline:
                     deadline.check()
@@ -1107,6 +1107,7 @@ class Engine:
                                     raise Suspended("Диск отключён")
                                 if not chunk:
                                     continue
+                                deadline.touch()
                                 if kind == "preview" and size + len(chunk) > PREVIEW_MAX_BYTES:
                                     keep = False
                                     raise APIError("Превью превышает допустимый объём")
@@ -1132,12 +1133,14 @@ class Engine:
                                     self.partials.save(job, entry["path"], kind, size, sha, etag, total)
                                     checkpoint_size, last_checkpoint = size, current
                                 control.progress(entry["path"], size, meta.get("size") if kind == "original" and meta.get("size") is not None else total, "Загрузка " + ("оригинала" if kind == "original" else "превью"), kind=kind, source_size=meta.get("size"))
+                            deadline.received()
                             stream.flush()
                             os.fsync(stream.fileno())
                         self.partials.save(job, entry["path"], kind, size, sha, etag, total)
                         deadline.check()
                         if expected is not None and size - offset != expected or total is not None and size != total:
                             raise APIError("Получен неполный ответ загрузки")
+                    deadline.received()
                     if kind == "original":
                         if meta.get("size") is not None and size != meta["size"]:
                             keep = False
@@ -1197,7 +1200,7 @@ class Engine:
                     error = NetworkError(offline=True)
                 elif deadline.expired.is_set():
                     error_type = NetworkError if isinstance(exc, (requests.RequestException, NetworkError)) else APIError
-                    error = error_type(f"Превышен лимит попытки: {settings['timeout']} с")
+                    error = error_type(deadline.timeout_message())
                 if control.adaptive and not isinstance(error, OSError):
                     control.adaptive.failure(error.status if isinstance(error, APIError) else None)
                 control.event(kind, f"{'Оригинал' if kind == 'original' else 'Превью'} · попытка {attempt + 1}/{tries}: {safe_error(error)}", entry["path"], "warning")

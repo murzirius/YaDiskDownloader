@@ -9,8 +9,15 @@ on:
 permissions:
   contents: read
 
+env:
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: utf-8
+
 jobs:
   tests:
+    timeout-minutes: 45
+    env:
+      YADISK_TEST_TIMEOUT_FACTOR: '4'
     strategy:
       fail-fast: false
       matrix:
@@ -18,39 +25,67 @@ jobs:
         python: ['3.11', '3.14']
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
+      - name: Install fixed SQLite on Windows
+        if: runner.os == 'Windows'
+        run: python tools/prepare_sqlite_windows.py
+      - name: Build isolated fixed SQLite on Linux
+        if: runner.os == 'Linux'
+        run: python tools/prepare_sqlite_linux.py
       - run: python -m pip install -r requirements-bootstrap.txt
       - run: python -m pip install -r requirements-dev.txt
-      - run: python -m pytest -q
+      - name: Record tested revision and runtime
+        run: python -c "import os, sys, sqlite3; from disk_downloader import __version__; from disk_downloader.sqlite_support import require_safe; require_safe(); from disk_downloader.limits import MAX_WORKERS; print('Commit:', os.environ.get('GITHUB_SHA')); print('Application:', __version__); print('Workers:', MAX_WORKERS); print('Python:', sys.version); print('SQLite:', sqlite3.sqlite_version)"
+      - run: python -m pytest -q --durations=15 --junitxml=test-results.xml -o faulthandler_timeout=180
+      - name: Save test results
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: test-results-${{ matrix.os }}-python-${{ matrix.python }}
+          path: test-results.xml
+          if-no-files-found: ignore
+          retention-days: 7
 
-  release:
-    if: startsWith(github.ref, 'refs/tags/v')
+  windows_exe:
+    timeout-minutes: 30
     needs: tests
     runs-on: windows-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.14'
+      - run: python tools/prepare_sqlite_windows.py
       - run: python -m pip install -r requirements-bootstrap.txt
       - run: python -m pip install -r requirements-build.txt
       - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: python tools/package_release.py --check-tag
       - run: python build_windows.py --output dist/windows --work build/windows
+      - name: Smoke actual EXE, UI, patched SQLite, tray and full shutdown
+        run: python tools/smoke_windows_exe.py --exe dist/windows/YaDiskDownloader.exe --output smoke-results.json
+      - name: Save EXE smoke results
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-exe-smoke
+          path: smoke-results.json
+          if-no-files-found: ignore
       - run: python -m pip download --no-deps --dest dist/windows/third_party pystray==0.19.5
       - run: python tools/package_release.py --exe dist/windows/YaDiskDownloader.exe --output dist/release
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: Windows-release
           path: dist/release/*
       - name: Publish checked release assets
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}

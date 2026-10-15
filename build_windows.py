@@ -30,6 +30,8 @@ def main():
     args = parser.parse_args()
     if sys.platform != "win32":
         parser.error("Для Windows EXE сборка выполняется на Windows")
+    from disk_downloader.sqlite_support import require_safe
+    require_safe()
     root = Path(__file__).resolve().parent
     output = Path(args.output).resolve()
     work = Path(args.work).resolve()
