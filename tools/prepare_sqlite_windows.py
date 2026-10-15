@@ -8,7 +8,7 @@ import sys
 import urllib.request
 import zipfile
 
-URL = 'https://www.sqlite.org/2026/sqlite-dll-win-x64-3510300.zip'
+URL = 'https://sqlite.org/2026/sqlite-dll-win-x64-3510300.zip'
 SHA256 = 'ea004f52ba873cc54d1cb908c2f7cf48c3064061d9ee3ded6a309284da5ff411'
 
 
@@ -31,3 +31,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
