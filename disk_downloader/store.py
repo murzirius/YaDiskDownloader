@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import tempfile
 from contextlib import closing, contextmanager
 from pathlib import Path
 
@@ -73,6 +74,7 @@ CREATE TABLE IF NOT EXISTS pending_service_outputs (root TEXT,kind TEXT,local TE
 class Store:
     def __init__(self, filename):
         mode = journal_mode()
+        self.wal = mode == 'WAL'
         self.filename = str(filename)
         Path(filename).parent.mkdir(parents=True, exist_ok=True)
         from .backups import before_upgrade
@@ -196,6 +198,21 @@ class Store:
         db.execute("INSERT OR IGNORE INTO entries(job,path,kind,meta) VALUES(?,?,?,?)", (job_id, meta["path"], meta["type"], json.dumps(safe, ensure_ascii=False)))
 
     def rows(self, sql, params=(), batch=200):
+        if not self.wal:
+            # Rollback-journal readers block a writer's commit. Some callers
+            # write while consuming this iterator (reports, cache repair).
+            # Finish the read first; spill large snapshots to an owned temporary
+            # file rather than keeping an unbounded list in memory.
+            with tempfile.SpooledTemporaryFile(max_size=1024*1024, mode='w+t', encoding='utf-8', dir=Path(self.filename).parent) as snapshot:
+                with self.db() as db:
+                    cursor = db.execute(sql, params)
+                    while rows := cursor.fetchmany(batch):
+                        for row in rows:
+                            snapshot.write(json.dumps(dict(row), ensure_ascii=False)+'\n')
+                snapshot.seek(0)
+                for line in snapshot:
+                    yield json.loads(line)
+            return
         with self.db() as db:
             cursor = db.execute(sql, params)
             while rows := cursor.fetchmany(batch):

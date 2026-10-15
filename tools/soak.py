@@ -146,6 +146,7 @@ def run(args):
             directory = args.output/f'cycle-{cycle:04}'
             directory.mkdir()
             killed = False
+            first_peak = 0
             for restart in range(2):
                 command = [sys.executable,str(Path(__file__).resolve()),'--worker','--output',str(directory),
                            '--files',str(args.files),'--slow-fsync-ms',str(args.slow_fsync_ms)]
@@ -159,6 +160,7 @@ def run(args):
                             progress = directory/'progress.json'
                             if restart == 0 and progress.exists():
                                 snapshot = json.loads(progress.read_text(encoding='utf-8'))
+                                first_peak = max(first_peak,snapshot['rss_peak_bytes'])
                                 if snapshot['originals'] >= max(2,args.files//3) and snapshot['phase'] == 'downloading':
                                     process.kill()  # TerminateProcess/SIGKILL, no cleanup path.
                                     process.wait(timeout=10)
@@ -175,6 +177,7 @@ def run(args):
                             process.wait(timeout=10)
             assert killed, 'Run completed too quickly to exercise abrupt process loss'
             item = json.loads((directory/'worker-result.json').read_text(encoding='utf-8'))
+            item['rss_peak_bytes'] = max(first_peak,item['rss_peak_bytes'])
             result['cycles'].append(item)
             cycle += 1
             print(json.dumps({'cycles':cycle,'elapsed_seconds':round(time.monotonic()-started),**item}),flush=True)

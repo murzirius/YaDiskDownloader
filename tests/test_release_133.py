@@ -1,4 +1,3 @@
-import io
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,6 +29,37 @@ def test_source_legacy_database_uses_safe_rollback_journal(tmp_path, monkeypatch
     with store.db() as db:
         assert db.execute('PRAGMA journal_mode').fetchone()[0] == 'delete'
         assert db.execute('PRAGMA synchronous').fetchone()[0] == 2
+
+
+def test_legacy_stream_snapshot_allows_writing_while_consuming_rows(tmp_path, monkeypatch):
+    from disk_downloader.store import Store
+    monkeypatch.setattr('disk_downloader.sqlite_support.safe_wal', lambda: False)
+    store = Store(tmp_path/'history.sqlite3')
+    with store.db() as db:
+        db.executemany('INSERT INTO preferences VALUES(?,?)', ((str(n),'before') for n in range(450)))
+    iterator = store.rows('SELECT key,value FROM preferences ORDER BY CAST(key AS INTEGER)')
+    first = next(iterator)
+    done = threading.Event()
+    errors = []
+    def writer():
+        try:
+            with store.db() as db:
+                db.execute("UPDATE preferences SET value='after'")
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            done.set()
+    thread = threading.Thread(target=writer)
+    thread.start()
+    try:
+        assert done.wait(5), 'Rollback reader blocked a writer while yielding rows'
+        assert not errors
+        snapshot = [first,*iterator]
+        assert len(snapshot) == 450 and all(row['value']=='before' for row in snapshot)
+        assert next(store.rows('SELECT value FROM preferences'))['value'] == 'after'
+    finally:
+        iterator.close()
+        thread.join(10)
 
 
 def test_idle_clock_progress_hold_and_independent_total():
