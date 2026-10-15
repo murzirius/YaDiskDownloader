@@ -19,7 +19,7 @@ from .import_state import find_import, inherit, save_import
 from .file_types import FILE_TYPES, file_type, preview_type, selected_type
 from .estimation import RemainingTime
 from .paths import file_signature, PathError, component, digest, native, normalize_selection, parent_path, publish, remote_path, reserve_output, safe_join, suffix, temporary_file
-from .reports import write_reports
+from .reports import write_reports, REPORT_LOCK
 from .journal import Journal, PHASES
 from .partials import Partials, strong_etag
 from .folder_usage import FolderUsage
@@ -143,6 +143,7 @@ class Engine:
         self.partials = Partials(store)
         self.shutting_down = False
         self.folder_usage = FolderUsage()
+        self.maintenance_busy = False
 
     def validate_settings(self, data):
         if "attempts" not in data and "retries" in data and (isinstance(data["retries"], bool) or not isinstance(data["retries"], int) or not 0 <= data["retries"] <= 8):
@@ -167,7 +168,7 @@ class Engine:
             raise ValueError("Укажите абсолютный путь локальной папки назначения")
         destination = str(Path(destination).resolve())
         values = {}
-        for name, default, low, high in (("workers", 8, 1, 8), ("attempts", attempt_count(data), 1, 9), ("timeout", 20, 5, 180)):
+        for name, default, low, high in (("workers", 8, 1, 20), ("attempts", attempt_count(data), 1, 9), ("timeout", 20, 5, 180)):
             value = data.get(name, default)
             if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
                 raise ValueError(f"{name}: допустимый диапазон {low}–{high}")
@@ -193,7 +194,7 @@ class Engine:
                 "destination": destination, "operation": operation, **values}
 
     def ensure_idle(self):
-        if any(thread.is_alive() for thread in self.threads.values()):
+        if self.maintenance_busy or any(thread.is_alive() for thread in self.threads.values()):
             raise ValueError("Дождитесь завершения текущей операции или остановите её")
 
     def create(self, data):
@@ -1091,10 +1092,13 @@ class Engine:
                         relative = self.allocate(job["id"], identity + "@version" + str(counter), (parent + "/" if parent else "") + name)
                         target = safe_join(job["root"], relative)
                     deadline.check()
+                    with self.store.db() as db:
+                        db.execute('INSERT OR REPLACE INTO pending_publications VALUES(?,?,?,?,?,?,?,?,?)', (job['id'], entry['path'], kind, Path(temp).name, relative, size, sha.hexdigest(), fingerprint(meta), settings['preview_size'] if kind == 'preview' else None))
                     publish(temp, target)
                     self.partials.discard(job, entry["path"], kind, remove=False)
                     with self.store.db() as db:
                         db.execute("INSERT OR REPLACE INTO artifacts VALUES(?,?,?,?,?,?,?,?)", (job["id"], entry["path"], kind, relative, size, sha.hexdigest(), fingerprint(meta), settings["preview_size"] if kind == "preview" else None))
+                        db.execute('DELETE FROM pending_publications WHERE job=? AND path=? AND type=?', (job['id'], entry['path'], kind))
                     if control.adaptive:
                         control.adaptive.success()
                     self.remember_file(job, relative, sha.hexdigest())
@@ -1157,23 +1161,24 @@ class Engine:
         self.phase(job_id, control, "preparing")
         control.progress(job["settings"]["paths"][0], 0, None, "Создание отчётов", unit="objects")
         control.check()
-        reports = write_reports(self.store, job_id, control.check, final_phase=final_phase)
-        reports.append(write_changes(self.store, job_id, control.check))
-        with control.lock:
-            control.active.clear()
-        if not manual and not job["settings"].get("create_zip", True):
-            self.store.update_job(job_id, phase=final_phase, generation=job["generation"] + 1)
-            control.event("archive", "Файлы и отчёты сохранены; создание ZIP выключено", level="success")
-            return
-        total = summary["saved_bytes"] + sum(os.path.getsize(safe_join(job["root"], r)) for r in reports)
-        generation = job["generation"] + 1
-        archive_rel = reserve_output(self.store, job, f"result-{generation}.zip")
-        archive = safe_join(job["root"], archive_rel)
-        temp = temporary_file(job["root"])
-        with control.lock:
-            control.temporary.add(temp)
-        self.store.update_job(job_id, zip_total=total, zip_done=0, zip_path=None, zip_bytes=0)
-        self.phase(job_id, control, "packing")
+        with REPORT_LOCK:
+            reports = write_reports(self.store, job_id, control.check, final_phase=final_phase)
+            reports.append(write_changes(self.store, job_id, control.check))
+            with control.lock:
+                control.active.clear()
+            if not manual and not job["settings"].get("create_zip", True):
+                self.store.update_job(job_id, phase=final_phase, generation=job["generation"] + 1)
+                control.event("archive", "Файлы и отчёты сохранены; создание ZIP выключено", level="success")
+                return
+            total = summary["saved_bytes"] + sum(os.path.getsize(safe_join(job["root"], r)) for r in reports)
+            generation = job["generation"] + 1
+            archive_rel = reserve_output(self.store, job, f"result-{generation}.zip")
+            archive = safe_join(job["root"], archive_rel)
+            temp = temporary_file(job["root"], self.store, 'zip')
+            with control.lock:
+                control.temporary.add(temp)
+            self.store.update_job(job_id, zip_total=total, zip_done=0, zip_path=None, zip_bytes=0)
+            self.phase(job_id, control, "packing")
         pending_zip, last_flush = 0, time.monotonic()
         try:
             with zipfile.ZipFile(temp, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as output:

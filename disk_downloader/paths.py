@@ -95,22 +95,40 @@ def file_signature(filename, sha):
 
 def publish(temp, target):
     if os.name == "nt":
-        os.rename(temp, target)
+        durable_move(temp, target, False)
     else:
         os.link(temp, target)
         os.unlink(temp)
 
 
-def temporary_file(root):
+def durable_move(source, target, replace):
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    move = kernel.MoveFileExW
+    move.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD)
+    move.restype = wintypes.BOOL
+    if not move(str(source), str(target), 8 | (1 if replace else 0)):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def temporary_file(root, store=None, purpose='temporary'):
     descriptor, filename = tempfile.mkstemp(prefix=".disk-", suffix=".part", dir=safe_join(root, ""))
     os.close(descriptor)
+    if store:
+        from .service_outputs import root_key
+        with store.db() as db:
+            db.execute('INSERT INTO temporary_files VALUES(?,?,?,?)', (root_key(root), Path(filename).name, purpose, time.time()))
     return filename
 
 
 def replace_owned(source, target):
     for attempt in range(4):
         try:
-            os.replace(source, target)
+            if os.name == 'nt':
+                durable_move(source, target, True)
+            else:
+                os.replace(source, target)
             return
         except PermissionError:
             if os.name != "nt" or attempt == 3:

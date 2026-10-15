@@ -58,6 +58,13 @@ CREATE TABLE IF NOT EXISTS partials (
  PRIMARY KEY(job,path,type), UNIQUE(job,local)
 );
 CREATE TABLE IF NOT EXISTS partial_ownership (job TEXT,local TEXT,PRIMARY KEY(job,local));
+CREATE TABLE IF NOT EXISTS service_outputs (root TEXT,kind TEXT,local TEXT,sha256 TEXT,PRIMARY KEY(root,kind));
+CREATE TABLE IF NOT EXISTS temporary_files (root TEXT,local TEXT,purpose TEXT,created REAL,PRIMARY KEY(root,local));
+CREATE TABLE IF NOT EXISTS pending_publications (job TEXT,path TEXT,type TEXT,temp TEXT,local TEXT,size INTEGER,sha256 TEXT,fingerprint TEXT,preview_size TEXT,PRIMARY KEY(job,path,type));
+CREATE TABLE IF NOT EXISTS job_queue (job TEXT PRIMARY KEY,position INTEGER,action TEXT,state TEXT DEFAULT 'waiting',error TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS report_records (root TEXT,path TEXT,kind TEXT,data TEXT,PRIMARY KEY(root,path,kind));
+CREATE TABLE IF NOT EXISTS journal_jobs (job TEXT PRIMARY KEY,root TEXT);
+CREATE TABLE IF NOT EXISTS pending_service_outputs (root TEXT,kind TEXT,local TEXT,sha256 TEXT,PRIMARY KEY(root,kind));
 """
 
 
@@ -65,6 +72,8 @@ class Store:
     def __init__(self, filename):
         self.filename = str(filename)
         Path(filename).parent.mkdir(parents=True, exist_ok=True)
+        from .backups import before_upgrade
+        before_upgrade(Path(filename))
         with closing(sqlite3.connect(self.filename, timeout=30)) as setup:
             setup.execute("PRAGMA journal_mode=WAL")
         with self.db() as db:
@@ -74,6 +83,10 @@ class Store:
                 if name not in columns:
                     db.execute(f"ALTER TABLE entries ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0")
             db.execute("CREATE INDEX IF NOT EXISTS queue_priority ON entries(job,kind,status,priority,path)")
+            job_columns = {row[1] for row in db.execute('PRAGMA table_info(jobs)')}
+            for name, declaration in (("title", "TEXT NOT NULL DEFAULT ''"), ("archived", "INTEGER NOT NULL DEFAULT 0")):
+                if name not in job_columns:
+                    db.execute('ALTER TABLE jobs ADD COLUMN ' + name + ' ' + declaration)
             if "pause_reason" not in {row[1] for row in db.execute("PRAGMA table_info(jobs)")}:
                 db.execute("ALTER TABLE jobs ADD COLUMN pause_reason TEXT NOT NULL DEFAULT ''")
             for row in db.execute("SELECT id,settings FROM jobs").fetchall():
@@ -108,12 +121,14 @@ class Store:
             db.execute("UPDATE entries SET error='' WHERE status IN ('done','existing','partial') AND EXISTS(SELECT 1 FROM artifacts a WHERE a.job=entries.job AND a.path=entries.path) AND (error LIKE 'Оригинал:%' OR error LIKE 'Превью:%') AND error NOT LIKE '%места%' AND error NOT LIKE '%файловой системы%' AND error NOT LIKE '%локальный путь%' AND error NOT LIKE '%пределы папки%'")
             db.execute("UPDATE jobs SET phase='interrupted', error='Процесс был перезапущен. Подключите Диск и продолжите.' WHERE phase IN ('scanning','preparing','downloading','packing','pausing','stopping')")
             db.execute("UPDATE entries SET status='pending' WHERE status='running'")
+            db.execute("UPDATE job_queue SET state='waiting',error='' WHERE state='running'")
             db.execute("UPDATE jobs SET phase='completed' WHERE phase='completed_with_errors' AND error='' AND NOT EXISTS(SELECT 1 FROM scan_errors s WHERE s.job=jobs.id) AND NOT EXISTS(SELECT 1 FROM entries e WHERE e.job=jobs.id AND e.kind='file' AND (e.error!='' OR e.status IN ('pending','running','error','no_preview','cancelled')))")
 
     @contextmanager
     def db(self):
         conn = sqlite3.connect(self.filename, timeout=30)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA synchronous=FULL")
         conn.execute("PRAGMA foreign_keys=ON")
         try:
             yield conn

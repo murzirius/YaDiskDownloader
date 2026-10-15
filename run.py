@@ -4,6 +4,8 @@ import socket
 import sys
 import threading
 import webbrowser
+import json
+import re
 from pathlib import Path
 
 from waitress import create_server
@@ -48,7 +50,15 @@ def main():
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--no-tray", action="store_true")
     parser.add_argument("--state-dir")
+    parser.add_argument('--apply-update')
+    parser.add_argument('--update-ack')
     args = parser.parse_args()
+    if args.apply_update:
+        if not frozen() or os.name != 'nt':
+            parser.error('Режим обновления доступен в Windows EXE')
+        from disk_downloader.updater import apply_update
+        apply_update(args.apply_update)
+        return 0
     if not 1024 <= args.port <= 65535:
         parser.error("Порт должен быть от 1024 до 65535")
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -86,6 +96,8 @@ def main():
                 return
             stopping.set()
         engine = app.extensions["engine"]
+        app.extensions['management'].stopped.set()
+        app.extensions['maintenance'].cancel.set()
         with engine.lock:
             engine.shutting_down = True
             for control in engine.controls.values():
@@ -102,6 +114,7 @@ def main():
         state_lock.close()
         stopped.set()
     app.extensions["quit_app"] = shutdown
+    app.extensions['management'].start()
     if os.name == "nt" and not args.no_tray:
         try:
             tray = Tray(app.extensions["engine"], url, shutdown)
@@ -111,6 +124,14 @@ def main():
             message("Не удалось создать значок в трее. Завершение доступно в меню «Обновления и диагностика».")
     if not args.no_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+    if args.update_ack:
+        from disk_downloader import __version__
+        ack = Path(args.update_ack).resolve()
+        if ack.name != 'ready.json' or not re.fullmatch('[a-f0-9]{32}', ack.parent.name) or ack.parent.parent != (state.resolve() / 'updates'):
+            raise ValueError('Некорректный путь подтверждения обновления')
+        with ack.open('x', encoding='utf-8') as stream:
+            json.dump({'version':__version__}, stream)
+            stream.flush(); os.fsync(stream.fileno())
     try:
         server.run()
     except KeyboardInterrupt:

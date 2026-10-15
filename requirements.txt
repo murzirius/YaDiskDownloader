@@ -4,3 +4,5 @@ urllib3==2.8.0
 Pillow==12.3.0
 waitress==3.0.2
 pystray==0.19.5; sys_platform == 'win32'
+Send2Trash==2.1.0; sys_platform == 'win32'
+pywin32==312; sys_platform == 'win32'

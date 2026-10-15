@@ -72,7 +72,7 @@ def test_changes_and_folder_totals_across_imports(system):
     engine.action(job["id"], "start")
     completed = wait_job(engine, job["id"])
     html = Path(safe_join(completed["root"], completed["settings"]["changes_local"])).read_text(encoding="utf-8")
-    assert "Не удалось проверить" in html and "changes-2" in completed["settings"]["changes_local"]
+    assert "Не удалось проверить" in html and completed["settings"]["changes_local"] == "changes.html"
     assert Path(old["root"], "gone.jpg").is_file()
     engine.action(job["id"], "pack")
     packed = wait_job(engine, job["id"])

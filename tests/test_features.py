@@ -31,11 +31,12 @@ def test_zip_optional_and_manual_pack(system):
     job = wait_job(engine, job_id)
     assert job["phase"] == "completed" and job["zip_path"] is None and job["generation"] == 1
     root = Path(job["root"])
-    assert (root / "photo.jpg").is_file() and (root / "report-1.json").is_file()
+    assert (root / "photo.jpg").is_file() and (root / "report.json").is_file()
     assert not list(root.glob("*.zip"))
     engine.action(job_id, "pack")
     packed = wait_job(engine, job_id)
-    assert packed["zip_path"] == "result-2.zip" and (root / "report-2.json").is_file()
+    assert packed["zip_path"] == "result-2.zip" and (root / "report.json").is_file()
+    assert len(list(root.glob('report*.json'))) == 1
 
 
 def test_auto_pause_disk_percentage_and_changed_threshold(system, monkeypatch):

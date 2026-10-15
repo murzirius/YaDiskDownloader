@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .paths import PathError, publish, replace_owned, reserve_output, safe_join, temporary_file
+from .service_outputs import location, finish
 
 
 GROUPS = {"system": "Задание", "scan": "Обход диска", "original": "Оригиналы", "preview": "Превью", "cache": "Уже скачанное", "errors": "Ошибки и повторы", "archive": "Отчёты и ZIP"}
@@ -24,6 +25,8 @@ class Journal:
         self.engine = engine
         self.store = engine.store
         self.job_id = job_id
+        with self.store.db() as db:
+            db.execute('INSERT OR IGNORE INTO journal_jobs VALUES(?,?)',(job_id,self.store.job(job_id)['root']))
         self.interval = interval
         self.stopped = threading.Event()
         self.write_lock = threading.Lock()
@@ -65,6 +68,19 @@ class Journal:
         due = time.monotonic() + self.interval
         while not self.stopped.wait(max(0, due - time.monotonic())):
             self.flush()
+            try:
+                from .reports import write_reports, REPORT_LOCK
+                from .import_state import save_import
+                def checkpoint():
+                    if self.stopped.is_set():
+                        raise ValueError('Периодическое сохранение остановлено')
+                with REPORT_LOCK:
+                    control=self.engine.controls.get(self.job_id)
+                    if not self.stopped.is_set() and getattr(control,'phase',None)!='packing':
+                        write_reports(self.store, self.job_id, checkpoint)
+                        save_import(self.store, self.job_id)
+            except (OSError, sqlite3.Error, ValueError):
+                self.error = 'Не удалось обновить отчёты или опись'
             due += self.interval
             if due <= time.monotonic():
                 due = time.monotonic() + self.interval
@@ -99,9 +115,7 @@ class Journal:
                 settings = job["settings"]
                 key = settings.get("journal_key") or uuid.uuid4().hex
                 marker = '<!doctype html><html lang="ru" data-journal="' + self.job_id + ":" + key + '">'
-                relative = settings.get("journal_local")
-                if not relative or not self.owned(job, relative, marker):
-                    relative = reserve_output(self.store, job, "log-" + self.job_id[:12] + ".html")
+                relative, replacing = location(self.store, job, 'journal', 'log.html')
                 if settings.get("journal_local") != relative or settings.get("journal_key") != key:
                     with self.store.db() as db:
                         current = json.loads(db.execute("SELECT settings FROM jobs WHERE id=?", (self.job_id,)).fetchone()[0])
@@ -111,14 +125,14 @@ class Journal:
                 updated = datetime.now(timezone.utc).isoformat()
                 summary = {"updated": updated, "id": self.job_id[:12], "phase": PHASES.get(status["phase"], status["phase"]), "files": status["files"], "processed": status["processed"], "saved_bytes": status["saved_bytes"], "root": self.clean(job["root"]), "groups": GROUPS}
                 with self.store.db() as db:
-                    ceiling = db.execute("SELECT COALESCE(MAX(id),0) FROM journal_events WHERE job=?", (self.job_id,)).fetchone()[0]
+                    ceiling = db.execute("SELECT COALESCE(MAX(id),0) FROM journal_events").fetchone()[0]
                 template = Path(__file__).with_name("templates").joinpath("journal.html").read_text(encoding="utf-8")
                 before, after = template.split("__JOURNAL_DATA__")
-                temp = temporary_file(job["root"])
+                temp = temporary_file(job["root"], self.store, 'journal')
                 with open(temp, "w", encoding="utf-8", newline="\n") as stream:
                     stream.write(marker + "\n" + before + '{"summary":' + encoded(summary) + ',"events":[')
                     first = True
-                    for row in self.store.rows("SELECT time,category,level,message,path FROM journal_events WHERE job=? AND id<=? ORDER BY id", (self.job_id, ceiling)):
+                    for row in self.store.rows("SELECT e.time,e.category,e.level,e.message,e.path FROM journal_events e LEFT JOIN jobs j ON j.id=e.job LEFT JOIN journal_jobs jj ON jj.job=e.job WHERE COALESCE(j.root,jj.root)=? AND e.id<=? ORDER BY e.id", (job['root'], ceiling)):
                         if not first:
                             stream.write(",\n")
                         stream.write(encoded(dict(row)))
@@ -126,13 +140,7 @@ class Journal:
                     stream.write("]}" + after)
                     stream.flush()
                     os.fsync(stream.fileno())
-                target = safe_join(job["root"], relative)
-                if os.path.lexists(target):
-                    if not self.owned(job, relative, marker):
-                        raise PathError("Файл журнала заменён другим файлом")
-                    replace_owned(temp, target)
-                else:
-                    publish(temp, target)
+                finish(self.store, job, 'journal', relative, temp, replacing)
                 self.saved = updated
                 self.error = ""
         except (OSError, sqlite3.Error, ValueError, UnicodeError):

@@ -1,5 +1,6 @@
 import threading
 import webbrowser
+import os
 from PIL import Image, ImageDraw
 
 
@@ -22,6 +23,9 @@ class Tray:
         self.error = ""
         self.thread = None
         self.ready = threading.Event()
+        self.notification_stop = threading.Event()
+        self.notification_thread = None
+        self.seen = {}
 
     def active(self):
         with self.engine.lock:
@@ -46,7 +50,17 @@ class Tray:
 
     def start(self):
         import pystray
-        self.icon = pystray.Icon("YaDiskDownloader", image(), "YaDiskDownloader", menu=pystray.Menu(
+        icon_class=pystray.Icon
+        if os.name=='nt':
+            owner=self
+            class ClickableIcon(pystray.Icon):
+                def _on_notify(self,wparam,lparam):
+                    if lparam==0x405:  # NIN_BALLOONUSERCLICK (WM_USER + 5)
+                        webbrowser.open(owner.url)
+                    else:
+                        super()._on_notify(wparam,lparam)
+            icon_class=ClickableIcon
+        self.icon = icon_class("YaDiskDownloader", image(), "YaDiskDownloader", menu=pystray.Menu(
             pystray.MenuItem("Открыть приложение", lambda icon, item: webbrowser.open(self.url), default=True),
             pystray.MenuItem(lambda item: self.pause_label(), lambda icon, item: self.toggle(), enabled=lambda item: bool(self.active())),
             pystray.Menu.SEPARATOR,
@@ -63,8 +77,37 @@ class Tray:
                 self.ready.set()
         self.thread = threading.Thread(target=run, name="disk-tray", daemon=True)
         self.thread.start()
+        self.notification_thread = threading.Thread(target=self.watch_notifications, name='disk-notifications', daemon=True)
+        self.notification_thread.start()
+
+    def watch_notifications(self):
+        first = True
+        while not self.notification_stop.wait(1):
+            try:
+                with self.engine.store.db() as db:
+                    pref = db.execute("SELECT value FROM preferences WHERE key='notifications'").fetchone()
+                    rows = db.execute('SELECT id,phase,generation,pause_reason FROM jobs').fetchall()
+                enabled = not pref or pref[0] == 'true'
+                for job in rows:
+                    key = (job['phase'], job['generation'], bool(job['pause_reason']))
+                    previous = self.seen.get(job['id'])
+                    self.seen[job['id']] = key
+                    if first or previous == key or not enabled or not self.icon or not self.icon.visible:
+                        continue
+                    text = None
+                    if job['phase'] == 'completed': text = 'Загрузка завершена. Откройте приложение через значок в трее.'
+                    elif job['phase'] == 'completed_with_errors': text = 'Загрузка завершена с замечаниями. Проверьте результат в приложении.'
+                    elif job['phase'] == 'paused' and job['pause_reason']: text = 'Загрузка на паузе: проверьте свободное место на диске.'
+                    elif job['phase'] == 'failed': text = 'Задание требует внимания. Откройте приложение через значок в трее.'
+                    if text: self.icon.notify(text, 'YaDiskDownloader')
+                first = False
+            except Exception:
+                continue
 
     def stop(self):
+        self.notification_stop.set()
+        if self.notification_thread:
+            self.notification_thread.join(2)
         if self.icon:
             self.icon.stop()
         if self.thread and self.thread is not threading.current_thread():

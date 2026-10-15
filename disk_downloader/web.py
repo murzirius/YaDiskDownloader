@@ -20,6 +20,12 @@ from . import __version__
 from .inventory import folders, change_summary, LABELS
 from .issues import draft
 from .runtime import state_folder, destination_folder, frozen
+from .backups import Backups
+from .management import Management
+from .maintenance import Maintenance
+from .recovery import recover_publications
+from .updater import Installer
+from .service_outputs import root_key, digest_file
 
 
 def create_app(state_dir=None, api=None, port=8766):
@@ -28,11 +34,15 @@ def create_app(state_dir=None, api=None, port=8766):
     app.config.update(MAX_CONTENT_LENGTH=1024 * 1024, SESSION_COOKIE_NAME=f"disk_downloader_{port}", SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Strict", SEND_FILE_MAX_AGE_DEFAULT=0)
     state = Path(state_dir or state_folder())
     store = Store(state / "jobs.sqlite3")
+    recovered = recover_publications(store)
     credentials = api.credentials if api else Credentials()
     api = api or DiskAPI(credentials)
     engine = Engine(store, api)
     updates = Updates(store)
-    app.extensions.update(engine=engine, store=store, disk_api=api, updates=updates)
+    management, maintenance, backups = Management(engine), Maintenance(engine), Backups(store)
+    installer = Installer(engine,updates,backups,port)
+    app.extensions['installer'] = installer
+    app.extensions.update(engine=engine, store=store, disk_api=api, updates=updates, management=management, maintenance=maintenance, backups=backups, recovered=recovered)
     thumbnail_slots = threading.BoundedSemaphore(3)
     dialog_lock = threading.Lock()
     origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
@@ -48,6 +58,8 @@ def create_app(state_dir=None, api=None, port=8766):
         if request.headers.get("Sec-Fetch-Site") == "cross-site":
             abort(403, "Межсайтовый запрос запрещён")
         if request.path.startswith("/api/"):
+            if request.path == '/api/backups/import':
+                request.max_content_length = 1024 * 1024 * 1024
             csrf = session.get("csrf")
             supplied = request.headers.get("X-CSRF-Token", "")
             if not csrf or not supplied.isascii() or not secrets.compare_digest(supplied, csrf):
@@ -125,9 +137,10 @@ def create_app(state_dir=None, api=None, port=8766):
         if not relative:
             raise ValueError("Отчёт появится после загрузки или сборки ZIP")
         filename = safe_join(job["root"], relative)
-        with open(filename, encoding="utf-8") as stream:
-            if not stream.read(150).startswith('<!doctype html><html lang="ru" data-changes="' + job_id + '">'):
-                raise ValueError("Файл отчёта заменён другим файлом")
+        with store.db() as db:
+            owned = db.execute("SELECT sha256 FROM service_outputs WHERE root=? AND kind='changes' AND local=?",(root_key(job['root']),relative)).fetchone()
+        if not owned or os.stat(filename).st_nlink != 1 or digest_file(filename) != owned['sha256']:
+            raise ValueError('Файл отчёта заменён другим файлом')
         if os.name == "nt":
             os.startfile(filename, "open")
         return jsonify(path=str(Path(job["root"]) / relative))
@@ -143,6 +156,16 @@ def create_app(state_dir=None, api=None, port=8766):
             updates.save(data)
         updates.start(force=True)
         return jsonify(updates.snapshot())
+
+    @app.get('/api/update-install')
+    def install_status(): return jsonify(installer.snapshot())
+
+    @app.post('/api/update-install')
+    def update_install():
+        action = payload().get('action')
+        if action == 'download': return jsonify(installer.download())
+        if action == 'install': return jsonify(installer.install(app.extensions.get('quit_app')))
+        raise ValueError('Неизвестная команда обновления')
 
     @app.get("/api/profiles")
     def profiles():
@@ -200,10 +223,82 @@ def create_app(state_dir=None, api=None, port=8766):
     @app.get("/api/status")
     def status():
         jobs = []
-        for row in store.rows("SELECT id FROM jobs ORDER BY started DESC LIMIT 30"):
+        for row in store.rows("SELECT id FROM jobs WHERE archived=0 ORDER BY started DESC LIMIT 30"):
             job = store.job(row["id"])
-            jobs.append({k: job[k] for k in ("id", "phase", "started", "root")})
+            jobs.append({k: job[k] for k in ("id", "title", "phase", "started", "root")})
         return jsonify(connected=credentials.connected, jobs=jobs)
+
+    @app.get('/api/history')
+    def history():
+        offset = request.args.get('offset','0')
+        if not offset.isascii() or not offset.isdigit() or len(offset)>7:
+            raise ValueError('Некорректная страница истории')
+        return jsonify(management.history(request.args.get('query',''),request.args.get('phase','all'),request.args.get('archived')=='1',int(offset)))
+
+    @app.post('/api/jobs/<job_id>/history')
+    def change_history(job_id):
+        return jsonify(management.history_action(job_id,payload()))
+
+    @app.get('/api/queue')
+    def queue_status(): return jsonify(management.queue_snapshot())
+
+    @app.post('/api/queue')
+    def queue_action(): return jsonify(management.queue_action(payload()))
+
+    @app.get('/api/verification')
+    def verification_status(): return jsonify(maintenance.snapshot())
+
+    @app.post('/api/verification')
+    def verify_folder():
+        data=payload()
+        if data.get('action')=='cancel':
+            maintenance.cancel.set()
+            return jsonify(ok=True)
+        return jsonify(maintenance.start(data))
+
+    @app.post('/api/cleanup-preview')
+    def cleanup_preview(): return jsonify(maintenance.cleanup_preview(payload().get('root')))
+
+    @app.post('/api/cleanup')
+    def cleanup_files(): return jsonify(maintenance.cleanup(payload()))
+
+    @app.get('/api/backups')
+    def list_backups(): return jsonify(items=backups.list())
+
+    @app.post('/api/backups')
+    def backup_create(): return jsonify(name=backups.create())
+
+    @app.get('/api/backups/<name>/download')
+    def backup_download(name): return send_file(backups.path(name),as_attachment=True,download_name=name)
+
+    @app.post('/api/backups/import')
+    def backup_import():
+        file=request.files.get('file')
+        if not file: raise ValueError('Выберите файл резервной копии')
+        return jsonify(name=backups.import_file(file.stream))
+
+    @app.post('/api/backups/restore')
+    def backup_restore():
+        data=payload()
+        if data.get('confirm') is not True: raise ValueError('Подтвердите восстановление истории и профилей')
+        with engine.lock:
+            engine.ensure_idle()
+            safety=backups.restore(data.get('name'))
+            credentials.clear()
+            engine.controls.clear(); engine.threads.clear(); management.armed=False
+        return jsonify(ok=True,safety_copy=safety)
+
+    @app.get('/api/notifications')
+    def notification_settings():
+        with store.db() as db: row=db.execute("SELECT value FROM preferences WHERE key='notifications'").fetchone()
+        return jsonify(enabled=not row or row[0]=='true')
+
+    @app.post('/api/notifications')
+    def save_notifications():
+        enabled=payload().get('enabled')
+        if not isinstance(enabled,bool): raise ValueError('Некорректная настройка уведомлений')
+        with store.db() as db: db.execute("INSERT OR REPLACE INTO preferences VALUES('notifications',?)",('true' if enabled else 'false',))
+        return jsonify(enabled=enabled)
 
     @app.post("/api/connect")
     def connect():
@@ -215,6 +310,7 @@ def create_app(state_dir=None, api=None, port=8766):
             except BaseException:
                 credentials.clear()
                 raise
+            management.armed=True
         return jsonify(connected=True)
 
     @app.post("/api/disconnect")
@@ -343,10 +439,10 @@ def create_app(state_dir=None, api=None, port=8766):
         if not relative:
             raise ValueError("Журнал ещё не сохранён")
         filename = safe_join(job["root"], relative)
-        marker = '<!doctype html><html lang="ru" data-journal="' + job_id + ":" + job["settings"].get("journal_key", "") + '">'
-        with open(filename, "r", encoding="utf-8") as stream:
-            if stream.readline(256).rstrip("\n") != marker:
-                raise ValueError("Файл журнала заменён другим файлом")
+        with store.db() as db:
+            owned = db.execute("SELECT sha256 FROM service_outputs WHERE root=? AND kind='journal' AND local=?",(root_key(job['root']),relative)).fetchone()
+        if not owned or os.stat(filename).st_nlink != 1 or digest_file(filename) != owned['sha256']:
+            raise ValueError('Файл журнала заменён другим файлом')
         if os.name == "nt":
             os.startfile(filename, "open")
         return jsonify(path=str(Path(job["root"]) / relative))

@@ -7,9 +7,11 @@
   <title>Диск · Локальное скачивание</title>
   <link rel="stylesheet" href="/static/app.css">
   <link rel="stylesheet" href="/static/features.css">
+  <link rel="stylesheet" href="/static/modern.css">
   <script src="/static/app.js" defer></script>
   <script src="/static/features.js" defer></script>
   <script src="/static/extended.js" defer></script>
+  <script src="/static/modern.js" defer></script>
 </head>
 <body>
 <header class="topbar">
@@ -60,7 +62,7 @@
         <label class="field">Порог заполнения диска, %<input id="max-disk-percent" type="number" min="1" max="99.9" step="0.1" value="95"></label>
         <label class="field">Общая скорость, МиБ/с<input id="speed-limit" type="number" min="0" max="10000" step="0.1" value="0"></label><p class="hint">0 — без ограничения. Лимит общий для всех потоков.</p>
         <label class="field">Размер превью<select id="preview-size"><option value="XXXL">Максимальный · 1280 px</option><option value="XXL">1024 px</option><option value="XL">800 px</option><option value="L">500 px</option><option value="M">300 px</option><option value="S">150 px</option></select></label>
-        <div class="numeric-settings"><label>Потоки<input id="workers" type="number" min="1" max="8" value="8"></label><label>Попытки всего<input id="retries" type="number" min="1" max="9" value="1"></label><label>Лимит попытки, с<input id="timeout" type="number" min="5" max="180" value="20"></label></div>
+        <div class="numeric-settings"><label>Потоки<input id="workers" type="number" min="1" max="20" value="8"></label><label>Попытки всего<input id="retries" type="number" min="1" max="9" value="1"></label><label>Лимит попытки, с<input id="timeout" type="number" min="5" max="180" value="20"></label></div>
         <p class="hint">Превью без обрезки. Файлы, отчёты и ZIP — в папке импорта.</p>
       </details>
       <label class="whole"><input id="create-zip" type="checkbox" checked> Создать ZIP после загрузки</label>

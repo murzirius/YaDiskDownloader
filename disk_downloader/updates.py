@@ -103,6 +103,13 @@ class Updates:
                             raise ValueError("Invalid release")
                         latest = version(tag)
                         result.update(latest=tag, url=target.geturl(), available=bool(latest and latest > version(__version__)))
+                        asset_name = 'YaDiskDownloader-v' + tag.lstrip('v') + '-Windows-x64.zip'
+                        assets = release.get('assets', [])
+                        if isinstance(assets, list):
+                            for asset in assets:
+                                if isinstance(asset,dict) and asset.get('name') == asset_name and re.fullmatch(r'sha256:[a-f0-9]{64}', asset.get('digest') or ''):
+                                    result['asset'] = {key:asset.get(key) for key in ('name','size','digest','browser_download_url')}
+                                    break
                         result["message"] = "Доступна новая версия " + tag if result["available"] else "Новая версия не требуется" if latest else "Найден релиз " + tag + "; сравните версии вручную"
         except (APIError, requests.RequestException, OSError, ValueError, TypeError, AttributeError):
             result["message"] = "Не удалось проверить обновления. Проверьте соединение и попробуйте позже."

@@ -102,7 +102,8 @@ function initializeHelp(){
 }
 function bytes(n){if(n===null||n===undefined)return 'неизвестно';const units=['Б','КиБ','МиБ','ГиБ','ТиБ'];let i=0;while(n>=1024&&i<units.length-1){n/=1024;i++;}return `${n.toLocaleString('ru-RU',{maximumFractionDigits:i?1:0})} ${units[i]}`;}
 function remainingTime(seconds){if(seconds===null||seconds===undefined)return 'Уточняется…';if(seconds===0)return '0 мин';if(seconds<60)return `≈ ${Math.ceil(seconds)} с`;const minutes=Math.ceil(seconds/60);if(minutes<60)return `≈ ${minutes} мин`;const hours=Math.floor(minutes/60),rest=minutes%60;if(hours<24)return `≈ ${hours} ч${rest?' '+rest+' мин':''}`;return `≈ ${Math.floor(hours/24)} д${hours%24?' '+hours%24+' ч':''}`;}
-function notice(message){$('notice').textContent=message||'';$('notice').hidden=!message;}
+const dismissedNotices = new Set();
+function notice(message){const boxes=[$('notice'),...document.querySelectorAll('.dialog-notice')];if(!message){for(const box of boxes)box.hidden=true;dismissedNotices.clear();return;}if(dismissedNotices.has(message))return;const dialog=document.querySelector('dialog[open]');if(dialog&&!dialog.querySelector('.dialog-notice')){const local=node('div',undefined,'notice dialog-notice');local.role='status';dialog.prepend(local);boxes.push(local);}for(const box of boxes){box.replaceChildren(node('span',message));const close=node('button','×','notice-close');close.setAttribute('aria-label','Закрыть уведомление');close.onclick=()=>{dismissedNotices.add(message);for(const holder of boxes)holder.hidden=true;};box.append(close);box.hidden=!!dialog&&box===$('notice');}}
 async function api(path,data){const controller=new AbortController();const timer=path==='/api/folder'?null:setTimeout(()=>controller.abort(),45000);const options={headers:{'X-CSRF-Token':csrf},credentials:'same-origin',cache:'no-store',signal:controller.signal};if(data!==undefined){options.method='POST';options.headers['Content-Type']='application/json';options.body=JSON.stringify(data);}try{const response=await fetch(path,options);const result=await response.json();if(!response.ok)throw new Error(result.error||`HTTP ${response.status}`);return result;}catch(error){if(error.name==='AbortError')throw new Error('Сервис не ответил вовремя. Проверьте, что приложение запущено.');throw error;}finally{if(timer!==null)clearTimeout(timer);}}
 async function safely(fn){try{notice('');await fn();}catch(error){notice(error.message);}}
 function connection(connected){state.connected=connected;$('connection').textContent=connected?'Диск подключён':'Не подключён';$('connection').classList.toggle('online',connected);$('auth-form').hidden=connected;$('disconnect').hidden=!connected;$('estimate').disabled=!connected;$('refresh').disabled=!connected;$('next-page').disabled=!connected||!state.hasMore;$('prev-page').disabled=!connected||state.offset===0;}
@@ -186,7 +187,7 @@ async function pollJob(){
     }
     connection(job.connected);
     const option=$('job-history').selectedOptions[0];
-    if(option)option.textContent=job.id.slice(0,8)+' · '+(phases[job.phase]||job.phase);
+    if(option&&option.value===job.id)option.textContent=(job.title||job.id.slice(0,8))+' · '+(phases[job.phase]||job.phase);
     $('job-content').hidden=false;
     $('phase').textContent=phases[job.phase]||job.phase;
     const packing=job.phase==='packing'||(job.phase==='paused'&&job.zip_total&&job.zip_done<job.zip_total);
@@ -230,9 +231,10 @@ async function pollJob(){
     $('pack-job').hidden=live||job.phase==='ready';
     $('pack-job').disabled=!job.scan_complete&&!job.processed;
     $('pack-job').textContent=job.zip_path?'Пересобрать ZIP':'Собрать ZIP';
-    $('network-warning').hidden=!job.network_waiting;
-    $('network-warning').textContent=job.network_warning||'';
-    $('result-info').textContent=job.pause_reason||job.error||(job.phase==='completed_with_errors'?'Результат неполный.':job.phase==='stopped'?'Остановлено. Незавершённых файлов: '+job.cancelled+'.':'');
+    if(typeof renderDismissibleNetwork==='function')renderDismissibleNetwork(job);
+    else{$('network-warning').hidden=!job.network_waiting;$('network-warning').textContent=job.network_warning||'';}
+    const resultMessage=job.pause_reason||job.error||(job.phase==='completed_with_errors'?'Результат неполный.':job.phase==='stopped'?'Остановлено. Незавершённых файлов: '+job.cancelled+'.':'');
+    if(typeof renderDismissibleResult==='function')renderDismissibleResult(job,resultMessage);else $('result-info').textContent=resultMessage;
     if(job.zip_path){
       $('download-zip').hidden=false;
       $('zip-saved').hidden=false;

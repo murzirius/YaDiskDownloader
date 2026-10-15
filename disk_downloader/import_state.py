@@ -103,7 +103,7 @@ def save_import(store, job_id):
         local = reserve_output(store, job, ".disk-import.sqlite3")
         job["settings"]["manifest_local"] = local
         store.update_job(job_id, settings=json.dumps(job["settings"], ensure_ascii=False))
-    temp = temporary_file(job["root"])
+    temp = temporary_file(job["root"], store, 'manifest')
     try:
         with closing(sqlite3.connect(temp)) as db:
             db.executescript("CREATE TABLE import_meta(key TEXT PRIMARY KEY,value TEXT); CREATE TABLE names(identity TEXT PRIMARY KEY,local TEXT,folded TEXT); CREATE TABLE artifacts(path TEXT,type TEXT,local TEXT,size INTEGER,sha256 TEXT,fingerprint TEXT,preview_size TEXT,PRIMARY KEY(path,type)); CREATE TABLE partials(path TEXT,type TEXT,local TEXT,fingerprint TEXT,size INTEGER,sha256 TEXT,etag TEXT,total INTEGER,PRIMARY KEY(path,type)); CREATE TABLE inventory(path TEXT PRIMARY KEY,kind TEXT,meta TEXT);")

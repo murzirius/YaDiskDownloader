@@ -67,7 +67,7 @@ class Partials:
                 if sha.hexdigest() != row["sha256"]:
                     raise ValueError("Сохранённая часть изменена")
                 if not owned:
-                    replacement = temporary_file(job["root"])
+                    replacement = temporary_file(job["root"], self.store, 'partial')
                     try:
                         copied = hashlib.sha256()
                         with open(filename, "rb") as source, open(replacement, "wb") as target:
@@ -97,7 +97,7 @@ class Partials:
                 return row, filename, sha, md5
             except (OSError, ValueError):
                 self.discard(job, path, kind)
-        filename = temporary_file(job["root"])
+        filename = temporary_file(job["root"], self.store, 'partial')
         row = {"job": job["id"], "path": path, "type": kind, "local": Path(filename).name, "fingerprint": stamp, "size": 0, "sha256": hashlib.sha256().hexdigest(), "etag": "", "total": None}
         with self.store.db() as db:
             db.execute("INSERT INTO partials VALUES(?,?,?,?,?,?,?,?,?)", tuple(row.values()))

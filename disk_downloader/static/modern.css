@@ -1,0 +1,24 @@
+:root{--control-accent:#96bddf;--control-bg:#242a33}
+button,input,textarea{border-radius:8px;transition:background .15s,border-color .15s}
+button:focus-visible,input:focus-visible,textarea:focus-visible,.select-choice:focus-visible{outline:2px solid var(--control-accent);outline-offset:3px}
+input[type=checkbox]{appearance:none;-webkit-appearance:none;display:inline-grid;place-content:center;width:18px;height:18px;min-width:18px;padding:0;margin:0 6px 0 0;vertical-align:middle;background:#20252d;border:1px solid #5b6574;border-radius:5px;cursor:pointer}
+input[type=checkbox]::before{content:'';width:9px;height:5px;border-left:2px solid #15202c;border-bottom:2px solid #15202c;transform:rotate(-45deg) scale(0);margin-top:-2px}
+input[type=checkbox]:checked{background:var(--control-accent);border-color:var(--control-accent)}
+input[type=checkbox]:checked::before{transform:rotate(-45deg) scale(1)}
+input[type=checkbox]:indeterminate{background:var(--control-accent)}
+input[type=checkbox]:indeterminate::before{border-left:0;border-bottom:2px solid #15202c;width:9px;transform:scale(1)}
+input:disabled,button:disabled{opacity:.45;cursor:default}
+input[type=number]{appearance:textfield;-moz-appearance:textfield}input[type=number]::-webkit-inner-spin-button,input[type=number]::-webkit-outer-spin-button{appearance:none;margin:0}
+input[type=range]{appearance:none;height:5px;background:#48515f;border-radius:4px;padding:0}
+input[type=range]::-webkit-slider-thumb{appearance:none;width:15px;height:15px;border-radius:50%;background:var(--control-accent);border:2px solid #20252d}
+input[type=range]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;background:var(--control-accent);border:2px solid #20252d}
+.custom-select{position:relative;display:block;min-width:0;width:100%}.select-choice{width:100%;display:flex;justify-content:space-between;gap:12px;text-align:left;background:var(--control-bg);padding:10px 12px;min-height:38px;color:var(--text);font:inherit}.select-choice::after{content:'⌄';color:var(--control-accent)}
+.select-menu{position:fixed;z-index:50;max-height:250px;overflow:auto;padding:5px;border:1px solid #536073;background:#242a33;border-radius:9px;box-shadow:0 12px 35px #0007}
+.toolbar .custom-select{width:200px;max-width:100%;flex:0 1 200px}
+.select-menu button{display:block;width:100%;text-align:left;border:0;background:transparent;padding:9px;font:inherit;color:var(--text)}.select-menu button:hover,.select-menu button[aria-selected=true]{background:#34475b}
+.notice,.network-warning,.result-info{position:relative;display:flex;gap:16px;align-items:flex-start;justify-content:space-between}.notice-close{border:0;background:transparent;color:inherit;min-width:28px;padding:0 6px;font-size:22px;line-height:1.1}
+.settings-panel fieldset{border-radius:9px;border-color:#343d49;padding:12px}.settings-panel legend{color:#aab7c8;font-size:12px;padding:0 6px}.settings-panel .type-options label{display:flex;align-items:center;gap:4px}.settings-panel h1{font-size:18px}
+.tools-tabs{display:flex;flex-wrap:wrap;gap:7px;margin:20px 0}.tools-tabs button[aria-selected=true]{background:#34475b;border-color:#96bddf}
+.tools-dialog{width:min(820px,calc(100vw - 24px))}.tools-content{min-height:160px}.tool-row{border:1px solid #343d49;border-radius:9px;padding:12px;margin:10px 0;overflow-wrap:anywhere}.tool-row .actions{margin-top:9px}.tool-row strong{font-size:14px}.tool-row p{font-size:12px;color:var(--muted);margin:7px 0}.tool-row input[type=text]{width:100%}.tools-content .field{margin:12px 0;display:flex;flex-direction:column;gap:6px}.tools-content input[type=search]{width:100%}.tool-output{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;background:#1a1e25;border-radius:8px;max-height:300px;overflow:auto;font:12px ui-monospace,monospace}
+.confirmation-dialog{width:min(430px,calc(100vw - 32px))}.confirmation-dialog p{line-height:1.6}.management-actions{margin:10px 0}.update-actions{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0}
+@media(max-width:600px){.tools-dialog{padding:16px}.tool-row .actions{flex-wrap:wrap}.select-menu{max-height:210px}}

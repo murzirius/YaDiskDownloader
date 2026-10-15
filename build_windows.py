@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 def notices(output):
-    packages = ("Flask", "requests", "urllib3", "Pillow", "waitress", "pystray", "six", "certifi", "charset-normalizer", "idna", "blinker", "click", "itsdangerous", "Jinja2", "MarkupSafe", "PyInstaller")
+    packages = ("Flask", "requests", "urllib3", "Pillow", "waitress", "pystray", "Send2Trash", "pywin32", "six", "certifi", "charset-normalizer", "idna", "blinker", "click", "itsdangerous", "Jinja2", "MarkupSafe", "PyInstaller")
     texts = ["Third-party components included in YaDiskDownloader.\nThe application license does not replace the licenses below.\n"]
     python_license = Path(sys.base_prefix) / "LICENSE.txt"
     if python_license.exists():

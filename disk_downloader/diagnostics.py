@@ -57,7 +57,7 @@ def write_bundle(engine, job_id):
     job = engine.store.job(job_id)
     files = bundle(engine, job_id)
     local = reserve_output(engine.store, job, "diagnostics-" + datetime.now().strftime("%Y%m%d-%H%M%S") + ".zip")
-    temp = temporary_file(job["root"])
+    temp = temporary_file(job["root"], engine.store, 'diagnostics')
     try:
         with zipfile.ZipFile(temp, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for name, data in files.items():

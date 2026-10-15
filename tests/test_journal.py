@@ -41,11 +41,11 @@ def test_journal_independent_of_report_formats_and_outside_zip(system):
     assert data["summary"]["processed"] == 1
     assert {event["category"] for event in data["events"]} >= {"system", "scan", "original", "preview", "archive"}
     assert "Сохранено" in html and "Найти файл или событие" in html
-    assert list(Path(job["root"]).glob("log-*.html")) == [filename]
+    assert list(Path(job["root"]).glob("log*.html")) == [filename]
     assert Path(job["root"], job["settings"]["changes_local"]).is_file()
     assert not list(Path(job["root"]).glob("*.part"))
     with zipfile.ZipFile(Path(job["root"], job["zip_path"])) as archive:
-        assert not any(name.rsplit("/", 1)[-1].startswith("log-") for name in archive.namelist())
+        assert not any(name.rsplit("/", 1)[-1].startswith("log") for name in archive.namelist())
         assert any(name.endswith("/changes.html") for name in archive.namelist())
     assert not engine.controls[job["id"]].journal.thread.is_alive()
 
@@ -143,7 +143,8 @@ def test_write_failure_does_not_fail_download_and_retries_final_save(system, mon
     engine, api, _ = system
     api.file("disk:/photo.jpg")
     job_id = make_job(system)
-    real_replace = module.os.replace
+    import disk_downloader.paths as paths
+    real_replace = paths.replace_owned
     failures = []
 
     def failing_once(source, destination):
@@ -152,7 +153,7 @@ def test_write_failure_does_not_fail_download_and_retries_final_save(system, mon
             raise PermissionError("Занят файл журнала")
         return real_replace(source, destination)
 
-    monkeypatch.setattr(module.os, "replace", failing_once)
+    monkeypatch.setattr('disk_downloader.service_outputs.replace_owned', failing_once)
     engine.action(job_id, "start")
     job = wait_job(engine, job_id)
     assert job["phase"] == "completed" and failures
@@ -192,16 +193,16 @@ def test_temporary_windows_manifest_lock_does_not_abort_resume(system, monkeypat
     engine, api, _ = system
     api.file("disk:/photo.jpg")
     job = run_job(system, mode="fallback")
-    replace = paths.os.replace
+    replace = paths.durable_move
     locks = []
 
-    def locked_once(source, target):
+    def locked_once(source, target, replace_existing):
         if str(target).endswith(".sqlite3") and not locks:
             locks.append(True)
             raise PermissionError(13, "Windows temporarily locked the import manifest")
-        return replace(source, target)
+        return replace(source, target, replace_existing)
 
-    monkeypatch.setattr(paths.os, "replace", locked_once)
+    monkeypatch.setattr(paths, "durable_move", locked_once)
     engine.action(job["id"], "resume")
     resumed = wait_job(engine, job["id"])
     assert resumed["phase"] == "completed" and locks
