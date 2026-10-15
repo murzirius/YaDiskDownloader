@@ -4,6 +4,9 @@ import io
 import threading
 import time
 import shutil
+import os
+import sys
+import traceback
 
 import pytest
 from PIL import Image
@@ -12,6 +15,50 @@ from disk_downloader.api import APIError, Credentials, DiskAPI
 from disk_downloader.engine import Engine
 from disk_downloader.paths import parent_path
 from disk_downloader.store import Store
+
+
+def test_timeout(seconds):
+    """Scale test scheduling waits, never application request deadlines."""
+    factor = float(os.environ.get("YADISK_TEST_TIMEOUT_FACTOR", "1"))
+    if not 1 <= factor <= 10:
+        raise ValueError("YADISK_TEST_TIMEOUT_FACTOR must be between 1 and 10")
+    return seconds * factor
+
+
+test_timeout.__test__ = False
+
+
+def stop_engines(engines):
+    for engine in engines:
+        engine.shutting_down = True
+        for control in tuple(engine.controls.values()):
+            control.stop()
+    deadline = time.monotonic() + test_timeout(15)
+    remaining = []
+    for engine in engines:
+        for worker in tuple(engine.threads.values()):
+            if worker is not threading.current_thread() and worker.is_alive():
+                worker.join(max(0, deadline - time.monotonic()))
+            if worker.is_alive():
+                remaining.append(worker.name)
+    if remaining:
+        raise AssertionError("Test left active job threads: " + ", ".join(remaining))
+
+
+@pytest.fixture(autouse=True)
+def cleanup_test_engines(monkeypatch):
+    engines = []
+    original = Engine.__init__
+
+    def tracked(engine, *args, **kwargs):
+        original(engine, *args, **kwargs)
+        engines.append(engine)
+
+    monkeypatch.setattr(Engine, "__init__", tracked)
+    try:
+        yield
+    finally:
+        stop_engines(engines)
 
 
 @pytest.fixture(autouse=True)
@@ -110,16 +157,23 @@ class FakeAPI:
         response.close()
 
 
-def wait_job(engine, job_id, phases=None, timeout=10):
-    until = time.monotonic() + timeout
+def wait_job(engine, job_id, phases=None, timeout=30):
+    until = time.monotonic() + test_timeout(timeout)
     while time.monotonic() < until:
-        job = engine.status(job_id)
-        if phases and job["phase"] in phases:
-            return job
-        if not phases and not job["live"]:
-            return job
-        time.sleep(0.01)
-    raise AssertionError("Задание не завершилось вовремя: " + str(engine.status(job_id)))
+        worker = engine.threads.get(job_id)
+        if phases and engine.store.job(job_id)["phase"] in phases:
+            return engine.status(job_id)
+        if not phases and (worker is None or not worker.is_alive()):
+            return engine.status(job_id)
+        delay = min(0.05, max(0, until - time.monotonic()))
+        if worker and worker.is_alive():
+            worker.join(delay)
+        else:
+            time.sleep(delay)
+    worker = engine.threads.get(job_id)
+    frame = sys._current_frames().get(worker.ident) if worker else None
+    stack = "".join(traceback.format_stack(frame)) if frame else "No active worker stack"
+    raise AssertionError("Задание не завершилось вовремя: " + str(engine.status(job_id)) + "\nWorker stack:\n" + stack)
 
 
 @pytest.fixture

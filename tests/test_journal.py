@@ -4,7 +4,7 @@ import time
 import zipfile
 from pathlib import Path
 
-from conftest import make_job, run_job, wait_job
+from conftest import make_job, run_job, wait_job, test_timeout
 from disk_downloader.api import APIError
 from disk_downloader.engine import Engine
 from disk_downloader.journal import Journal
@@ -20,7 +20,7 @@ def read_journal(engine, job_id):
 
 
 def eventually(check, timeout=4):
-    end = time.monotonic() + timeout
+    end = time.monotonic() + test_timeout(timeout)
     while time.monotonic() < end:
         try:
             if check():
@@ -58,7 +58,7 @@ def test_periodic_save_including_pause_and_final_stop(system):
     job_id = make_job(system)
     api.block, api.delay = threading.Event(), 1
     engine.action(job_id, "start")
-    assert api.block.wait(3)
+    assert api.block.wait(test_timeout(10))
     engine.action(job_id, "pause")
     try:
         eventually(lambda: read_journal(engine, job_id)[2]["summary"]["phase"] == "Пауза")

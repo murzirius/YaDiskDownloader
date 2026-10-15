@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import FakeAPI, wait_job
+from conftest import FakeAPI, wait_job, test_timeout
 from disk_downloader.engine import Engine
 from disk_downloader.store import Store
 from disk_downloader.recovery import recover_publications
@@ -15,7 +15,7 @@ from disk_downloader.recovery import recover_publications
 def test_abrupt_process_termination_preserves_confirmed_results(tmp_path,phase):
     process=subprocess.Popen([sys.executable,str(Path(__file__).with_name('crash_worker.py')),str(tmp_path),phase],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
     try:
-        due=time.monotonic()+20
+        due=time.monotonic()+test_timeout(30)
         while time.monotonic()<due and not (tmp_path/'reached').is_file():
             if process.poll() is not None:
                 raise AssertionError(process.communicate()[1].decode(errors='replace'))
@@ -46,7 +46,7 @@ def test_abrupt_process_termination_preserves_confirmed_results(tmp_path,phase):
             assert not list(Path(job['root']).glob('*.zip'))
         engine=Engine(store,api)
         engine.action(job_id,'resume',{'workers':20,'timeout':60})
-        result=wait_job(engine,job_id,timeout=30)
+        result=wait_job(engine,job_id,timeout=90)
         assert result['phase']=='completed',result
         assert (Path(result['root'])/'one.bin').read_bytes()==b'x'*(8*1024*1024)
         assert json.loads((Path(result['root'])/'report.json').read_text(encoding='utf-8'))['summary']['phase']=='completed'

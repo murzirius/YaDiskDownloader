@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from conftest import Response, make_job, run_job, wait_job
+from conftest import Response, make_job, run_job, wait_job, test_timeout
 from disk_downloader.api import APIError
 from disk_downloader.engine import Engine
 from disk_downloader.paths import publish
@@ -30,7 +30,7 @@ def test_scanning_has_no_percentage_and_resumes_page_offset(system, monkeypatch)
 
     monkeypatch.setattr(api, "metadata", metadata)
     job_id = engine.create({"destination": str(tmp / "downloads"), "whole_disk": True})
-    assert reached.wait(3)
+    assert reached.wait(test_timeout(10))
     scanning = engine.status(job_id)
     assert scanning["files"] == 200 and scanning["percent"] is None
     assert scanning["estimate"]["original_bytes"] == 200 * len(b"original")

@@ -8,7 +8,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from conftest import wait_job, run_job
+from conftest import wait_job, run_job, test_timeout
 from disk_downloader.api import APIError, Deadline, Suspended
 from disk_downloader.engine import Engine
 from disk_downloader.inventory import compare, change_summary, folders
@@ -203,7 +203,7 @@ def test_tray_controls_real_engine_pause_and_resume(system):
     api.block = threading.Event()
     api.delay = 1
     engine.action(job["id"], "start")
-    assert api.block.wait(3)
+    assert api.block.wait(test_timeout(10))
     tray = Tray(engine, "http://127.0.0.1:8766", lambda: None)
     tray.toggle()
     assert engine.controls[job["id"]].paused

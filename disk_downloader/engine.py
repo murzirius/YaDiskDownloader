@@ -71,9 +71,9 @@ class Control:
         self.finished = None
         self.temporary = set()
         self.temporary_sizes = {}
-        self.remaining_time = RemainingTime(self.statistics_clock)
         self.journal = None
         self.network = NetworkWait(self.event, clock=self.active_clock)
+        self.remaining_time = RemainingTime(self.statistics_clock)
         self.space_check = None
         self.space_lock = threading.Lock()
         self.next_space_check = 0
@@ -271,7 +271,7 @@ class Engine:
             control.rate_limiter = rate_limit.RateLimiter(job["settings"].get("speed_limit_mib", 0), control.active_clock)
             control.space_check = lambda: self.check_space(job_id, control)
             control.selected_paths = tuple(paths) if paths else None
-            control.reuse_scanned = operation == "download" and not paths and job["phase"] == "ready" and job["settings"].get("operation") == "missing"
+            control.reuse_scanned = operation == "download" and not paths and job["settings"].get("operation") == "missing"
             self.controls[job_id] = control
             thread = threading.Thread(target=self.run, args=(job_id, operation, control), daemon=True)
             self.threads[job_id] = thread
@@ -435,6 +435,8 @@ class Engine:
         status["folder_bytes_updated"] = usage["updated"]
         status["eta_seconds"] = None
         status["eta_phase"] = None
+        status["eta_message"] = "Ожидание интернета" if status["network_waiting"] else "Уточняется…"
+        status["eta_basis"] = None
         if live and control and not status["network_waiting"] and status["phase"] in ("downloading", "packing"):
             phase = status["phase"]
             work = status["remaining_work"]
@@ -455,7 +457,10 @@ class Engine:
                 if phase == "packing":
                     status["eta_seconds"] = control.remaining_time.estimate(phase, status["zip_done"], 0, max(0, status["zip_total"] - status["zip_done"]), 0)
                 else:
-                    status["eta_seconds"] = control.remaining_time.estimate(phase, control.transferred, status["processed"], remaining_bytes, work["files"], unknown_files)
+                    original_only = status["settings"]["mode"] == "fallback" or status["settings"].get("operation") == "missing" or status["generation"] > 0
+                    status["eta_seconds"] = control.remaining_time.estimate(phase, control.transferred, status["processed"], remaining_bytes, work["files"], unknown_files, original_only=original_only)
+                status["eta_message"] = control.remaining_time.reason
+                status["eta_basis"] = control.remaining_time.basis
             status["eta_phase"] = phase
         elif status["phase"] in ("completed", "completed_with_errors") and not live:
             status["eta_seconds"] = 0
@@ -694,8 +699,12 @@ class Engine:
 
     def download(self, job_id, control):
         workers = self.store.job(job_id)["settings"]["workers"]
+        first_stage_work = False
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="disk-download") as pool:
             for stage in range(2):
+                if stage and first_stage_work:
+                    with control.lock:
+                        control.remaining_time.new_stage()
                 condition = "" if stage else " AND NOT EXISTS(SELECT 1 FROM artifacts a WHERE a.job=entries.job AND a.path=entries.path)"
                 parameters = (job_id,)
                 if control.selected_paths:
@@ -711,6 +720,8 @@ class Engine:
                                 db.execute("UPDATE entries SET status='running' WHERE job=? AND path=?", (job_id, entry["path"]))
                         if not entry:
                             break
+                        if not stage:
+                            first_stage_work = True
                         active.add(pool.submit(self.process, job_id, dict(entry), control))
                     if not active:
                         break
@@ -722,6 +733,9 @@ class Engine:
 
     def prioritize(self, job_id, control, prime=False):
         job = self.store.job(job_id)
+        if prime and (job["settings"].get("operation") == "missing" or job["generation"] > 0):
+            self.check_local_results(job, control)
+            return
         with self.store.db() as db:
             rows = db.execute("SELECT e.path,e.meta,e.status,a.type,a.local,a.size,a.sha256,a.fingerprint,v.signature FROM entries e JOIN artifacts a ON a.job=e.job AND a.path=e.path LEFT JOIN verification_cache v ON v.job=a.job AND v.local=a.local WHERE e.job=? AND e.kind='file' AND (? OR e.status='pending') ORDER BY e.path,a.type", (job_id, prime)).fetchall()
         candidates = {}
@@ -761,6 +775,48 @@ class Engine:
                     elif value["status"] == "existing":
                         db.execute("UPDATE entries SET status='pending' WHERE job=? AND path=?", (job_id, path))
 
+    def check_local_results(self, job, control):
+        """Finish local verification before any download workers are started."""
+        control = control or Control()
+        job_id = job["id"]
+        with self.store.db() as db:
+            total = db.execute("SELECT COUNT(*) FROM entries WHERE job=? AND kind='file' AND status!='filtered'", (job_id,)).fetchone()[0]
+        checked = found = 0
+        cursor = ""
+        control.event("cache", "Проверка папки перед дозагрузкой")
+        while True:
+            control.check()
+            with self.store.db() as db:
+                rows = db.execute("SELECT * FROM entries WHERE job=? AND kind='file' AND status!='filtered' AND path>? ORDER BY path LIMIT 200", (job_id, cursor)).fetchall()
+            if not rows:
+                break
+            for row in rows:
+                control.check()
+                entry = dict(row)
+                control.progress(entry["path"], checked, total, "Проверка скачанной папки", unit="objects")
+                meta = json.loads(entry["meta"])
+                original = preview = False
+                try:
+                    original = self.reusable(job, entry, "original", meta, control)
+                    preview = not original and preview_type(meta) and self.reusable(job, entry, "preview", meta, control)
+                except (OSError, ValueError):
+                    # An unreadable local file must not prevent the remaining folder check.
+                    with self.store.db() as db:
+                        db.execute("DELETE FROM artifacts WHERE job=? AND path=?", (job_id, entry["path"]))
+                with self.store.db() as db:
+                    if original:
+                        db.execute("UPDATE entries SET status='existing',priority=2,error='',original_status='existing_verified',preview_status='not_needed',fallback=0 WHERE job=? AND path=?", (job_id, entry["path"]))
+                        db.execute("DELETE FROM artifacts WHERE job=? AND path=? AND type='preview'", (job_id, entry["path"]))
+                    else:
+                        db.execute("UPDATE entries SET status='pending',priority=?,error='',original_status='not_requested',preview_status=?,fallback=0 WHERE job=? AND path=?", (int(bool(preview)), "existing_verified" if preview else "not_requested", job_id, entry["path"]))
+                checked += 1
+                found += bool(original or preview)
+                with control.lock:
+                    control.active.clear()
+                control.progress(entry["path"], checked, total, "Проверка скачанной папки", unit="objects")
+            cursor = rows[-1]["path"]
+        control.event("cache", f"Папка проверена: {checked} файлов, уже есть результат у {found}. Сначала будут скачаны файлы без результата.")
+
     def remember_file(self, job, relative, sha):
         signature = file_signature(safe_join(job["root"], relative), sha)
         if signature[-1] is None:
@@ -783,6 +839,7 @@ class Engine:
             filename = safe_join(job["root"], entry["local"])
             if not os.path.isfile(filename) or meta.get("size") is not None and os.path.getsize(filename) != meta["size"]:
                 return False
+            before = file_signature(filename, "")
             sha, md5 = hashlib.sha256(), hashlib.md5()
             with open(filename, "rb") as stream:
                 while chunk := stream.read(1024 * 1024):
@@ -790,6 +847,8 @@ class Engine:
                     sha.update(chunk)
                     md5.update(chunk)
             if meta.get("sha256") and sha.hexdigest() != meta["sha256"] or meta.get("md5") and md5.hexdigest() != meta["md5"]:
+                return False
+            if before != file_signature(filename, ""):
                 return False
             with self.store.db() as db:
                 db.execute("INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)", (job["id"], entry["path"], kind, entry["local"], os.path.getsize(filename), sha.hexdigest(), fingerprint(meta), None))
@@ -847,6 +906,7 @@ class Engine:
         completed, reused = [], []
         original_status = preview_status = "not_requested"
         fallback = False
+        finalized = False
         try:
             control.check()
             self.store.update_entry(job_id, path, error="", original_attempts=0, preview_attempts=0, original_status="not_requested", preview_status="not_requested", fallback=0)
@@ -915,6 +975,7 @@ class Engine:
             if not completed or other_errors:
                 control.event("errors", "; ".join(errors if not completed else other_errors), path, "error")
             self.store.update_entry(job_id, path, status=status, error="; ".join(errors if not completed else other_errors), original_status=original_status, preview_status=preview_status, fallback=int(fallback))
+            finalized = True
         except Suspended:
             self.store.update_entry(job_id, path, status="pending", original_status=original_status, preview_status=preview_status)
             control.stop()
@@ -928,13 +989,17 @@ class Engine:
             with self.store.db() as db:
                 db.execute("DELETE FROM artifacts WHERE job=? AND path=?", (job_id, path))
             self.store.update_entry(job_id, path, status="error", error=safe_error(exc), original_status=original_status, preview_status=preview_status)
+            finalized = True
             control.event("errors", "Ошибка обработки файла: " + safe_error(exc), path, "error")
         except Exception as exc:
             self.store.update_entry(job_id, path, status="error", error=safe_error(exc), original_status=original_status, preview_status=preview_status)
+            finalized = True
             control.event("errors", "Ошибка обработки файла: " + safe_error(exc), path, "error")
         finally:
             with control.lock:
                 control.active.pop(path, None)
+                if finalized:
+                    control.remaining_time.result(bool(completed), reused=bool(completed) and len(reused) == len(completed) and not errors, fallback=fallback)
 
     def transfer(self, job, entry, kind, meta, control):
         import re
@@ -1035,6 +1100,7 @@ class Engine:
                                 size += len(chunk)
                                 with control.lock:
                                     control.transferred += len(chunk)
+                                    control.remaining_time.advance(kind, len(chunk))
                                     control.temporary_sizes[temp] = size
                                 pending_bytes += len(chunk)
                                 current = time.monotonic()
@@ -1107,6 +1173,8 @@ class Engine:
                 raise
             except Exception as exc:
                 error = exc
+                with control.lock:
+                    control.remaining_time.retry(kind)
                 if deadline.network_aborted.is_set():
                     error = NetworkError(offline=True)
                 elif deadline.expired.is_set():

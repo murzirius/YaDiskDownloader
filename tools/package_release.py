@@ -8,7 +8,7 @@ from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[1]
 VERSION=re.search(r'__version__\s*=\s*"([0-9.]+)"',(ROOT/'disk_downloader/__init__.py').read_text(encoding='utf-8')).group(1)
-ROOT_FILES=('README.md','LICENSE','.gitignore','run.py','build_windows.py','start.cmd','start.ps1','requirements.txt','requirements-dev.txt','requirements-build.txt','requirements-bootstrap.txt')
+ROOT_FILES=('README.md','LICENSE','.gitignore','run.py','build_windows.py','start.cmd','start.ps1','START-CMD.txt','requirements.txt','requirements-dev.txt','requirements-build.txt','requirements-bootstrap.txt')
 
 
 def source_files():
@@ -28,6 +28,13 @@ def package(output, executable=None):
     with zipfile.ZipFile(source,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as archive:
         for file in source_files(): archive.write(file,'disk-downloader/'+file.relative_to(ROOT).as_posix())
     files=[source]
+    cmd=output/f'YaDiskDownloader-v{VERSION}-Windows-CMD.zip'
+    with zipfile.ZipFile(cmd,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as archive:
+        for file in source_files():
+            relative=file.relative_to(ROOT)
+            if relative.parts[0]=='disk_downloader' or relative.as_posix() in ('README.md','LICENSE','run.py','start.cmd','start.ps1','START-CMD.txt','requirements.txt','requirements-bootstrap.txt','docs/usage.md'):
+                archive.write(file,'YaDiskDownloader-CMD/'+relative.as_posix())
+    files.append(cmd)
     if executable:
         executable=executable.resolve()
         if not executable.is_file(): raise ValueError('EXE not found')

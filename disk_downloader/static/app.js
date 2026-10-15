@@ -128,15 +128,15 @@ function renderJobCounters(job){
   for(const [label,value,wide] of [
     ['Файлы',`${job.processed} / ${job.files}`],
     ['Скорость',bytes(job.speed)+'/с'],
-    ['Объём папки на ПК',bytes(job.folder_bytes??job.local_bytes)+(job.folder_bytes_scanning?' · уточняется':''),true],
+    ['На устройстве',bytes(job.folder_bytes??job.local_bytes)+(job.folder_bytes_scanning?' · уточняется':''),true],
     ['Свободно на диске',bytes(job.free_bytes),true],
     ['Оригиналы',job.originals],
     ['Превью',job.previews],
     ['Замены оригинала',job.replacements],
     ['Ошибки',job.errors+job.scan_errors]
   ])counter(main,label,value,wide);
-  if(job.previous_results)counter(main,'Ранее сохранено',job.previous_results,true);
-  if(['downloading','packing','paused','completed','completed_with_errors'].includes(job.phase))counter(main,job.eta_phase==='packing'?'До конца ZIP':'До конца загрузки',job.phase==='paused'?'Пауза':remainingTime(job.eta_seconds),true);
+  if(job.previous_results)counter(main,'Уже есть результат',job.previous_results,true);
+  if(['downloading','packing','paused','completed','completed_with_errors'].includes(job.phase))counter(main,job.eta_phase==='packing'?'До конца ZIP':'До конца загрузки',job.phase==='paused'?'Пауза':job.eta_seconds==null?(job.eta_message||'Уточняется…'):remainingTime(job.eta_seconds),true);
   for(const [label,value] of [
     ['Потоки',`${job.workers_status.current} / ${job.workers_status.maximum}`],['Недокачанные части',bytes(job.partial_bytes)],
     ['Папки',job.folders],['Уже имеются',job.existing],['Исключены по типу',job.counts.filtered||0],
@@ -164,7 +164,7 @@ function renderEstimate(job){
   details.append(node('p','Найденные оригиналы: '+bytes(estimate.original_bytes)+'. Неизвестных размеров: '+estimate.original_unknown+'.'));
   details.append(node('p',(job.settings.create_zip!==false?'Запас для ZIP и временных файлов: ':'Запас для временных файлов: ')+bytes(estimate.extra_temporary_bytes)+(hasUnknown?' + неизвестный объём':'')+' сверх результата.'));
   details.append(node('p','Размеры превью заранее неизвестны. Приоритет оригинала оценивается по оригиналам; итог зависит от успешности загрузки.'));
-  details.append(node('p','Объём папки на ПК учитывает всё содержимое, включая прежние загрузки, отчёты, ZIP и недокачанные части. Обновляется примерно каждые 10 секунд; ссылки на внешние папки не обходятся.'));
+  details.append(node('p','Показатель «На устройстве» учитывает всё содержимое папки, включая прежние загрузки, отчёты, ZIP и недокачанные части. Обновляется примерно каждые 10 секунд; ссылки на внешние папки не обходятся.'));
 }
 async function pollJob(){
   if(!state.job||state.polling)return;
@@ -209,7 +209,7 @@ async function pollJob(){
         const progress=node('progress');
         progress.max=file.size||1;
         progress.value=file.done;
-        div.append(progress,node('span',bytes(file.done)+' / '+bytes(file.size),'muted'));
+        div.append(progress,node('span',file.unit==='objects'?file.done.toLocaleString('ru-RU')+' / '+file.size.toLocaleString('ru-RU')+' файлов':bytes(file.done)+' / '+bytes(file.size),'muted'));
       }else div.append(node('div',file.unit==='objects'?file.done.toLocaleString('ru-RU')+' объектов':bytes(file.done),'muted'));
       active.append(div);
     }

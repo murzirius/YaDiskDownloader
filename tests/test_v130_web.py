@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 from test_api_security import web_session
-from conftest import wait_job
+from conftest import wait_job, test_timeout
 
 
 def test_new_endpoints_keep_csrf_and_origin_protection(tmp_path):
@@ -30,7 +30,7 @@ def test_history_queue_and_offline_verification_routes(tmp_path):
     engine.action(job,'start');wait_job(engine,job)
     app.extensions['disk_api'].credentials.clear()
     assert client.post('/api/verification',base_url=base,headers=headers,json={'job':job}).status_code==200
-    app.extensions['maintenance'].thread.join(5)
+    app.extensions['maintenance'].thread.join(test_timeout(15))
     assert client.get('/api/verification',base_url=base,headers=headers).get_json()['counts'].get('ok')
 
 

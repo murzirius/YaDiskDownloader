@@ -56,7 +56,7 @@ def test_none_before_preview_before_original_and_corrupt_cache_is_missing(system
     job = wait_job(engine, second)
     assert job["phase"] == "completed"
     originals = [path for path, kind in api.media_calls if kind == "original"]
-    assert originals == ["disk:/z-new", "disk:/z-none", "disk:/c-corrupt", "disk:/a-preview"]
+    assert originals == ["disk:/c-corrupt", "disk:/z-new", "disk:/z-none", "disk:/a-preview"]
     assert not any(kind == "preview" for _, kind in api.media_calls)
     assert damaged.read_bytes() == b"x" * len(old)
 

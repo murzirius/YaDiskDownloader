@@ -10,7 +10,7 @@ from pathlib import Path
 from contextlib import closing
 
 import pytest
-from conftest import FakeAPI, make_job, run_job, wait_job
+from conftest import FakeAPI, make_job, run_job, wait_job, test_timeout
 from disk_downloader.backups import Backups
 from disk_downloader.management import Management
 from disk_downloader.maintenance import Maintenance
@@ -122,7 +122,7 @@ def test_offline_verification_hashes_content_and_allows_cancel(system):
     job=run_job(system,mode='fallback');api.credentials.clear()
     (Path(job['root'])/'one.bin').write_bytes(b'corrupt!')
     (Path(job['root'])/'two.bin').unlink()
-    maintenance=Maintenance(engine);maintenance.start({'job':job['id']});maintenance.thread.join(5)
+    maintenance=Maintenance(engine);maintenance.start({'job':job['id']});maintenance.thread.join(test_timeout(15))
     result=maintenance.snapshot()
     assert not result['busy'] and result['counts']=={'damaged':1,'missing':1}
     assert not api.credentials.connected

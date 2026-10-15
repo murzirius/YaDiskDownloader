@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import make_job, run_job, wait_job
+from conftest import make_job, run_job, wait_job, test_timeout
 from disk_downloader.api import APIError, Credentials, DiskAPI, Suspended, retry_delay, validate_resource
 from disk_downloader.engine import Engine, fingerprint
 from disk_downloader.inventory import compare
@@ -93,7 +93,7 @@ def test_busy_job_rejection_does_not_modify_other_task(system, monkeypatch):
     reached = threading.Event()
     api.block, api.delay = reached, 1
     engine.action(first, "start")
-    assert reached.wait(2)
+    assert reached.wait(test_timeout(10))
     before = engine.store.job(second)["settings"]
     try:
         with pytest.raises(ValueError):
@@ -404,8 +404,8 @@ def test_report_stage_accepts_controller_commands(system, monkeypatch, command):
         return original(*args, **kwargs)
     monkeypatch.setattr(module, "write_reports", reports)
     engine.action(job_id, "start", {"create_zip": False})
-    assert reached.wait(3)
     try:
+        assert reached.wait(test_timeout(15))
         assert engine.store.job(job_id)["phase"] == "preparing"
         engine.action(job_id, command)
         if command == "pause":

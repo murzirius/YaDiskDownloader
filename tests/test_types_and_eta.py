@@ -137,11 +137,16 @@ def test_eta_known_bytes_unknown_previews_stall_and_phase_switch():
     eta = RemainingTime(lambda: moment[0])
     eta.start("downloading")
     moment[0] = 1
-    assert eta.estimate("downloading", 10, 0, 90, 1) is None
-    moment[0] = 2
-    assert eta.estimate("downloading", 10, 0, 90, 1) == 18
-    moment[0] = 5
-    assert eta.estimate("downloading", 20, 1, 10000, 9, 9) == 45
+    eta.advance('original', 32768)
+    assert eta.estimate("downloading", 32768, 0, 196608, 1) is None
+    for step in (2, 3):
+        moment[0] = step
+        eta.advance('original', 32768)
+    assert eta.estimate("downloading", 98304, 0, 196608, 1) == 6
+    for step in (4, 5, 6):
+        moment[0] = step
+        eta.result(True)
+    assert eta.estimate("downloading", 98304, 3, 10000, 9, 9) == 18
     moment[0] = 40
     assert eta.estimate("downloading", 20, 1, 10000, 9, 9) is None
     eta.start("packing", 0)
@@ -157,13 +162,16 @@ def test_eta_pause_excludes_paused_time(monkeypatch):
     control = Control()
     eta = control.remaining_time
     eta.start("downloading")
-    moment[0] = 2
+    for step in (1, 2, 3):
+        moment[0] = step
+        eta.advance('original', 32768)
     control.pause()
-    moment[0] = 22
-    assert eta.estimate("downloading", 20, 0, 80, 1) == 8
+    moment[0] = 23
+    assert eta.estimate("downloading", 98304, 0, 196608, 1) == 6
     control.resume()
     moment[0] = 24
-    assert eta.estimate("downloading", 40, 0, 60, 1) == 6
+    eta.advance('original', 32768)
+    assert eta.estimate("downloading", 131072, 0, 196608, 1) == 6
 
 
 def test_job_eta_accounts_for_active_bytes_and_zero_after_completion(system):
@@ -178,10 +186,12 @@ def test_job_eta_accounts_for_active_bytes_and_zero_after_completion(system):
     moment = [0]
     control.remaining_time = RemainingTime(lambda: moment[0])
     control.remaining_time.start("downloading")
-    moment[0] = 5
-    control.transferred = 100
-    control.progress("disk:/one.jpg", 100, 1000, "Загрузка превью", kind="preview", source_size=1000)
-    assert engine.status(job_id)["eta_seconds"] == 45
+    for step in (1, 2, 3):
+        moment[0] = step
+        control.remaining_time.advance('preview', 32768)
+    control.transferred = 98304
+    control.progress("disk:/one.jpg", 98304, 294912, "Загрузка превью", kind="preview", source_size=1000)
+    assert engine.status(job_id)["eta_seconds"] == 6
     engine.store.update_job(job_id, phase="paused")
     assert engine.status(job_id)["eta_seconds"] is None
     engine.store.update_job(job_id, phase="completed")

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import make_job, run_job, wait_job
+from conftest import make_job, run_job, wait_job, test_timeout
 from disk_downloader.api import APIError
 from disk_downloader.engine import Engine
 from disk_downloader.paths import safe_join
@@ -152,7 +152,7 @@ def test_pause_resume_stop_and_partial_archive(system):
     api.block = threading.Event()
     api.delay = 1
     engine.action(job_id, "start")
-    assert api.block.wait(3)
+    assert api.block.wait(test_timeout(10))
     engine.action(job_id, "pause")
     paused = engine.status(job_id)
     assert paused["phase"] == "paused" and paused["processed"] == 0

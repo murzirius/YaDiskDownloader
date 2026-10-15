@@ -57,7 +57,7 @@ def test_modified_file_with_restored_mtime_is_not_trusted(system):
     assert filename.read_bytes() == b"damaged"
 
 
-def test_legacy_signature_still_counts_previous_file_but_requires_hash(system):
+def test_legacy_signature_is_hashed_and_counted_before_start(system):
     engine, api, _ = system
     api.file('disk:/legacy.jpg')
     first = run_job(system, mode='fallback')
@@ -66,7 +66,7 @@ def test_legacy_signature_still_counts_previous_file_but_requires_hash(system):
         db.execute('UPDATE verification_cache SET signature=? WHERE job=? AND local=?',(json.dumps(json.loads(row['signature'])[:6]),first['id'],row['local']))
     before = missing(system,first)
     assert before['previous_results'] == 1
-    assert before['existing'] == 0
+    assert before['existing'] == 1
     engine.action(before['id'],'start')
     after = wait_job(engine,before['id'])
     assert after['existing'] == 1

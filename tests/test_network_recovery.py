@@ -6,14 +6,14 @@ from pathlib import Path
 import pytest
 import requests
 
-from conftest import Response, make_job, wait_job
+from conftest import Response, make_job, wait_job, test_timeout
 from disk_downloader.api import APIError, Deadline, DiskAPI, NetworkError, Suspended
 from disk_downloader.engine import Control
 from disk_downloader.network import NetworkWait
 
 
 def until(predicate, timeout=3):
-    end = time.monotonic() + timeout
+    end = time.monotonic() + test_timeout(timeout)
     while time.monotonic() < end:
         if predicate():
             return
@@ -27,6 +27,7 @@ def test_offline_warning_and_recovery_with_one_attempt_and_partial(system, monke
     api.file("disk:/one.bin", data=content, preview=False)
     job_id = make_job(system, mode="fallback")
     online = threading.Event()
+    resumed_request = threading.Event()
     monkeypatch.setattr(NetworkWait, "reachable", staticmethod(online.is_set))
     media_calls = []
 
@@ -41,6 +42,7 @@ def test_offline_warning_and_recovery_with_one_attempt_and_partial(system, monke
             return Interrupted(content), None
         offset = settings.get("_range_offset", 0)
         assert offset == 100
+        resumed_request.set()
         return Response(content[offset:], status=206, headers={"Content-Length": str(len(content) - offset), "Content-Range": f"bytes {offset}-{len(content)-1}/{len(content)}"}), None
 
     monkeypatch.setattr(api, "media", media)
@@ -56,8 +58,9 @@ def test_offline_warning_and_recovery_with_one_attempt_and_partial(system, monke
     assert len(media_calls) == 1
     resumed = time.monotonic()
     online.set()
-    done = wait_job(engine, job_id)
+    assert resumed_request.wait(2), "Network recovery did not resume the request promptly"
     assert time.monotonic() - resumed < 2
+    done = wait_job(engine, job_id)
     assert done["phase"] == "completed" and done["errors"] == 0 and not done["network_waiting"]
     assert media_calls == [("original", 0), ("original", 100)]
     row = next(engine.store.rows("SELECT original_attempts FROM entries WHERE job=? AND kind='file'", (job_id,)))
@@ -172,6 +175,7 @@ def test_real_parallel_http_disconnect_resumes_without_old_socket_timeout(system
     online.set()
     first_started = threading.Event()
     release_old_socket = threading.Event()
+    resumed_requests = {path: threading.Event() for path in bodies}
     calls = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -199,8 +203,10 @@ def test_real_parallel_http_disconnect_resumes_without_old_socket_timeout(system
                 offset = int(self.headers.get("Range", "bytes=0-").split("=")[1].split("-")[0])
                 calls.append((path, offset))
                 first = len([item for item in calls if item[0] == path]) == 1
+                if not first:
+                    resumed_requests[path].set()
                 if first and path == "disk:/b.bin":
-                    assert first_started.wait(2)
+                    assert first_started.wait(test_timeout(10))
                 data = bodies[path]
                 self.send_response(206 if offset else 200)
                 self.send_header("Content-Length", str(len(data) - offset))
@@ -243,8 +249,10 @@ def test_real_parallel_http_disconnect_resumes_without_old_socket_timeout(system
         gate.next_probe = 0
         recovered = time.monotonic()
         online.set()
-        done = wait_job(engine, job_id, timeout=4)
+        for event in resumed_requests.values():
+            assert event.wait(max(0, 3 - (time.monotonic() - recovered)))
         assert time.monotonic() - recovered < 3
+        done = wait_job(engine, job_id)
         assert done["errors"] == 0 and done["originals"] == 2 and done["phase"] == "completed"
         assert not release_old_socket.is_set()
         for row in engine.store.rows("SELECT path,local FROM artifacts WHERE job=?", (job_id,)):

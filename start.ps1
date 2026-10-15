@@ -2,16 +2,29 @@
 Set-Location -LiteralPath $PSScriptRoot
 $runtime = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $runtime)) {
-    $pythonTool = Get-Command py -ErrorAction SilentlyContinue
-    $pythonArguments = @('-3')
-    if (-not $pythonTool) {
-        $pythonTool = Get-Command python -ErrorAction SilentlyContinue
-        $pythonArguments = @()
+    $candidates = @()
+    $launcher = Get-Command py -ErrorAction SilentlyContinue
+    if ($launcher) {
+        foreach ($line in @(& $launcher.Source -0p 2>$null)) {
+            if ($line -match '^\s*-(V:\S+)') {
+                $candidates += @{ Path = $launcher.Source; Arguments = @('-' + $Matches[1]) }
+            }
+        }
+        $candidates += @{ Path = $launcher.Source; Arguments = @('-3') }
     }
-    if (-not $pythonTool) { throw 'Установите Python 3.11 или новее, затем запустите start.cmd снова.' }
-    & $pythonTool.Source @pythonArguments -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,11) else 1)'
-    if ($LASTEXITCODE -ne 0) { throw 'Требуется установленный Python 3.11 или новее.' }
-    & $pythonTool.Source @pythonArguments -m venv .venv
+    $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+    if ($pythonCommand) { $candidates += @{ Path = $pythonCommand.Source; Arguments = @() } }
+    $selectedPython = $null
+    foreach ($candidate in $candidates) {
+        $candidateArguments = $candidate.Arguments
+        try {
+            & $candidate.Path @candidateArguments -c 'import sys,sysconfig; raise SystemExit(0 if sys.version_info >= (3,11) and not sysconfig.get_config_var(''Py_GIL_DISABLED'') else 1)' 2>$null
+        } catch { continue }
+        if ($LASTEXITCODE -eq 0) { $selectedPython = $candidate; break }
+    }
+    if (-not $selectedPython) { throw 'Установите обычный Python 3.11 или новее (не free-threaded), затем запустите start.cmd снова.' }
+    $pythonArguments = $selectedPython.Arguments
+    & $selectedPython.Path @pythonArguments -m venv .venv
     if ($LASTEXITCODE -ne 0) { throw 'Не удалось создать окружение Python' }
 }
 $bootstrapFile = Join-Path $PSScriptRoot 'requirements-bootstrap.txt'
