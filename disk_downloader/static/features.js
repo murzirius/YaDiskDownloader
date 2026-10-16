@@ -15,5 +15,5 @@ $('close-service').onclick=()=>$('service-dialog').close();
 $('preview-diagnostics').onclick=()=>safely(async()=>{if(!state.job)throw new Error('Сначала выберите задание');const result=await api('/api/jobs/'+state.job+'/diagnostics-preview');diagnosticsJob=state.job;$('diagnostics-content').textContent=JSON.stringify({files:Object.keys(result.files),environment:result.files['environment.json'],settings:result.files['settings.json'],summary:result.files['summary.json'],error_records:result.files['errors.json'].length,event_records:result.files['events.json'].length},null,2);$('diagnostics-preview').hidden=false;});
 $('save-diagnostics').onclick=()=>safely(async()=>{if(!diagnosticsJob)throw new Error('Сначала посмотрите состав');$('save-diagnostics').disabled=true;try{const result=await api('/api/jobs/'+diagnosticsJob+'/diagnostics',{});$('diagnostics-status').textContent='Сохранено в папке импорта: '+result.local;}finally{$('save-diagnostics').disabled=false;}});
 safely(loadProfiles);safely(loadUpdates);
-setInterval(()=>{if($('service-dialog').open)loadUpdates().catch(error=>{$('update-status').textContent=error.message;});},2000);
-setInterval(()=>loadUpdates().catch(()=>{}),30000);
+setInterval(()=>{if(!document.hidden&&$('service-dialog').open)loadUpdates().catch(error=>{$('update-status').textContent=error.message;});},2000);
+setInterval(()=>{if(!document.hidden&&!state.closing)loadUpdates().catch(()=>{});},30000);
