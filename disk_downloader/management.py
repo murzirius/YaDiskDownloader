@@ -70,8 +70,13 @@ class Management:
                 continue
 
     def tick(self):
+        # No scheduler action is possible before consent/connection, or while
+        # any task is still running. Avoid opening SQLite just to rediscover it.
+        if (self.engine.shutting_down or not self.armed or not self.engine.api.credentials.connected
+                or any(thread.is_alive() for thread in tuple(self.engine.threads.values()))):
+            return
         with self.engine.lock:
-            if self.engine.shutting_down or self.paused() or not self.armed or not self.engine.api.credentials.connected:
+            if self.engine.shutting_down or not self.armed or not self.engine.api.credentials.connected or self.paused():
                 return
             with self.store.db() as db:
                 for row in db.execute("SELECT job FROM job_queue WHERE state='running'").fetchall():

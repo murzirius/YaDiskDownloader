@@ -96,27 +96,37 @@ class Tray:
 
     def watch_notifications(self):
         first = True
-        while not self.notification_stop.wait(1):
+        while not self.notification_stop.is_set():
             try:
+                # A read-only, autocommit observer keeps data_version meaningful
+                # across ticks. No read transaction is held between polls.
                 with self.engine.store.db() as db:
-                    pref = db.execute("SELECT value FROM preferences WHERE key='notifications'").fetchone()
-                    rows = db.execute('SELECT id,phase,generation,pause_reason FROM jobs').fetchall()
-                enabled = not pref or pref[0] == 'true'
-                for job in rows:
-                    key = (job['phase'], job['generation'], bool(job['pause_reason']))
-                    previous = self.seen.get(job['id'])
-                    self.seen[job['id']] = key
-                    if first or previous == key or not enabled or not self.icon or not self.icon.visible:
-                        continue
-                    text = None
-                    if job['phase'] == 'completed': text = 'Загрузка завершена. Откройте приложение через значок в трее.'
-                    elif job['phase'] == 'completed_with_errors': text = 'Загрузка завершена с замечаниями. Проверьте результат в приложении.'
-                    elif job['phase'] == 'paused' and job['pause_reason']: text = 'Загрузка на паузе: проверьте свободное место на диске.'
-                    elif job['phase'] == 'failed': text = 'Задание требует внимания. Откройте приложение через значок в трее.'
-                    if text: self.icon.notify(text, 'YaDiskDownloader')
-                first = False
+                    previous_version = None
+                    while not self.notification_stop.wait(1):
+                        version = db.execute('PRAGMA data_version').fetchone()[0]
+                        if version == previous_version:
+                            continue
+                        pref = db.execute("SELECT value FROM preferences WHERE key='notifications'").fetchone()
+                        rows = db.execute('SELECT id,phase,generation,pause_reason FROM jobs').fetchall()
+                        previous_version = version
+                        enabled = not pref or pref[0] == 'true'
+                        current = {}
+                        for job in rows:
+                            key = (job['phase'], job['generation'], bool(job['pause_reason']))
+                            previous = self.seen.get(job['id'])
+                            current[job['id']] = key
+                            if first or previous == key or not enabled or not self.icon or not self.icon.visible:
+                                continue
+                            text = None
+                            if job['phase'] == 'completed': text = 'Загрузка завершена. Откройте приложение через значок в трее.'
+                            elif job['phase'] == 'completed_with_errors': text = 'Загрузка завершена с замечаниями. Проверьте результат в приложении.'
+                            elif job['phase'] == 'paused' and job['pause_reason']: text = 'Загрузка на паузе: проверьте свободное место на диске.'
+                            elif job['phase'] == 'failed': text = 'Задание требует внимания. Откройте приложение через значок в трее.'
+                            if text: self.icon.notify(text, 'YaDiskDownloader')
+                        self.seen = current
+                        first = False
             except Exception:
-                continue
+                self.notification_stop.wait(1)
 
     def stop(self):
         self.notification_stop.set()
