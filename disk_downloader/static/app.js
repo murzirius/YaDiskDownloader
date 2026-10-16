@@ -47,7 +47,7 @@ function initializePanel(){
   $('retries').closest('label').firstChild.textContent='Попытки всего';
   $('retries').min=1;
   $('retries').max=9;
-  $('timeout').closest('label').firstChild.textContent='Лимит попытки, с';
+  $('timeout').closest('label').firstChild.textContent='Без данных, с';
   if($('download-zip').tagName==='A'){
     const button=node('button','Открыть папку с ZIP','download');
     button.id='download-zip';
@@ -117,7 +117,7 @@ function filename(item){const button=node('button',item.name,'name-button');butt
 function renderFiles(){state.thumbVersion++;state.thumbnailObserver?.disconnect();for(const controller of state.thumbnailControllers||[])controller.abort();state.thumbnailControllers=new Set();for(const url of state.urls)URL.revokeObjectURL(url);state.urls=[];const holder=$('file-list');holder.replaceChildren();const items=visibleItems();if(!items.length){holder.append(node('div',state.items.length?'По фильтру ничего не найдено':'Папка пуста','empty'));updateSelection();return;}if(state.view==='table'){const table=node('table',undefined,'files-table');const thead=node('thead');const header=node('tr');for(const text of ['','Имя','Размер','Изменён'])header.append(node('th',text));thead.append(header);table.append(thead);const body=node('tbody');for(const item of items){const row=node('tr');row.classList.toggle('selected',selected.has(item.path));const checkCell=node('td');checkCell.append(checkbox(item));const nameCell=node('td');const wrapper=node('div',undefined,'file-name');wrapper.append(icon(item),filename(item),excludeButton(item));nameCell.append(wrapper);row.append(checkCell,nameCell,node('td',item.type==='dir'?'—':bytes(item.size),'muted'),node('td',item.modified?new Date(item.modified).toLocaleDateString('ru-RU'):'—','muted'));body.append(row);}table.append(body);holder.append(table);}else{const grid=node('div',undefined,'files-grid');for(const item of items){const tile=node('div',undefined,'file-tile');tile.classList.toggle('selected',selected.has(item.path));const top=node('div',undefined,'tile-top');top.append(checkbox(item),node('span',item.type==='dir'?'Папка':bytes(item.size),'muted'),excludeButton(item));tile.append(top,icon(item),filename(item));grid.append(tile);}holder.append(grid);}updateSelection();loadThumbnails();}
 function loadThumbnails(){const version=state.thumbVersion;const queue=[];let running=0;const observer=new IntersectionObserver(entries=>{for(const entry of entries){if(entry.isIntersecting){observer.unobserve(entry.target);queue.push(entry.target);}}pump();},{root:$('file-list'),rootMargin:'100px'});state.thumbnailObserver=observer;for(const el of $('file-list').querySelectorAll('[data-preview-path]'))observer.observe(el);async function pump(){if(version!==state.thumbVersion){observer.disconnect();return;}while(running<2&&queue.length){const el=queue.shift();running++;const controller=new AbortController();state.thumbnailControllers.add(controller);(async()=>{try{const response=await fetch('/api/thumbnail?'+new URLSearchParams({path:el.dataset.previewPath,size:state.view==='grid'?'M':'S'}),{headers:{'X-CSRF-Token':csrf},credentials:'same-origin',cache:'no-store',signal:controller.signal});if(!response.ok)return;const blob=await response.blob();if(version!==state.thumbVersion||!state.connected)return;const url=URL.createObjectURL(blob);state.urls.push(url);const img=node('img');img.src=url;img.alt='';el.replaceChildren(img);}catch{}finally{state.thumbnailControllers.delete(controller);running--;pump();}})();}}}
 function advancedSettings(){return {create_zip:$('create-zip').checked,adaptive_workers:false,resume_parts:$('resume-parts').checked,auto_pause:$('auto-pause').checked,max_disk_percent:Number($('max-disk-percent').value),speed_limit_mib:Number($('speed-limit').value),exclusions:$('exclusions').value.split(/\r?\n/).map(value=>value.trim()).filter(Boolean)};}
-function settings(){return {operation:$('operation').value,paths:[...selected],whole_disk:$('whole-disk').checked,destination:$('destination').value,mode:$('mode').value,file_types:$('file-types')?[...document.querySelectorAll('input[name=file-type]:checked')].map(el=>el.value):['photos','videos','music','files'],preview_size:$('preview-size').value,workers:Number($('workers').value),attempts:Number($('retries').value),timeout:Number($('timeout').value),reports:[...document.querySelectorAll('input[name=report]:checked')].map(el=>el.value),...advancedSettings()};}
+function settings(){return {operation:$('operation').value,paths:[...selected],whole_disk:$('whole-disk').checked,destination:$('destination').value,mode:$('mode').value,file_types:$('file-types')?[...document.querySelectorAll('input[name=file-type]:checked')].map(el=>el.value):['photos','videos','music','files'],preview_size:$('preview-size').value,workers:Number($('workers').value),attempts:Number($('retries').value),timeout:Number($('timeout').value),total_timeout:Number($('total-timeout').value),reports:[...document.querySelectorAll('input[name=report]:checked')].map(el=>el.value),...advancedSettings()};}
 async function refreshJobs(){const result=await api('/api/status');renderRunning(result.active_job);connection(result.connected);const history=$('job-history');history.replaceChildren();if(!result.jobs.length){history.append(new Option('Нет заданий',''));$('job-content').hidden=true;return;}for(const job of result.jobs)history.append(new Option(`${job.id.slice(0,8)} · ${phases[job.phase]||job.phase}`,job.id));if(!state.job||!result.jobs.some(job=>job.id===state.job))state.job=result.jobs[0].id;history.value=state.job;showPanel('job');await pollJob();}
 function counter(holder,label,value,wide=false){const div=node('div',undefined,wide?'storage-counter':undefined);div.append(node('span',label),node('strong',String(value)));holder.append(div);}
 function renderJobCounters(job){
@@ -130,16 +130,16 @@ function renderJobCounters(job){
     ['Скорость',bytes(job.speed)+'/с'],
     ['На устройстве',bytes(job.folder_bytes??job.local_bytes)+(job.folder_bytes_scanning?' · уточняется':''),true],
     ['Свободно на диске',bytes(job.free_bytes),true],
-    ['Оригиналы',job.originals],
-    ['Превью',job.previews],
-    ['Замены оригинала',job.replacements],
+    ['Полные оригиналы',job.completeness.originals],
+    ['Только превью',job.completeness.preview_only],
+    ['Без результата',job.completeness.no_result],
     ['Ошибки',job.errors+job.scan_errors]
   ])counter(main,label,value,wide);
   if(job.previous_results)counter(main,'Уже есть результат',job.previous_results,true);
   if(['downloading','packing','paused','completed','completed_with_errors'].includes(job.phase))counter(main,job.eta_phase==='packing'?'До конца ZIP':'До конца загрузки',job.phase==='paused'?'Пауза':job.eta_seconds==null?(job.eta_message||'Уточняется…'):remainingTime(job.eta_seconds),true);
   for(const [label,value] of [
     ['Потоки',`${job.workers_status.current} / ${job.workers_status.maximum}`],['Недокачанные части',bytes(job.partial_bytes)],
-    ['Папки',job.folders],['Уже имеются',job.existing],['Исключены по типу',job.counts.filtered||0],
+    ['Превью всего',job.previews],['Замены оригинала',job.replacements],['Папки',job.folders],['Уже имеются',job.existing],['Исключены по типу',job.counts.filtered||0],
     ['Нет превью',job.missing_previews],['Отменено',job.cancelled],
     ['Передано',bytes(job.downloaded)],['Сохранено',bytes(job.saved_bytes)]
   ])counter(extra,label,value);
@@ -179,6 +179,7 @@ async function pollJob(){
       $('workers').value=job.settings.workers;
       $('retries').value=job.settings.attempts??job.settings.retries+1;
       $('timeout').value=job.settings.timeout;
+      $('total-timeout').value=job.settings.total_timeout??job.settings.timeout;
       for(const [id,key] of [['create-zip','create_zip'],['resume-parts','resume_parts'],['auto-pause','auto_pause']])$(id).checked=job.settings[key]!==false;
       $('max-disk-percent').value=job.settings.max_disk_percent??95;
       $('speed-limit').value=job.settings.speed_limit_mib??0;
@@ -239,7 +240,8 @@ async function pollJob(){
     $('pack-job').textContent=job.zip_path?'Пересобрать ZIP':'Собрать ZIP';
     if(typeof renderDismissibleNetwork==='function')renderDismissibleNetwork(job);
     else{$('network-warning').hidden=!job.network_waiting;$('network-warning').textContent=job.network_warning||'';}
-    const resultMessage=job.pause_reason||job.error||(job.phase==='completed_with_errors'?'Результат неполный.':job.phase==='stopped'?'Остановлено. Незавершённых файлов: '+job.cancelled+'.':'');
+    const completenessMessage=['completed','completed_with_errors'].includes(job.phase)?(job.scan_errors?'Обход завершился с ошибками: часть папок могла остаться непроверенной. ':!job.completeness.no_result&&!job.completeness.preview_only?'Все выбранные файлы сохранены в оригинале. ':'')+(job.completeness.preview_only?'Только превью: '+job.completeness.preview_only+'. Это уменьшенные копии. ':'')+(job.completeness.no_result?'Без результата: '+job.completeness.no_result+'. ':''):'';
+    const resultMessage=job.pause_reason||job.error||completenessMessage||(job.phase==='completed_with_errors'?'Результат неполный.':job.phase==='stopped'?'Остановлено. Незавершённых файлов: '+job.cancelled+'.':'');
     if(typeof renderDismissibleResult==='function')renderDismissibleResult(job,resultMessage);else $('result-info').textContent=resultMessage;
     if(job.zip_path){
       $('download-zip').hidden=false;
@@ -261,7 +263,7 @@ async function pollJob(){
   }
 }
 async function loadErrors(){if(!state.job)return;const jobId=state.job,offset=state.errorOffset;const result=await api(`/api/jobs/${jobId}/errors?offset=${offset}`);if(jobId!==state.job||offset!==state.errorOffset)return;const holder=$('errors-list');holder.replaceChildren();if(!result.items.length)holder.append(node('p','Нет записей на этой странице','muted'));for(const item of result.items){const div=node('div',undefined,'error-item'),label=node('label',undefined,'error-selection'),check=node('input');check.type='checkbox';check.checked=errorSelections.has(item.path);check.disabled=item.status==='scan_error';check.setAttribute('aria-label','Выбрать '+item.path);check.onchange=()=>{if(check.checked)errorSelections.add(item.path);else errorSelections.delete(item.path);$('retry-selected').hidden=!errorSelections.size;$('retry-selected').textContent='Повторить выбранные ('+errorSelections.size+')';};label.append(check,node('strong',item.path));div.append(label,node('p',item.error),node('span',`Оригинал: ${outcomes[item.original_status]||item.original_status}. Превью: ${outcomes[item.preview_status]||item.preview_status}.${item.fallback?' Переход к превью после неудачи оригинала.':''}`));if(item.status!=='scan_error'){const retry=node('button','Повторить этот файл');retry.disabled=state.jobStatus?.live||!state.connected;retry.onclick=()=>safely(()=>retrySelected([item.path]));div.append(retry);}holder.append(div);}$('errors-prev').disabled=state.errorOffset===0;$('errors-next').disabled=!result.has_more;}
-function runtimeLimits(){const previous=state.jobStatus?.settings;if(!state.limitsTouched&&state.limitsJob!==state.job&&previous)return Object.fromEntries(['workers','attempts','timeout','create_zip','adaptive_workers','resume_parts','auto_pause','max_disk_percent','speed_limit_mib'].filter(key=>previous[key]!==undefined).map(key=>[key,previous[key]]));return {workers:Number($('workers').value),attempts:Number($('retries').value),timeout:Number($('timeout').value),...advancedSettings()};}
+function runtimeLimits(){const previous=state.jobStatus?.settings;if(!state.limitsTouched&&state.limitsJob!==state.job&&previous)return Object.fromEntries(['workers','attempts','timeout','total_timeout','create_zip','adaptive_workers','resume_parts','auto_pause','max_disk_percent','speed_limit_mib'].filter(key=>previous[key]!==undefined).map(key=>[key,previous[key]]));return {workers:Number($('workers').value),attempts:Number($('retries').value),timeout:Number($('timeout').value),total_timeout:Number($('total-timeout').value),...advancedSettings()};}
 async function action(verb){
   if(state.actionPending||!state.job)return;
   state.actionPending=true;
@@ -315,7 +317,7 @@ $('choose-folder').onclick=()=>safely(async()=>{$('choose-folder').disabled=true
 $('estimate').onclick=()=>safely(async()=>{$('estimate').disabled=true;try{const result=await api('/api/jobs',settings());state.job=result.id;state.restoreLimits=true;state.limitsTouched=false;state.errorOffset=0;errorSelections.clear();await refreshJobs();}finally{$('estimate').disabled=!state.connected||!!state.activeJob;}});
 $('refresh-jobs').onclick=()=>safely(refreshJobs);
 $('job-history').onchange=()=>{state.job=$('job-history').value;state.restoreLimits=true;state.limitsTouched=false;state.errorOffset=0;errorSelections.clear();safely(pollJob);};
-for(const id of ['workers','retries','timeout'])$(id).oninput=()=>{state.limitsTouched=true;};
+for(const id of ['workers','retries','timeout','total-timeout'])$(id).oninput=()=>{state.limitsTouched=true;};
 for(const [id,verb] of [['start-job','start'],['pause-job','pause'],['resume-job','resume'],['stop-job','stop'],['retry-job','retry'],['pack-job','pack']])$(id).onclick=()=>safely(()=>action(verb));
 $('errors-detail').ontoggle=()=>{if($('errors-detail').open)safely(loadErrors);};
 $('errors-prev').onclick=()=>{state.errorOffset=Math.max(0,state.errorOffset-100);safely(loadErrors);};

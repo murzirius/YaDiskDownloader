@@ -3,6 +3,8 @@ import socket
 import time
 import math
 import re
+import io
+import http.client
 from contextlib import nullcontext, contextmanager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -42,14 +44,16 @@ def attempt_count(settings):
 
 
 class Deadline:
-    def __init__(self, seconds, checkpoint=lambda: None, clock=time.monotonic, cancelled=lambda: False):
+    def __init__(self, seconds, checkpoint=lambda: None, clock=time.monotonic, cancelled=lambda: False, idle_seconds=None):
         self.seconds = seconds
+        self.idle_seconds = idle_seconds
         self.checkpoint = checkpoint
         self.clock = clock
         self.cancelled = cancelled
         self.network = getattr(getattr(checkpoint, "__self__", None), "network", None)
         self.network_aborted = threading.Event()
         self.started = clock()
+        self.last_data = 0
         self.held = 0
         self.hold_started = None
         self.finished = threading.Event()
@@ -72,9 +76,27 @@ class Deadline:
         self.abort()
         self.thread.join(0.2)
 
-    def remaining(self):
+    def elapsed(self):
         current = self.clock()
-        return max(0, self.seconds - ((self.hold_started if self.hold_started is not None else current) - self.started - self.held))
+        return (self.hold_started if self.hold_started is not None else current) - self.started - self.held
+
+    def remaining(self):
+        elapsed = self.elapsed()
+        total = max(0, self.seconds - elapsed) if self.seconds else float('inf')
+        idle = max(0, self.idle_seconds - (elapsed - self.last_data)) if self.idle_seconds else float('inf')
+        return min(total, idle)
+
+    def touch(self):
+        self.last_data = self.elapsed()
+
+    def received(self):
+        """The body is complete; local verification isn't a network stall."""
+        self.idle_seconds = None
+
+    def timeout_message(self):
+        if self.idle_seconds and self.elapsed() - self.last_data >= self.idle_seconds:
+            return f'Нет новых данных {self.idle_seconds} с'
+        return f'Превышен лимит попытки: {self.seconds} с'
 
     @contextmanager
     def hold(self):
@@ -91,7 +113,7 @@ class Deadline:
             raise NetworkError(offline=True)
         if self.expired.is_set() or self.remaining() <= 0:
             self.expired.set()
-            raise NetworkError(f"Превышен лимит попытки: {self.seconds} с")
+            raise NetworkError(self.timeout_message())
 
     def attach(self, connection=None, response=None):
         with self.lock:
@@ -141,15 +163,48 @@ class DeadlineAdapter(HTTPAdapter):
         super().init_poolmanager(connections, maxsize, block, **kwargs)
         deadline = self.deadline
 
+        class ProgressRaw(io.RawIOBase):
+            def __init__(self, raw):
+                self.raw = raw
+
+            def readable(self):
+                return True
+
+            def readinto(self, buffer):
+                count = self.raw.readinto(buffer)
+                if count:
+                    deadline.touch()
+                return count
+
+            def fileno(self):
+                return self.raw.fileno()
+
+            @property
+            def _sock(self):
+                return self.raw._sock
+
+            def close(self):
+                try:
+                    self.raw.close()
+                finally:
+                    super().close()
+
+        class ProgressResponse(http.client.HTTPResponse):
+            def __init__(self, *args, **options):
+                super().__init__(*args, **options)
+                self.fp = io.BufferedReader(ProgressRaw(self.fp.detach()))
+
         class TimedHTTPPool(HTTPConnectionPool):
             def _new_conn(self):
                 conn = super()._new_conn()
+                conn.response_class = ProgressResponse
                 deadline.attach(connection=conn)
                 return conn
 
         class TimedHTTPSPool(HTTPSConnectionPool):
             def _new_conn(self):
                 conn = super()._new_conn()
+                conn.response_class = ProgressResponse
                 deadline.attach(connection=conn)
                 return conn
 
@@ -301,7 +356,7 @@ class DiskAPI:
                 if deadline.network_aborted.is_set():
                     raise NetworkError(offline=True) from None
                 if deadline.expired.is_set():
-                    raise NetworkError(f"Превышен лимит попытки: {timeout} с") from None
+                    raise NetworkError(deadline.timeout_message()) from None
                 deadline.check()
             raise NetworkError() from None
         except BaseException:
@@ -354,7 +409,7 @@ class DiskAPI:
             try:
                 if delay:
                     self.wait(delay, check)
-                with nullcontext(owner) if owner else Deadline(timeout, checkpoint, getattr(control, "active_clock", time.monotonic), lambda: getattr(control, "stopped", False) or not self.credentials.connected) as budget:
+                with nullcontext(owner) if owner else Deadline(settings.get('total_timeout', timeout), checkpoint, getattr(control, "active_clock", time.monotonic), lambda: getattr(control, "stopped", False) or not self.credentials.connected, idle_seconds=timeout if 'total_timeout' in settings else None) as budget:
                     check.deadline = budget
                     response, session = self._open(BASE + endpoint, params, True, timeout, check, epoch)
                     if response.status_code == 401:
@@ -375,7 +430,7 @@ class DiskAPI:
                         raise APIError("Некорректный ответ API")
                     return result
             except (requests.RequestException, AttributeError, OSError):
-                error = NetworkError(offline=True) if budget and budget.network_aborted.is_set() else NetworkError(f"Превышен лимит попытки: {timeout} с" if budget and budget.expired.is_set() else "Сетевая ошибка или таймаут")
+                error = NetworkError(offline=True) if budget and budget.network_aborted.is_set() else NetworkError(budget.timeout_message() if budget and budget.expired.is_set() else "Сетевая ошибка или таймаут")
             except (ValueError, UnicodeError):
                 error = NetworkError(offline=True) if budget and budget.network_aborted.is_set() else APIError("Некорректный JSON API")
             except APIError as exc:

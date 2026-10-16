@@ -1,0 +1,47 @@
+name: Long durability and load test
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: 'Real run time in minutes (1–240; at least one complete cycle)'
+        default: '60'
+        required: true
+      files:
+        description: 'Files per cycle (10–100000)'
+        default: '20000'
+        required: true
+permissions:
+  contents: read
+jobs:
+  soak:
+    runs-on: windows-latest
+    timeout-minutes: 350
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
+      SOAK_MINUTES: ${{ inputs.minutes }}
+      SOAK_FILES: ${{ inputs.files }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - run: python tools/prepare_sqlite_windows.py
+      - run: python -m pip install -r requirements-bootstrap.txt -r requirements-dev.txt
+      - name: Check input bounds
+        run: python -c "import os; assert 1 <= float(os.environ['SOAK_MINUTES']) <= 240; assert 10 <= int(os.environ['SOAK_FILES']) <= 100000"
+      - name: Repeated inventory, transfer, offline, hard kill and byte verification
+        shell: pwsh
+        run: python tools/soak.py --minutes $env:SOAK_MINUTES --files $env:SOAK_FILES --max-seconds 19800 --output soak-output
+      - name: Retain measurements and worker logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: soak-results
+          path: |
+            soak-output/result.json
+            soak-output/**/progress.json
+            soak-output/**/worker-result.json
+            soak-output/**/*.log
+          if-no-files-found: ignore
+          retention-days: 14

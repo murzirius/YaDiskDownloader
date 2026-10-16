@@ -64,6 +64,10 @@ class Tray:
         if os.name=='nt':
             owner=self
             class ClickableIcon(pystray.Icon):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self._message_handlers[0x0010] = lambda w, l: owner.exit()  # WM_CLOSE
+
                 def _on_notify(self,wparam,lparam):
                     if lparam==0x405:  # NIN_BALLOONUSERCLICK (WM_USER + 5)
                         webbrowser.open(owner.url)

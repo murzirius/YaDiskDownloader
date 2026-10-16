@@ -5,6 +5,8 @@ import platform
 import re
 import secrets
 import sys
+import sqlite3
+from .sqlite_support import safe_wal
 import zipfile
 from datetime import datetime, timezone
 
@@ -12,12 +14,12 @@ from . import __version__
 from .paths import publish, reserve_output, safe_join, temporary_file
 
 
-SETTINGS = ("mode", "preview_size", "file_types", "workers", "attempts", "timeout", "reports", "create_zip", "auto_pause", "max_disk_percent", "adaptive_workers", "resume_parts", "operation", "speed_limit_mib")
+SETTINGS = ("mode", "preview_size", "file_types", "workers", "attempts", "timeout", "total_timeout", "reports", "create_zip", "auto_pause", "max_disk_percent", "adaptive_workers", "resume_parts", "operation", "speed_limit_mib")
 
 
 def error_kind(value):
     value = value.lower()
-    for text, name in (("лимит попытки", "attempt_timeout"), ("таймаут", "network_timeout"), ("сетевая", "network"), ("места", "disk_space"), ("sha-256", "checksum"), ("sha256", "checksum"), ("md5", "checksum"), ("неполный", "incomplete_response"), ("размер", "size_mismatch"), ("недопустим", "validation"), ("токен", "authorization"), ("не подключ", "authorization"), ("недоступ", "unavailable")):
+    for text, name in (("нет новых данных", "idle_timeout"), ("лимит попытки", "attempt_timeout"), ("таймаут", "network_timeout"), ("сетевая", "network"), ("места", "disk_space"), ("sha-256", "checksum"), ("sha256", "checksum"), ("md5", "checksum"), ("неполный", "incomplete_response"), ("размер", "size_mismatch"), ("недопустим", "validation"), ("токен", "authorization"), ("не подключ", "authorization"), ("недоступ", "unavailable")):
         if text in value:
             return name
     return "other" if value else "none"
@@ -31,7 +33,7 @@ def bundle(engine, job_id):
     summary = {key: status.get(key) for key in ("phase", "files", "folders", "processed", "originals", "previews", "errors", "scan_errors", "cancelled", "replacements", "missing_previews", "saved_bytes", "downloaded", "zip_bytes", "partial_bytes", "free_bytes", "workers_status")}
     summary["error_type"] = error_kind(status["error"])
     settings = {key: status["settings"][key] for key in SETTINGS if key in status["settings"]}
-    environment = {"app_version": __version__, "python": sys.version.split()[0], "system": platform.system(), "system_release": platform.release(), "architecture": platform.machine(), "created": datetime.now(timezone.utc).isoformat()}
+    environment = {"app_version": __version__, "sqlite": sqlite3.sqlite_version, "safe_sqlite_wal": safe_wal(), "python": sys.version.split()[0], "system": platform.system(), "system_release": platform.release(), "architecture": platform.machine(), "created": datetime.now(timezone.utc).isoformat()}
     entries = []
     for row in engine.store.rows("SELECT path,status,error,original_status,preview_status,original_attempts,preview_attempts FROM entries WHERE job=? AND kind='file' AND (error!='' OR status IN ('error','cancelled','no_preview')) LIMIT 1000", (job_id,)):
         row["source_id"] = source_id(row.pop("path"))

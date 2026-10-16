@@ -50,6 +50,9 @@ def test_abrupt_process_termination_preserves_confirmed_results(tmp_path,phase):
         # and FULL SQLite commits. Allow for slower hosted Windows disks while
         # keeping a finite deadline and the same recovery/data assertions.
         result=wait_job(engine,job_id,timeout=180 if phase=='scan' else 90)
+        if result['phase'] != 'completed':
+            print('RECOVERY_DIAGNOSTICS='+json.dumps({'phase':result['phase'], 'counts':result['counts'],
+                'error':result['error'], 'files':list(store.rows("SELECT path,status,error,original_status,preview_status FROM entries WHERE job=? AND kind='file' AND (error!='' OR status IN ('error','no_preview')) LIMIT 10",(job_id,)))},ensure_ascii=True))
         assert result['phase']=='completed',result
         if phase=='scan':
             assert result['files']==451 and result['originals']==451

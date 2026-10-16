@@ -36,7 +36,7 @@ def records(store, job_id):
 def context(store, job_id):
     job = store.summary(job_id)
     keys = ("id", "settings", "root", "started", "ended", "phase", "scan_complete", "files", "folders", "processed", "percent", "originals", "previews", "replacements", "existing", "missing_previews", "errors", "scan_errors", "cancelled", "downloaded", "saved_bytes", "error")
-    return {k: job[k] for k in keys}
+    return {k: job[k] for k in (*keys, 'completeness')}
 
 
 def excel_cell(value):

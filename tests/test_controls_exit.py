@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import socket
 import subprocess
@@ -105,7 +106,8 @@ def test_real_process_exits_and_releases_port_and_state(tmp_path, mode):
     with socket.socket() as probe:
         probe.bind(('127.0.0.1', 0))
         port = probe.getsockname()[1]
-    process = subprocess.Popen([sys.executable, str(Path(__file__).with_name('shutdown_worker.py')), str(tmp_path), mode, str(port)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    env = dict(os.environ, PYTHONIOENCODING='cp1252', PYTHONUTF8='0')
+    process = subprocess.Popen([sys.executable, str(Path(__file__).with_name('shutdown_worker.py')), str(tmp_path), mode, str(port)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     session = requests.Session()
     session.trust_env = False
     base = f'http://127.0.0.1:{port}'

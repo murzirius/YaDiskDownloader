@@ -19,7 +19,11 @@ from disk_downloader.lifecycle import Shutdown
 
 def message(text):
     if sys.stdout:
-        print(text, flush=True)
+        try:
+            print(text, flush=True)
+        except UnicodeEncodeError:
+            encoding = getattr(sys.stdout, 'encoding', None) or 'ascii'
+            print(text.encode(encoding, errors='backslashreplace').decode(encoding), flush=True)
     elif os.name == "nt":
         import ctypes
         ctypes.windll.user32.MessageBoxW(None, text, "YaDiskDownloader", 0x40)
@@ -86,7 +90,7 @@ def main():
     server = create_server(app, sockets=[listener], threads=12, clear_untrusted_proxy_headers=True)
     url = f"http://127.0.0.1:{args.port}"
     if sys.stdout:
-        print(f"Приложение доступно: {url}", flush=True)
+        message(f"Приложение доступно: {url}")
     shutdown = Shutdown(app, server, state_lock)
     app.extensions["quit_app"] = shutdown
     app.extensions['management'].start()
