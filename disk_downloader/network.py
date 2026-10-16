@@ -46,6 +46,18 @@ class NetworkWait:
             deadline.network_aborted.set()
             deadline.abort()
 
+    def pause_requests(self):
+        with self.requests_lock:
+            active = tuple(self.requests)
+        for deadline in active:
+            # A local checksum / fake response has no socket to interrupt and
+            # can continue at its checkpoint after the pause without a retry.
+            with deadline.lock:
+                has_socket = bool(deadline.connections or deadline.sockets)
+            if has_socket:
+                deadline.pause_aborted.set()
+                deadline.abort()
+
     @staticmethod
     def reachable():
         from .api import APIError, Deadline, DeadlineAdapter

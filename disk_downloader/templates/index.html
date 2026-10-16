@@ -18,8 +18,8 @@
   <div class="brand"><strong>Диск</strong><span>Локальное скачивание</span></div>
   <span class="connection" id="connection">Не подключён</span>
   <form id="auth-form" class="auth">
-    <label class="sr-only" for="token">OAuth-токен</label>
-    <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="OAuth-токен · только в памяти" required>
+    <label class="sr-only" for="token">Ключ доступа Яндекс.Диска</label>
+    <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="Вставьте ключ доступа Яндекс.Диска" aria-describedby="auth-hint" required>
     <button id="connect" type="submit">Подключить</button>
   </form>
   <button id="disconnect" hidden>Отключить</button>
@@ -28,6 +28,8 @@
   <button id="quit-app" class="quiet" title="Остановить работу и закрыть приложение, включая значок в трее">Выход</button>
 </header>
 <div id="notice" class="notice" role="status" hidden></div>
+<div id="service-warning" class="service-warning" role="alert" hidden><span id="service-warning-text"></span><button id="recheck-service">Проверить связь</button><button id="reload-page">Обновить страницу</button></div>
+<p id="auth-hint" class="auth-hint">Ключ хранится только в памяти программы. Обновление страницы его не удаляет; после выхода из программы ключ нужно ввести снова. <button id="key-help" class="quiet">Где взять ключ?</button></p>
 <main>
   <section class="browser-panel" aria-label="Файлы Диска">
     <div class="navigation">
@@ -43,7 +45,7 @@
       <label class="thumb-control">Миниатюры <input id="thumb-size" type="range" min="64" max="180" value="104"></label>
     </div>
     <div class="selection-bar"><label><input id="select-page" type="checkbox"> Эта страница</label><span id="selection-count">Выбрано: 0</span><button id="clear-selection" class="quiet">Снять выбор</button></div>
-    <div id="file-list" class="file-list"><div class="empty"><strong>Диск не подключён</strong><span>Введите OAuth-токен с правом чтения Диска.</span><span>После перезапуска токен нужно ввести снова.</span></div></div>
+    <div id="file-list" class="file-list"><div class="empty"><strong>Диск не подключён</strong><span>Вставьте ключ доступа вверху страницы и нажмите «Подключить».</span><span>После перезапуска токен нужно ввести снова.</span></div></div>
     <div class="pagination"><span id="page-info">Список папки</span><button id="prev-page" disabled>Предыдущая</button><button id="next-page" disabled>Следующая</button></div>
     <details class="selected-detail"><summary>Выбранные исходные пути</summary><div id="selected-paths">Выбор пуст</div></details>
   </section>
@@ -53,9 +55,11 @@
     <section id="settings-panel" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab">
       <h1>Скачивание</h1>
       <label class="field">Как загрузить<select id="operation"><option value="new">Новая загрузка</option><option value="missing">Дозагрузить недостающее</option></select></label>
+      <p id="operation-hint" class="hint">Выберите файлы или весь Диск, затем папку на ПК. Сначала покажем список и примерный объём — скачивание начнётся по вашей команде.</p>
+      <div id="missing-policy-field" hidden><label class="field">Если уже есть превью<select id="missing-policy"><option value="originals">Попробовать скачать оригинал</option><option value="any_result">Превью достаточно — пропустить файл</option></select></label><p class="hint">Превью — уменьшенная копия фото или кадр видео. В любом варианте сначала скачиваем файлы, у которых нет никакой копии.</p></div>
       <label class="whole"><input id="whole-disk" type="checkbox"> Скачать весь Диск</label>
       <label class="field"><span id="destination-label">Сохранить в</span><div class="folder-input"><input id="destination" value="{{ default_destination }}" spellcheck="false"><button id="choose-folder" title="Выбрать папку" aria-label="Выбрать папку">…</button></div></label>
-      <label class="field">Режим<select id="mode"><option value="previews" selected>Только превью</option><option value="both">Оригиналы и превью</option><option value="fallback">Оригинал, превью при неудаче</option></select></label>
+      <label class="field" id="new-mode-field">Что сохранить<select id="mode"><option value="previews" selected>Уменьшенные копии (превью)</option><option value="both">Оригиналы и уменьшенные копии</option><option value="fallback">Оригиналы; при ошибке — превью</option></select></label><p id="mode-hint" class="hint">Превью фотографии меньше оригинала. Превью видео — картинка, а не само видео.</p>
       <fieldset id="file-types"><legend>Типы для скачивания</legend><div class="type-options"><label><input type="checkbox" name="file-type" value="photos" checked> Фото</label><label><input type="checkbox" name="file-type" value="videos" checked> Видео</label><label><input type="checkbox" name="file-type" value="music" checked> Музыка</label><label><input type="checkbox" name="file-type" value="files" checked> Другие файлы</label></div><p class="hint">Превью — для фото и видео. Музыка и другие файлы — оригиналы.</p></fieldset>
       <fieldset><legend>Отчёты</legend><label><input type="checkbox" name="report" value="csv" checked> CSV</label><label><input type="checkbox" name="report" value="json" checked> JSON</label><label><input type="checkbox" name="report" value="html"> HTML</label><label><input type="checkbox" name="report" value="txt"> TXT</label></fieldset>
       <details class="advanced-settings"><summary>Дополнительные настройки</summary>
@@ -77,9 +81,12 @@
       <select id="job-history" aria-label="История заданий"><option value="">Нет заданий</option></select>
       <div id="job-content" hidden>
         <div class="phase-line"><strong id="phase">—</strong><span id="percentage">—</span></div>
+        <div id="resume-options" class="resume-options" hidden><strong>Как продолжить загрузку</strong><label class="field">Файлы, у которых уже есть превью<select id="resume-policy"><option value="originals">Попробовать скачать оригиналы</option><option value="any_result">Считать скачанными и пропустить</option></select></label><p id="resume-options-hint" class="hint">Сначала проверим папку и обновим прогресс. Готовые оригиналы заново скачиваться не будут.</p></div>
         <progress id="progress" max="100" value="0" aria-label="Прогресс задания"></progress>
-        <div class="actions job-controls"><button id="start-job" class="primary">Начать скачивание</button><button id="pause-job" title="Приостановить работу без потери прогресса">Пауза</button><button id="resume-job">Продолжить</button><button id="stop-job" class="danger" title="Остановить текущее задание и сохранить прогресс">Остановить</button></div>
+        <div class="actions job-controls"><button id="start-job" class="primary">Начать скачивание</button><button id="pause-job" title="Приостановить работу без потери прогресса">Пауза</button><button id="resume-job" class="primary">Продолжить</button><button id="stop-job" class="danger" title="Остановить текущее задание и сохранить прогресс">Остановить</button></div>
         <p id="job-hint" class="hint" role="status" aria-live="polite"></p>
+        <button id="connect-for-job" class="primary wide" hidden>Подключить Диск, чтобы продолжить</button>
+        <button id="open-job-folder" class="quiet wide">Открыть папку с результатами</button>
         <div id="counters" class="counters"></div>
         <div id="active-files" class="active-files"></div>
         <div id="estimate-info" class="estimate-info"></div>

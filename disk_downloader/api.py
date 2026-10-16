@@ -26,6 +26,10 @@ class Suspended(Exception):
     pass
 
 
+class PausedRequest(Exception):
+    """Retry an interrupted request after a user pause, without spending an attempt."""
+
+
 class APIError(Exception):
     def __init__(self, message, status=None, retry_after=None):
         super().__init__(message)
@@ -52,6 +56,7 @@ class Deadline:
         self.cancelled = cancelled
         self.network = getattr(getattr(checkpoint, "__self__", None), "network", None)
         self.network_aborted = threading.Event()
+        self.pause_aborted = threading.Event()
         self.started = clock()
         self.last_data = 0
         self.held = 0
@@ -109,6 +114,8 @@ class Deadline:
 
     def check(self):
         self.checkpoint()
+        if self.pause_aborted.is_set():
+            raise PausedRequest()
         if self.network_aborted.is_set() or self.network and self.network.offline.is_set():
             raise NetworkError(offline=True)
         if self.expired.is_set() or self.remaining() <= 0:
@@ -145,6 +152,9 @@ class Deadline:
 
     def watch(self):
         while not self.finished.wait(0.025):
+            if self.pause_aborted.is_set():
+                self.abort()
+                continue
             if self.network_aborted.is_set() or self.network and self.network.offline.is_set():
                 self.network_aborted.set()
                 self.abort()
@@ -268,22 +278,34 @@ class Credentials:
         self.token = None
         self.epoch = 0
         self.responses = set()
+        self.reason = "not_connected"
 
-    def set(self, token):
+    def set(self, token, expected_epoch=None):
         if not isinstance(token, str) or not 10 <= len(token) <= 4096 or any(not 33 <= ord(c) <= 126 for c in token):
-            raise ValueError("Некорректный OAuth-токен")
-        self.clear()
+            raise ValueError("Ключ доступа не похож на токен Яндекса. Скопируйте весь токен, без пробелов и переноса строки. Нужен токен, а не ClientID и не Client_secret. Подсказка — кнопка «Где взять ключ?».")
         with self.lock:
+            if expected_epoch is not None and expected_epoch != self.epoch:
+                raise ValueError("Подключение изменилось в другой вкладке. Обновите состояние и при необходимости подключите ключ ещё раз.")
+            active = list(self.responses)
+            self.responses.clear()
+            self.epoch += 1
             self.token = token
+            self.reason = ""
+        for response in active:
+            response.close()
 
-    def clear(self):
+    def clear(self, expected_epoch=None, reason="disconnected"):
         with self.lock:
+            if expected_epoch is not None and expected_epoch != self.epoch:
+                return False
             self.token = None
+            self.reason = reason
             self.epoch += 1
             active = list(self.responses)
             self.responses.clear()
         for response in active:
             response.close()
+        return True
 
     def snapshot(self):
         with self.lock:
@@ -301,12 +323,25 @@ class Credentials:
         with self.lock:
             return bool(self.token)
 
+    def status(self):
+        with self.lock:
+            return {"connected": bool(self.token), "auth_revision": self.epoch, "auth_reason": self.reason}
+
 
 class DiskAPI:
     def __init__(self, credentials):
         self.credentials = credentials
         self.rate_lock = threading.Lock()
         self.rate_until = 0
+
+    def verify_token(self, token):
+        """Validate a candidate without revoking the current working connection."""
+        candidate = Credentials()
+        candidate.set(token)
+        try:
+            DiskAPI(candidate).metadata("disk:/", {"attempts": 1, "timeout": 15, "total_timeout": 20}, limit=1)
+        finally:
+            candidate.clear()
 
     def wait(self, delay, checkpoint):
         until = time.monotonic() + delay
@@ -379,7 +414,13 @@ class DiskAPI:
         if status == 429 or 500 <= status <= 599:
             with self.rate_lock:
                 self.rate_until = max(self.rate_until, time.monotonic() + delay)
-        message = "Токен недействителен или истёк" if status == 401 else f"API вернул HTTP {status}"
+        messages = {
+            401: "Яндекс.Диск отклонил ключ доступа. Получите новый ключ с правом чтения Диска и подключитесь снова.",
+            403: "Яндекс.Диск запретил доступ (HTTP 403). Проверьте право чтения у ключа и доступ к этому файлу. Если другие файлы скачиваются, повторите этот файл позже.",
+            404: "Яндекс.Диск не нашёл файл или его превью (HTTP 404). Файл мог быть перемещён или удалён; превью бывает недоступно.",
+            429: "Яндекс.Диск временно ограничил число запросов (HTTP 429). Программа выдержит паузу; при частых ограничениях уменьшите число одновременных загрузок.",
+        }
+        message = messages.get(status, f"Сервер Яндекс.Диска вернул ошибку HTTP {status}. Повторите позже; при массовых ошибках проверьте доступность Диска.")
         raise APIError(message, status, delay)
 
     def get(self, endpoint, params=None, settings=None, checkpoint=lambda: None):
@@ -413,8 +454,8 @@ class DiskAPI:
                     check.deadline = budget
                     response, session = self._open(BASE + endpoint, params, True, timeout, check, epoch)
                     if response.status_code == 401:
-                        self.credentials.clear()
-                        raise Suspended("Токен недействителен или истёк. Подключите Диск заново.")
+                        self.credentials.clear(expected_epoch=epoch, reason="expired")
+                        raise Suspended("Яндекс.Диск отклонил ключ доступа. Подключите Диск заново с действующим ключом и нажмите «Продолжить» у задания. Скачанные файлы сохранены.")
                     if response.status_code != 200:
                         self.fail_response(response, attempt)
                     data = bytearray()
@@ -429,6 +470,11 @@ class DiskAPI:
                     if not isinstance(result, dict):
                         raise APIError("Некорректный ответ API")
                     return result
+            except PausedRequest:
+                if owner:
+                    raise
+                delay = 0
+                continue
             except (requests.RequestException, AttributeError, OSError):
                 error = NetworkError(offline=True) if budget and budget.network_aborted.is_set() else NetworkError(budget.timeout_message() if budget and budget.expired.is_set() else "Сетевая ошибка или таймаут")
             except (ValueError, UnicodeError):
@@ -438,6 +484,12 @@ class DiskAPI:
             finally:
                 if response is not None:
                     self.close(response, session)
+            if getattr(budget, 'pause_aborted', None) and budget.pause_aborted.is_set():
+                if owner:
+                    raise PausedRequest()
+                checkpoint()
+                delay = 0
+                continue
             budget = None
             if network and not owner:
                 def connected_check():

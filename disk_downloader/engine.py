@@ -14,7 +14,7 @@ from pathlib import Path
 import requests
 from PIL import Image
 
-from .api import APIError, Deadline, NetworkError, PREVIEW_MAX_BYTES, SIZES, Suspended, attempt_count, retry_delay, validate_resource
+from .api import APIError, Deadline, NetworkError, PausedRequest, PREVIEW_MAX_BYTES, SIZES, Suspended, attempt_count, retry_delay, validate_resource
 from .import_state import find_import, inherit, save_import
 from .file_types import FILE_TYPES, file_type, preview_type, selected_type
 from .estimation import RemainingTime
@@ -47,6 +47,11 @@ def file_hash(filename, checkpoint=lambda: None):
 
 
 def safe_error(exc):
+    if isinstance(exc, NetworkError):
+        detail = str(exc)
+        if detail == "Сетевая ошибка или таймаут":
+            return "Не удалось получить данные от Яндекс.Диска: соединение оборвалось или сервер не ответил. Проверьте интернет. Если другие сайты работают, повторите позже — Диск может временно ограничивать загрузку."
+        return "Получение данных от Яндекс.Диска: " + detail + ". Можно повторить загрузку; сохранённые файлы не удаляются."
     if isinstance(exc, (APIError, PathError, Suspended)):
         return str(exc)
     if isinstance(exc, requests.RequestException):
@@ -55,7 +60,11 @@ def safe_error(exc):
         return 'Ошибка базы истории (' + getattr(exc, 'sqlite_errorname', 'SQLITE_ERROR') + ')'
     if isinstance(exc, OSError):
         if exc.errno == 28 or getattr(exc, "winerror", None) == 112:
-            return "Недостаточно места на диске"
+            return "Недостаточно места на диске ПК. Освободите место в папке загрузки и нажмите «Продолжить»."
+        if isinstance(exc, PermissionError):
+            return "Windows запретила запись или чтение файла. Закройте файл в других программах и проверьте доступ к папке загрузки. Затем повторите задание."
+        if isinstance(exc, FileNotFoundError):
+            return "Файл или папка на ПК не найдены. Проверьте, что диск подключён и папку загрузки не перенесли."
         return f"Ошибка файловой системы (код {exc.errno or getattr(exc, 'winerror', 0)})"
     return "Ошибка проверки или обработки файла"
 
@@ -103,6 +112,7 @@ class Control:
             if not self.paused:
                 self.paused = True
                 self.pause_started = time.monotonic()
+        self.network.pause_requests()
 
     def resume(self):
         with self.condition:
@@ -175,11 +185,16 @@ class Engine:
         for name, default, low, high in (("workers", 8, 1, MAX_WORKERS), ("attempts", attempt_count(data), 1, 9), ("timeout", 20, 5, 3600), ("total_timeout", 0, 0, 86400)):
             value = data.get(name, default)
             if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
-                raise ValueError(f"{name}: допустимый диапазон {low}–{high}")
+                label = {"workers": "Число одновременных загрузок", "attempts": "Попытки для каждого файла", "timeout": "Ожидание без новых данных (секунды)", "total_timeout": "Общий предел попытки (секунды)"}[name]
+                raise ValueError(f"{label}: укажите целое число от {low} до {high}.")
             values[name] = value
         operation = data.get("operation", "new")
         if operation not in ("new", "missing"):
             raise ValueError("Некорректный способ загрузки")
+        missing_policy = data.get("missing_policy", "originals")
+        if missing_policy not in ("originals", "any_result"):
+            raise ValueError("Выберите, что считать скачанным: только оригинал или оригинал и превью.")
+        values["missing_policy"] = missing_policy
         values["retries"] = values["attempts"] - 1
         for name, default in (("create_zip", True), ("auto_pause", True), ("resume_parts", True), ("adaptive_workers", False)):
             value = data.get(name, default)
@@ -199,7 +214,7 @@ class Engine:
 
     def ensure_idle(self):
         if self.maintenance_busy or any(thread.is_alive() for thread in self.threads.values()):
-            raise ValueError("Дождитесь завершения текущей операции или остановите её")
+            raise ValueError("Сейчас выполняется другая работа. Вернитесь к текущему заданию и нажмите «Остановить», затем дождитесь остановки. Скачанные файлы останутся; после этого можно подключить ключ или запустить другое задание.")
 
     def create(self, data):
         with self.lock:
@@ -278,17 +293,21 @@ class Engine:
             control.rate_limiter = rate_limit.RateLimiter(job["settings"].get("speed_limit_mib", 0), control.active_clock)
             control.space_check = lambda: self.check_space(job_id, control)
             control.selected_paths = tuple(paths) if paths else None
-            control.reuse_scanned = operation == "download" and not paths and job["settings"].get("operation") == "missing"
+            control.reuse_scanned = operation == "download" and not paths and (job["settings"].get("operation") == "missing" or job["phase"] in ("paused", "stopped", "interrupted", "failed") or job["generation"] > 0)
             self.controls[job_id] = control
             thread = threading.Thread(target=self.run, args=(job_id, operation, control), daemon=True)
             self.threads[job_id] = thread
             thread.start()
 
     def action(self, job_id, action, limits=None):
-        if action == 'stop':
+        if action in ('stop', 'pause'):
             control = self.controls.get(job_id)
-            if control:
-                control.stop()
+            thread = self.threads.get(job_id)
+            if control and thread and thread.is_alive():
+                if action == 'stop':
+                    control.stop()
+                elif not control.stopped:
+                    control.pause()
         with self.lock:
             job = self.store.job(job_id)
             scan_only = action == 'continue_scan'
@@ -305,7 +324,7 @@ class Engine:
             live = self.threads.get(job_id)
             control = self.controls.get(job_id)
             if action == "pause":
-                if not live or not live.is_alive() or job["phase"] not in ("scanning", "preparing", "downloading", "packing"):
+                if not live or not live.is_alive() or control.stopped:
                     raise ValueError("Нет активной операции для паузы")
                 control.pause()
                 control.pause_reason = ""
@@ -329,8 +348,10 @@ class Engine:
             if action == "resume" and live and live.is_alive() and control.paused:
                 if limits and any(limits.get(k, job["settings"].get(k, 0 if k == "speed_limit_mib" else None)) != job["settings"].get(k, attempt_count(job["settings"]) if k == "attempts" else 0 if k == "speed_limit_mib" else None) for k in ("workers", "attempts", "timeout", "total_timeout", "speed_limit_mib")):
                     raise ValueError("Для изменения ограничений остановите задание и продолжите с новыми параметрами")
-                if not self.api.credentials.connected and not job["scan_complete"]:
-                    raise ValueError("Подключите Диск")
+                if not self.api.credentials.connected and getattr(control, "phase", "downloading") != "packing":
+                    raise ValueError("Для продолжения загрузки подключите Яндекс.Диск: вставьте ключ доступа вверху страницы. Скачанные файлы сохранены.")
+                if limits and limits.get("missing_policy", job["settings"].get("missing_policy", "originals")) != job["settings"].get("missing_policy", "originals"):
+                    raise ValueError("Чтобы изменить учёт превью, нажмите «Остановить», дождитесь остановки и затем «Продолжить».")
                 if limits:
                     keys = ("create_zip", "auto_pause", "max_disk_percent", "adaptive_workers", "resume_parts", "speed_limit_mib")
                     validated = self.validate_settings(job["settings"] | {key: limits[key] for key in keys if key in limits})
@@ -357,7 +378,7 @@ class Engine:
                     if found != len(paths):
                         raise ValueError("Выбранный файл не принадлежит заданию")
                 if limits:
-                    keys = ("workers", "attempts", "timeout", "total_timeout", "create_zip", "auto_pause", "max_disk_percent", "adaptive_workers", "resume_parts", "speed_limit_mib")
+                    keys = ("workers", "attempts", "timeout", "total_timeout", "create_zip", "auto_pause", "max_disk_percent", "adaptive_workers", "resume_parts", "speed_limit_mib", "missing_policy")
                     validated = self.validate_settings({**job["settings"], **{k: limits[k] for k in keys if k in limits}})
                     job["settings"].update({k: validated[k] for k in (*keys, "retries")})
                     self.store.update_job(job_id, settings=json.dumps(job["settings"], ensure_ascii=False))
@@ -373,14 +394,14 @@ class Engine:
                             raise ValueError("Выбранный файл не принадлежит заданию")
                         db.execute("UPDATE entries SET status='pending',error='' WHERE job=? AND kind='file' AND path IN (" + placeholders + ")", (job_id, *paths))
                     elif action == "retry":
-                        db.execute("UPDATE entries SET status='pending', error='' WHERE job=? AND kind='file' AND (status IN ('error','partial','no_preview','cancelled') OR fallback=1)", (job_id,))
+                        db.execute("UPDATE entries SET status='pending', error='' WHERE job=? AND kind='file' AND (status IN ('error','partial','no_preview','cancelled') OR fallback=1 OR (?='originals' AND EXISTS(SELECT 1 FROM artifacts a WHERE a.job=entries.job AND a.path=entries.path AND a.type='preview') AND NOT EXISTS(SELECT 1 FROM artifacts a WHERE a.job=entries.job AND a.path=entries.path AND a.type='original')))", (job_id, job["settings"].get("missing_policy", "originals")))
                         db.execute("UPDATE entries SET scanned=0 WHERE job=? AND kind='dir' AND path IN (SELECT path FROM scan_errors WHERE job=?)", (job_id, job_id))
                         has_scan_errors = db.execute("SELECT COUNT(*) FROM scan_errors WHERE job=?", (job_id,)).fetchone()[0]
                         if has_scan_errors:
                             db.execute("UPDATE jobs SET scan_complete=0 WHERE id=?", (job_id,))
                     else:
                         if job["phase"] == "ready" and job["settings"].get("operation") == "missing":
-                            db.execute("UPDATE entries SET status='pending' WHERE job=? AND kind='file' AND NOT (status='existing' AND original_status='existing_verified')", (job_id,))
+                            db.execute("UPDATE entries SET status='pending' WHERE job=? AND kind='file' AND NOT (status='existing' AND (original_status='existing_verified' OR (?='any_result' AND preview_status='existing_verified')))", (job_id, job["settings"].get("missing_policy", "originals")))
                         else:
                             db.execute("UPDATE entries SET status='pending' WHERE job=? AND kind='file'", (job_id,))
                 self.launch(job_id, "scan" if scan_only else "download", paths=paths if action == "retry_selected" else None)
@@ -391,17 +412,37 @@ class Engine:
             raise ValueError("Неизвестная команда")
 
     def disconnect(self):
-        with self.lock:
-            for control in self.controls.values():
-                control.stop()
+        for control in tuple(self.controls.values()):
+            control.stop()
         self.api.credentials.clear()
 
+    def reconcile(self, job_id):
+        """A dead worker must leave a task that can be resumed, never a busy button."""
+        with self.lock:
+            job = self.store.job(job_id)
+            thread = self.threads.get(job_id)
+            if (not thread or not thread.is_alive()) and job["phase"] in ("new", "scanning", "preparing", "downloading", "packing", "paused", "pausing", "stopping"):
+                self.store.update_job(job_id, phase="interrupted", error=job["error"] or "Работа приложения прервалась. Файлы и прогресс сохранены. Подключите Яндекс.Диск и нажмите «Продолжить».")
+                job = self.store.job(job_id)
+            return job
+
     def status(self, job_id):
+        self.reconcile(job_id)
         live = bool(self.threads.get(job_id) and self.threads[job_id].is_alive())
         status = self.store.summary(job_id)
         control = self.controls.get(job_id)
         status.update(control.snapshot() if control else {"active": [], "speed": 0})
         status["live"] = live
+        if not live or control and control.paused:
+            status["speed"] = 0
+        finishing = status["phase"] in ("completed", "completed_with_errors", "stopped", "failed", "ready")
+        if live and control and not finishing:
+            if control.stopped:
+                status["phase"] = "stopping"
+            elif control.paused:
+                status["phase"] = "paused"
+        status["can_pause"] = bool(live and control and not finishing and not control.stopped and not control.paused)
+        status["can_resume"] = bool(not live or control and control.paused and not control.stopped)
         status["network_waiting"] = bool(live and control and control.network.offline.is_set())
         status["network_warning"] = control.network.message if status["network_waiting"] else ""
         if status["network_waiting"]:
@@ -516,8 +557,20 @@ class Engine:
             return False
 
     def run(self, job_id, operation, control):
-        with self.store.activity():
-            self._run(job_id, operation, control)
+        try:
+            with self.store.activity():
+                self._run(job_id, operation, control)
+        except Exception as exc:
+            # Includes failures opening the activity connection / final journal.
+            # The next status request also reconciles a dead worker's phase.
+            try:
+                self.store.update_job(job_id, phase="failed", ended=now(), error=safe_error(exc))
+            except sqlite3.Error:
+                pass
+            finally:
+                with control.lock:
+                    control.active.clear()
+                    control.finished = time.monotonic()
 
     def _run(self, job_id, operation, control):
         saved_scan = False
@@ -753,7 +806,7 @@ class Engine:
 
     def prioritize(self, job_id, control, prime=False):
         job = self.store.job(job_id)
-        if prime and (job["settings"].get("operation") == "missing" or job["generation"] > 0):
+        if prime and (job["settings"].get("operation") == "missing" or job["generation"] > 0 or getattr(control, "reuse_scanned", False)):
             self.check_local_results(job, control)
             return
         with self.store.db() as db:
@@ -819,6 +872,19 @@ class Engine:
                 try:
                     original = self.reusable(job, entry, "original", meta, control)
                     preview = not original and preview_type(meta) and self.reusable(job, entry, "preview", meta, control)
+                    if (original or preview) and job["settings"].get("operation") != "missing":
+                        # A restart resumes a saved inventory. Before skipping
+                        # its verified copies, check whether the source changed.
+                        try:
+                            current = self.api.metadata(entry["path"], job["settings"], control.check, limit=1)
+                            if current.get("type") != "file" or fingerprint(current) != fingerprint(meta):
+                                original = preview = False
+                                with self.store.db() as db:
+                                    db.execute("DELETE FROM artifacts WHERE job=? AND path=?", (job_id, entry["path"]))
+                        except APIError:
+                            # Let the normal per-file path record a readable
+                            # error / retry; do not silently accept stale data.
+                            original = preview = False
                 except (OSError, ValueError):
                     # An unreadable local file must not prevent the remaining folder check.
                     with self.store.db() as db:
@@ -827,6 +893,8 @@ class Engine:
                     if original:
                         db.execute("UPDATE entries SET status='existing',priority=2,error='',original_status='existing_verified',preview_status='not_needed',fallback=0 WHERE job=? AND path=?", (job_id, entry["path"]))
                         db.execute("DELETE FROM artifacts WHERE job=? AND path=? AND type='preview'", (job_id, entry["path"]))
+                    elif preview and job["settings"].get("missing_policy", "originals") == "any_result":
+                        db.execute("UPDATE entries SET status='existing',priority=1,error='',original_status='not_requested',preview_status='existing_verified',fallback=0 WHERE job=? AND path=?", (job_id, entry["path"]))
                     else:
                         db.execute("UPDATE entries SET status='pending',priority=?,error='',original_status='not_requested',preview_status=?,fallback=0 WHERE job=? AND path=?", (int(bool(preview)), "existing_verified" if preview else "not_requested", job_id, entry["path"]))
                 checked += 1
@@ -877,7 +945,7 @@ class Engine:
         artifact = dict(artifact)
         try:
             filename = safe_join(job["root"], artifact["local"])
-            valid = artifact["fingerprint"] == fingerprint(meta) and (kind != "preview" or artifact["preview_size"] == job["settings"]["preview_size"] and artifact["size"] <= PREVIEW_MAX_BYTES)
+            valid = artifact["fingerprint"] == fingerprint(meta) and (kind != "preview" or (artifact["preview_size"] == job["settings"]["preview_size"] or job["settings"].get("missing_policy") == "any_result") and artifact["size"] <= PREVIEW_MAX_BYTES)
             if kind == "original" and meta.get("sha256"):
                 valid = valid and artifact["sha256"].lower() == meta["sha256"].lower()
             valid = valid and os.path.isfile(filename) and os.path.getsize(filename) == artifact["size"]
@@ -976,7 +1044,7 @@ class Engine:
                 except Exception as exc:
                     outcome = "unavailable" if isinstance(exc, APIError) and exc.status == 404 and kind == "preview" else "failed"
                     errors.append(("Оригинал: " if kind == "original" else "Превью: ") + safe_error(exc))
-                    if isinstance(exc, PathError) or isinstance(exc, OSError) and not isinstance(exc, requests.RequestException):
+                    if isinstance(exc, (PathError, sqlite3.Error)) or isinstance(exc, OSError) and not isinstance(exc, requests.RequestException):
                         other_errors.append(safe_error(exc))
                     control.event(kind, ("Оригинал: " if kind == "original" else "Превью: ") + safe_error(exc), path, "warning")
                 if kind == "original":
@@ -1196,16 +1264,20 @@ class Engine:
                 raise
             except Exception as exc:
                 error = exc
-                with control.lock:
-                    control.remaining_time.retry(kind)
-                if deadline.network_aborted.is_set():
+                if deadline.pause_aborted.is_set() or isinstance(exc, PausedRequest):
+                    error = PausedRequest()
+                else:
+                    with control.lock:
+                        control.remaining_time.retry(kind)
+                if not isinstance(error, PausedRequest) and deadline.network_aborted.is_set():
                     error = NetworkError(offline=True)
-                elif deadline.expired.is_set():
+                elif not isinstance(error, PausedRequest) and deadline.expired.is_set():
                     error_type = NetworkError if isinstance(exc, (requests.RequestException, NetworkError)) else APIError
                     error = error_type(deadline.timeout_message())
                 if control.adaptive and not isinstance(error, OSError):
                     control.adaptive.failure(error.status if isinstance(error, APIError) else None)
-                control.event(kind, f"{'Оригинал' if kind == 'original' else 'Превью'} · попытка {attempt + 1}/{tries}: {safe_error(error)}", entry["path"], "warning")
+                if not isinstance(error, PausedRequest):
+                    control.event(kind, f"{'Оригинал' if kind == 'original' else 'Превью'} · попытка {attempt + 1}/{tries}: {safe_error(error)}", entry["path"], "warning")
                 if isinstance(error, APIError) and error.status == 416:
                     keep = False
             finally:
@@ -1230,6 +1302,10 @@ class Engine:
                 with control.lock:
                     control.temporary.discard(temp)
                     control.temporary_sizes.pop(temp, None)
+            if isinstance(error, PausedRequest):
+                control.check()
+                delay = 0
+                continue
             def connected_check():
                 control.check()
                 if not self.api.credentials.connected:

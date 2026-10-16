@@ -2,74 +2,23 @@ const $ = id => document.getElementById(id);
 const csrf = document.querySelector('meta[name="csrf-token"]').content;
 const selected = new Set();
 const errorSelections = new Set();
-const state = {closing:false,actionPending:false,activeJob:null,limitsJob:null,restoreLimits:false,limitsTouched:false,connected:false,path:'disk:/',offset:0,items:[],total:null,hasMore:false,view:'table',history:[],job:null,jobStatus:null,errorOffset:0,browseVersion:0,thumbVersion:0,urls:[],polling:false};
-const phases = {new:'Новое задание',scanning:'Обход Диска',preparing:'Подготовка результатов',ready:'Оценка готова',downloading:'Скачивание',paused:'Пауза',stopping:'Остановка…',stopped:'Остановлено',interrupted:'Требуется продолжение',packing:'Создание ZIP',completed:'Завершено',completed_with_errors:'Завершено с неполным результатом',failed:'Операция завершилась ошибкой'};
+const state = {closing:false,actionPending:false,activeJob:null,limitsJob:null,restoreLimits:true,limitsTouched:false,connected:false,authRevision:-1,authBusy:false,instance:null,path:'disk:/',offset:0,items:[],total:null,hasMore:false,view:'table',history:[],job:null,jobStatus:null,errorOffset:0,browseVersion:0,thumbVersion:0,urls:[],polling:false};
+const phases = {new:'Новое задание',scanning:'Составляем список файлов',preparing:'Проверяем папку и готовим результат',ready:'Список готов — можно скачивать',downloading:'Скачивание',paused:'На паузе',stopping:'Сохраняем прогресс и останавливаем…',stopped:'Остановлено — можно продолжить',interrupted:'Работа прервалась — можно продолжить',packing:'Создаём ZIP',completed:'Завершено',completed_with_errors:'Завершено, есть файлы без результата',failed:'Работа остановилась из-за ошибки'};
 const modes = {previews:'Только превью',both:'Оригиналы и превью',fallback:'Оригинал, превью при неудаче'};
 const typeLabels = {photos:'фото',videos:'видео',music:'музыка',files:'другие файлы'};
 const outcomes = {downloaded_verified:'скачан и проверен',existing_verified:'уже имеется, проверен',unavailable:'недоступно',failed:'не удалось',not_requested:'не запрашивалось',not_needed:'не требуется'};
 function showPanel(panel){$('settings-panel').hidden=panel!=='settings';$('job-panel').hidden=panel!=='job';$('settings-tab').setAttribute('aria-selected',String(panel==='settings'));$('job-tab').setAttribute('aria-selected',String(panel==='job'));}
 function initializePanel(){
-  const settingsPanel=$('settings-panel');
-  settingsPanel.querySelector('h1').textContent='Скачивание';
-  settingsPanel.querySelector('input[name=report]').closest('fieldset').querySelector('legend').textContent='Отчёты';
-  const destinationLabel=$('destination').closest('label');
-  const labelText=[...destinationLabel.childNodes].find(child=>child.nodeType===Node.TEXT_NODE);
-  if(labelText)labelText.textContent='Сохранить в';
-  $('estimate').textContent='Оценить выбранное';
-  for(const hint of settingsPanel.querySelectorAll(':scope > .hint'))hint.remove();
-  if(!settingsPanel.querySelector('.advanced-settings')){
-    const previewSelect=$('preview-size');
-    const sizeLabel=previewSelect.closest('label');
-    const details=node('details',undefined,'advanced-settings');
-    details.append(node('summary','Дополнительные настройки'));
-    details.append(sizeLabel,settingsPanel.querySelector('.numeric-settings'));
-    details.append(node('p','Превью без обрезки. Файлы, отчёты и ZIP — в папке импорта.','hint'));
-    const text=[...sizeLabel.childNodes].find(child=>child.nodeType===Node.TEXT_NODE);
-    if(text)text.textContent='Размер превью';
-    const labels={XXXL:'Максимальный · 1280 px',XXL:'1024 px',XL:'800 px',L:'500 px',M:'300 px',S:'150 px'};
-    for(const option of previewSelect.options)option.textContent=labels[option.value];
-    $('estimate').before(details);
-  }
-  if(!$('operation')){
-    const label=node('label','Как загрузить','field');
-    const select=node('select');
-    select.id='operation';
-    select.append(new Option('Новая загрузка','new'),new Option('Дозагрузить недостающее','missing'));
-    label.append(select);
-    settingsPanel.querySelector('h1').after(label);
-  }
-  if(!$('destination-label')){
-    const span=node('span','Сохранить в');
-    span.id='destination-label';
-    if(labelText)labelText.replaceWith(span);else destinationLabel.prepend(span);
-  }
-  $('operation').onchange=()=>{$('destination-label').textContent=$('operation').value==='missing'?'Папка предыдущей загрузки (Disk-…)':'Сохранить в';};
-  $('retries').closest('label').firstChild.textContent='Попытки всего';
-  $('retries').min=1;
-  $('retries').max=9;
-  $('timeout').closest('label').firstChild.textContent='Без данных, с';
-  if($('download-zip').tagName==='A'){
-    const button=node('button','Открыть папку с ZIP','download');
-    button.id='download-zip';
-    button.hidden=true;
-    $('download-zip').replaceWith(button);
-  }
-  if(!$('zip-saved')){
-    const info=node('div',undefined,'hint');
-    info.id='zip-saved';
-    info.hidden=true;
-    $('download-zip').before(info);
-  }
-  if(!$('job-details')){
-    const details=node('details',undefined,'job-details');
-    details.id='job-details';
-    const extra=node('div',undefined,'counters');
-    extra.id='extra-counters';
-    const estimate=node('div',undefined,'hint');
-    estimate.id='estimate-details';
-    details.append(node('summary','Подробности задания'),extra,estimate,$('job-settings'),$('output-path'));
-    $('errors-detail').before(details);
-  }
+  $('estimate').textContent='1. Проверить список и объём';
+  $('operation').onchange=()=>{
+    const missing=$('operation').value==='missing';
+    $('destination-label').textContent=missing?'Папка, куда скачивали раньше':'Куда сохранить на ПК';
+    $('missing-policy-field').hidden=!missing;
+    $('new-mode-field').hidden=missing;
+    $('mode-hint').hidden=missing;
+    $('operation-hint').textContent=missing?'Выберите прежнюю папку с результатами. Проверим, что уже сохранено, и скачаем недостающее в ту же папку.':'Выберите файлы или весь Диск и папку на ПК. Сначала покажем список и объём, затем вы сможете начать скачивание.';
+  };
+  $('operation').onchange();
 }
 function node(tag,text,className){const el=document.createElement(tag);if(text!==undefined)el.textContent=text;if(className)el.className=className;return el;}
 function initializeHelp(){
@@ -104,7 +53,37 @@ function bytes(n){if(n===null||n===undefined)return 'неизвестно';const
 function remainingTime(seconds){if(seconds===null||seconds===undefined)return 'Уточняется…';if(seconds===0)return '0 мин';if(seconds<60)return `≈ ${Math.ceil(seconds)} с`;const minutes=Math.ceil(seconds/60);if(minutes<60)return `≈ ${minutes} мин`;const hours=Math.floor(minutes/60),rest=minutes%60;if(hours<24)return `≈ ${hours} ч${rest?' '+rest+' мин':''}`;return `≈ ${Math.floor(hours/24)} д${hours%24?' '+hours%24+' ч':''}`;}
 const dismissedNotices = new Set();
 function notice(message){const boxes=[$('notice'),...document.querySelectorAll('.dialog-notice')];if(!message){for(const box of boxes)box.hidden=true;dismissedNotices.clear();return;}if(dismissedNotices.has(message))return;const dialog=document.querySelector('dialog[open]');if(dialog&&!dialog.querySelector('.dialog-notice')){const local=node('div',undefined,'notice dialog-notice');local.role='status';dialog.prepend(local);boxes.push(local);}for(const box of boxes){box.replaceChildren(node('span',message));const close=node('button','×','notice-close');close.setAttribute('aria-label','Закрыть уведомление');close.onclick=()=>{dismissedNotices.add(message);for(const holder of boxes)holder.hidden=true;};box.append(close);box.hidden=!!dialog&&box===$('notice');}}
-async function api(path,data){const controller=new AbortController();const timer=path==='/api/folder'?null:setTimeout(()=>controller.abort(),45000);const options={headers:{'X-CSRF-Token':csrf},credentials:'same-origin',cache:'no-store',signal:controller.signal};if(data!==undefined){options.method='POST';options.headers['Content-Type']='application/json';options.body=JSON.stringify(data);}try{const response=await fetch(path,options);const result=await response.json();if(!response.ok)throw new Error(result.error||`HTTP ${response.status}`);return result;}catch(error){if(error.name==='AbortError')throw new Error('Сервис не ответил вовремя. Проверьте, что приложение запущено.');throw error;}finally{if(timer!==null)clearTimeout(timer);}}
+function serviceWarning(message,session=false){if(!message&&state.sessionExpired)return;if(session)state.sessionExpired=true;$('service-warning').hidden=!message;$('service-warning-text').textContent=message||'';$('reload-page').hidden=!session;$('recheck-service').hidden=session;}
+function requestPurpose(path,data){if(path==='/api/connect')return 'Проверка ключа доступа в Яндекс.Диске';if(path.startsWith('/api/browse'))return 'Получение списка файлов Яндекс.Диска';if(path.endsWith('/action'))return ({pause:'Постановка задания на паузу',stop:'Остановка задания',resume:'Продолжение загрузки',continue_scan:'Продолжение поиска файлов',start:'Запуск скачивания',retry:'Повторная загрузка',pack:'Создание ZIP'})[data?.action]||'Управление заданием';if(path==='/api/jobs')return 'Подготовка нового задания';if(path.startsWith('/api/jobs/')||path==='/api/status')return 'Обновление состояния задания';return 'Запрос к приложению на этом ПК';}
+function acceptAuth(result){
+  if(result.instance_id&&state.instance&&state.instance!==result.instance_id){serviceWarning('Программа была перезапущена. Обновите страницу, затем подключите ключ доступа и продолжите задание. История и скачанные файлы сохранены.',true);return;}
+  if(result.instance_id)state.instance=result.instance_id;
+  if(typeof result.auth_revision!=='number'||result.auth_revision<state.authRevision)return;
+  state.authRevision=result.auth_revision;connection(result.connected);
+  if(result.auth_reason==='expired')$('auth-hint').firstChild.textContent='Яндекс.Диск отклонил прежний ключ. Получите новый ключ с правом чтения Диска, подключитесь и нажмите «Продолжить» у задания. ';
+}
+async function api(path,data){
+  const controller=new AbortController(),purpose=requestPurpose(path,data);
+  const timeout=path==='/api/connect'?25000:path.endsWith('/action')?15000:data===undefined?15000:60000;
+  const timer=path==='/api/folder'?null:setTimeout(()=>controller.abort(),timeout);
+  const options={headers:{'X-CSRF-Token':csrf},credentials:'same-origin',cache:'no-store',signal:controller.signal};
+  if(data!==undefined){options.method='POST';options.headers['Content-Type']='application/json';options.body=JSON.stringify(data);}
+  try{
+    let response;
+    try{response=await fetch(path,options);}catch(error){
+      const timed=error.name==='AbortError';
+      const message=timed?`${purpose}: приложение на этом ПК (${location.host}) не прислало ответ за ${timeout/1000} с. Команда могла выполниться — нажмите «Проверить связь», чтобы увидеть состояние. Если окно программы закрыто, запустите её снова.`:`${purpose}: страница не может связаться с программой на этом ПК (${location.host}). Запустите YaDiskDownloader и нажмите «Проверить связь». Закрытие вкладки само по себе не останавливает скачивание.`;
+      serviceWarning(message);throw new Error(message);
+    }
+    let result;
+    try{result=await response.json();}catch{throw new Error(`${purpose}: приложение вернуло ответ, который не удалось прочитать (HTTP ${response.status}). Обновите страницу. Если повторяется — отправьте диагностику через «Сообщить об ошибке».`);}
+    if(result.code==='session_expired')serviceWarning(result.error,true);
+    else if(response.ok&&(path==='/api/status'||/^\/api\/jobs\/[^/]+$/.test(path)))serviceWarning('');
+    acceptAuth(result);
+    if(!response.ok)throw new Error((result.operation||purpose)+': '+(result.error||`Ошибка HTTP ${response.status}`)+(response.status>=500&&result.request_id?' Номер ошибки: '+result.request_id+'.':''));
+    return result;
+  }finally{if(timer!==null)clearTimeout(timer);}
+}
 async function safely(fn){try{notice('');await fn();}catch(error){notice(error.message);}}
 function connection(connected){state.connected=connected;$('connection').textContent=connected?'Диск подключён':'Не подключён';$('connection').classList.toggle('online',connected);$('auth-form').hidden=connected;$('disconnect').hidden=!connected;$('estimate').disabled=!connected||!!state.activeJob;$('refresh').disabled=!connected;$('next-page').disabled=!connected||!state.hasMore;$('prev-page').disabled=!connected||state.offset===0;}
 function breadcrumb(){const holder=$('breadcrumbs');holder.replaceChildren();const parts=state.path==='disk:/'?[]:state.path.slice(6).split('/');let path='disk:/';const root=node('button','Диск');root.onclick=()=>safely(()=>browse('disk:/',0,true));holder.append(root);for(const part of parts){holder.append(node('span','/','muted'));path=path.replace(/\/$/,'')+'/'+part;const target=path;const button=node('button',part);button.onclick=()=>safely(()=>browse(target,0,true));holder.append(button);}$('up').disabled=parts.length===0||!state.connected;$('back').disabled=!state.history.length||!state.connected;}
@@ -117,8 +96,8 @@ function filename(item){const button=node('button',item.name,'name-button');butt
 function renderFiles(){state.thumbVersion++;state.thumbnailObserver?.disconnect();for(const controller of state.thumbnailControllers||[])controller.abort();state.thumbnailControllers=new Set();for(const url of state.urls)URL.revokeObjectURL(url);state.urls=[];const holder=$('file-list');holder.replaceChildren();const items=visibleItems();if(!items.length){holder.append(node('div',state.items.length?'По фильтру ничего не найдено':'Папка пуста','empty'));updateSelection();return;}if(state.view==='table'){const table=node('table',undefined,'files-table');const thead=node('thead');const header=node('tr');for(const text of ['','Имя','Размер','Изменён'])header.append(node('th',text));thead.append(header);table.append(thead);const body=node('tbody');for(const item of items){const row=node('tr');row.classList.toggle('selected',selected.has(item.path));const checkCell=node('td');checkCell.append(checkbox(item));const nameCell=node('td');const wrapper=node('div',undefined,'file-name');wrapper.append(icon(item),filename(item),excludeButton(item));nameCell.append(wrapper);row.append(checkCell,nameCell,node('td',item.type==='dir'?'—':bytes(item.size),'muted'),node('td',item.modified?new Date(item.modified).toLocaleDateString('ru-RU'):'—','muted'));body.append(row);}table.append(body);holder.append(table);}else{const grid=node('div',undefined,'files-grid');for(const item of items){const tile=node('div',undefined,'file-tile');tile.classList.toggle('selected',selected.has(item.path));const top=node('div',undefined,'tile-top');top.append(checkbox(item),node('span',item.type==='dir'?'Папка':bytes(item.size),'muted'),excludeButton(item));tile.append(top,icon(item),filename(item));grid.append(tile);}holder.append(grid);}updateSelection();loadThumbnails();}
 function loadThumbnails(){const version=state.thumbVersion;const queue=[];let running=0;const observer=new IntersectionObserver(entries=>{for(const entry of entries){if(entry.isIntersecting){observer.unobserve(entry.target);queue.push(entry.target);}}pump();},{root:$('file-list'),rootMargin:'100px'});state.thumbnailObserver=observer;for(const el of $('file-list').querySelectorAll('[data-preview-path]'))observer.observe(el);async function pump(){if(version!==state.thumbVersion){observer.disconnect();return;}while(running<2&&queue.length){const el=queue.shift();running++;const controller=new AbortController();state.thumbnailControllers.add(controller);(async()=>{try{const response=await fetch('/api/thumbnail?'+new URLSearchParams({path:el.dataset.previewPath,size:state.view==='grid'?'M':'S'}),{headers:{'X-CSRF-Token':csrf},credentials:'same-origin',cache:'no-store',signal:controller.signal});if(!response.ok)return;const blob=await response.blob();if(version!==state.thumbVersion||!state.connected)return;const url=URL.createObjectURL(blob);state.urls.push(url);const img=node('img');img.src=url;img.alt='';el.replaceChildren(img);}catch{}finally{state.thumbnailControllers.delete(controller);running--;pump();}})();}}}
 function advancedSettings(){return {create_zip:$('create-zip').checked,adaptive_workers:false,resume_parts:$('resume-parts').checked,auto_pause:$('auto-pause').checked,max_disk_percent:Number($('max-disk-percent').value),speed_limit_mib:Number($('speed-limit').value),exclusions:$('exclusions').value.split(/\r?\n/).map(value=>value.trim()).filter(Boolean)};}
-function settings(){return {operation:$('operation').value,paths:[...selected],whole_disk:$('whole-disk').checked,destination:$('destination').value,mode:$('mode').value,file_types:$('file-types')?[...document.querySelectorAll('input[name=file-type]:checked')].map(el=>el.value):['photos','videos','music','files'],preview_size:$('preview-size').value,workers:Number($('workers').value),attempts:Number($('retries').value),timeout:Number($('timeout').value),total_timeout:Number($('total-timeout').value),reports:[...document.querySelectorAll('input[name=report]:checked')].map(el=>el.value),...advancedSettings()};}
-async function refreshJobs(){const result=await api('/api/status');renderRunning(result.active_job);connection(result.connected);const history=$('job-history');history.replaceChildren();if(!result.jobs.length){history.append(new Option('Нет заданий',''));$('job-content').hidden=true;return;}for(const job of result.jobs)history.append(new Option(`${job.id.slice(0,8)} · ${phases[job.phase]||job.phase}`,job.id));if(!state.job||!result.jobs.some(job=>job.id===state.job))state.job=result.jobs[0].id;history.value=state.job;showPanel('job');await pollJob();}
+function settings(){return {operation:$('operation').value,missing_policy:$('missing-policy').value,paths:[...selected],whole_disk:$('whole-disk').checked,destination:$('destination').value,mode:$('mode').value,file_types:$('file-types')?[...document.querySelectorAll('input[name=file-type]:checked')].map(el=>el.value):['photos','videos','music','files'],preview_size:$('preview-size').value,workers:Number($('workers').value),attempts:Number($('retries').value),timeout:Number($('timeout').value),total_timeout:Number($('total-timeout').value),reports:[...document.querySelectorAll('input[name=report]:checked')].map(el=>el.value),...advancedSettings()};}
+async function refreshJobs(){const result=await api('/api/status');renderRunning(result.active_job);const history=$('job-history');history.replaceChildren();if(!result.jobs.length){history.append(new Option('Нет заданий',''));$('job-content').hidden=true;return;}for(const job of result.jobs)history.append(new Option(`${job.title||job.root.split(/[\\/]/).pop()||job.id.slice(0,8)} · ${phases[job.phase]||job.phase}`,job.id));if(!state.job||!result.jobs.some(job=>job.id===state.job))state.job=result.active_job?.id||result.jobs[0].id;history.value=state.job;showPanel('job');await pollJob();}
 function counter(holder,label,value,wide=false){const div=node('div',undefined,wide?'storage-counter':undefined);div.append(node('span',label),node('strong',String(value)));holder.append(div);}
 function renderJobCounters(job){
   const main=$('counters');
@@ -174,6 +153,7 @@ async function pollJob(){
     const job=await api('/api/jobs/'+id);
     if(id!==state.job)return;
     state.jobStatus=job;
+    if(state.resumePolicyJob!==job.id){state.resumePolicyJob=job.id;$('resume-policy').value=job.settings.missing_policy||'originals';}
     if(state.restoreLimits&&state.limitsJob!==job.id){
       state.limitsJob=job.id;
       $('workers').value=job.settings.workers;
@@ -183,19 +163,20 @@ async function pollJob(){
       for(const [id,key] of [['create-zip','create_zip'],['resume-parts','resume_parts'],['auto-pause','auto_pause']])$(id).checked=job.settings[key]!==false;
       $('max-disk-percent').value=job.settings.max_disk_percent??95;
       $('speed-limit').value=job.settings.speed_limit_mib??0;
+      $('resume-policy').value=job.settings.missing_policy||'originals';
       $('exclusions').value=(job.settings.exclusions??[]).join('\n');
       for(const input of document.querySelectorAll('input[name=file-type]'))input.checked=(job.settings.file_types||Object.keys(typeLabels)).includes(input.value);
     }
-    connection(job.connected);
+
     const option=$('job-history').selectedOptions[0];
-    if(option&&option.value===job.id)option.textContent=(job.title||job.id.slice(0,8))+' · '+(phases[job.phase]||job.phase);
+    if(option&&option.value===job.id)option.textContent=(job.title||job.root.split(/[\\/]/).pop()||job.id.slice(0,8))+' · '+(phases[job.phase]||job.phase);
     $('job-content').hidden=false;
     $('phase').textContent=phases[job.phase]||job.phase;
     const packing=job.phase==='packing'||(job.phase==='paused'&&job.zip_total&&job.zip_done<job.zip_total);
     const percent=packing?(job.zip_total?Math.min(100,job.zip_done*100/job.zip_total):0):job.percent;
     if(job.phase==='scanning'||!job.scan_complete&&!packing){
       $('progress').removeAttribute('value');
-      $('percentage').textContent='Обход без общего %';
+      $('percentage').textContent='Ищем файлы…';
     }else{
       $('progress').value=percent??0;
       $('percentage').textContent=(percent??0).toLocaleString('ru-RU',{maximumFractionDigits:1})+'%'+(packing?' ZIP':' обработано');
@@ -220,20 +201,25 @@ async function pollJob(){
     const scanOnly=!job.scan_complete||job.settings.scan_only_pending;
     $('resume-job').textContent=scanOnly?'Продолжить обход':'Продолжить загрузку';
     $('stop-job').textContent=job.phase==='stopping'?'Останавливаем…':scanOnly?'Остановить обход':job.phase==='packing'?'Остановить ZIP':'Остановить загрузку';
-    $('job-hint').textContent=state.closing?'Завершаем приложение…':job.phase==='stopping'?'Отменяем запросы и сохраняем прогресс…':job.phase==='ready'?'Список готов. Нажмите «Начать скачивание».':job.phase==='scanning'?'Составляем список файлов. Можно остановить и продолжить позже.':job.phase==='preparing'?'Проверяем локальные файлы и подготавливаем результаты.':job.phase==='paused'?'Работа на паузе. Для продолжения нажмите кнопку выше.':['stopped','interrupted'].includes(job.phase)?(scanOnly?'Обход остановлен. «Продолжить обход» вернёт вас к оценке.':'Прогресс сохранён. Можно продолжить загрузку.'):'Закрытие вкладки не останавливает работу. Для выхода используйте «Выход». ';
+    $('job-hint').textContent=state.closing?'Завершаем приложение…':job.phase==='stopping'?'Отменяем запросы и сохраняем прогресс…':job.phase==='ready'?'Список готов. Нажмите «Начать скачивание».':job.phase==='scanning'?'Составляем список файлов. Можно остановить и продолжить позже.':job.phase==='preparing'?'Проверяем локальные файлы и подготавливаем результаты.':job.phase==='paused'?'Работа на паузе. Для продолжения нажмите кнопку выше.':['stopped','interrupted'].includes(job.phase)?(scanOnly?'Обход остановлен. «Продолжить обход» вернёт вас к оценке.':(state.connected?'Прогресс сохранён. В блоке «Как продолжить загрузку» выберите, достаточно ли превью, и нажмите «Продолжить загрузку».':'Прогресс сохранён. Нажмите «Подключить Диск, чтобы продолжить», вставьте ключ доступа, затем продолжите загрузку.')):'Закрытие вкладки не останавливает работу. Для выхода используйте «Выход». ';
     if(live)renderRunning({id:job.id,phase:job.phase,scan_complete:job.scan_complete});
     const hasIssues=job.errors||job.scan_errors;
-    const hasRetry=hasIssues||job.replacements||job.counts.partial;
+    const hasRetry=hasIssues||job.replacements||job.counts.partial||job.completeness.preview_only;
+    $('start-job').textContent='2. Начать скачивание';
     $('start-job').hidden=job.phase!=='ready';
     $('start-job').disabled=state.actionPending||live||!state.connected;
     $('pause-job').disabled=state.actionPending||job.phase==='stopping';
-    $('pause-job').hidden=!live||!['scanning','preparing','downloading','packing'].includes(job.phase);
-    $('resume-job').hidden=!['paused','stopped','interrupted','failed'].includes(job.phase);
-    $('resume-job').disabled=state.actionPending||(job.phase!=='paused'&&(!state.connected||live));
+    $('pause-job').hidden=!job.can_pause;
+    $('resume-job').hidden=!job.can_resume||!['paused','stopped','interrupted','failed'].includes(job.phase);
+    $('resume-job').disabled=state.actionPending||(!state.connected&&!packing);
+    $('connect-for-job').hidden=state.connected||!job.can_resume||!['ready','paused','stopped','interrupted','failed'].includes(job.phase);
+    $('resume-options').hidden=!job.can_resume||!['ready','paused','stopped','interrupted','failed'].includes(job.phase);
+    $('resume-policy').disabled=live;
+    $('resume-options-hint').textContent=live?'Чтобы изменить учёт превью, остановите задание. Затем выберите вариант и продолжите — прогресс сохранится.':'Проверим папку перед продолжением. Сначала скачаем файлы без копий. Готовые оригиналы повторно не скачиваем.';
     $('stop-job').hidden=!live;
-    $('stop-job').disabled=state.actionPending||job.phase==='stopping';
-    $('retry-job').hidden=!hasRetry;
-    $('retry-job').textContent=hasIssues?'Повторить неудачные':'Повторить недостающий вариант';
+    $('stop-job').disabled=state.stopPending||job.phase==='stopping';
+    $('retry-job').hidden=!hasRetry||live||job.phase==='ready';
+    $('retry-job').textContent=hasIssues?'Повторить файлы с ошибками':'Попробовать скачать оригиналы';
     $('retry-job').disabled=live||!state.connected;
     $('pack-job').hidden=live||job.phase==='ready';
     $('pack-job').disabled=!job.scan_complete&&!job.processed;
@@ -263,17 +249,19 @@ async function pollJob(){
   }
 }
 async function loadErrors(){if(!state.job)return;const jobId=state.job,offset=state.errorOffset;const result=await api(`/api/jobs/${jobId}/errors?offset=${offset}`);if(jobId!==state.job||offset!==state.errorOffset)return;const holder=$('errors-list');holder.replaceChildren();if(!result.items.length)holder.append(node('p','Нет записей на этой странице','muted'));for(const item of result.items){const div=node('div',undefined,'error-item'),label=node('label',undefined,'error-selection'),check=node('input');check.type='checkbox';check.checked=errorSelections.has(item.path);check.disabled=item.status==='scan_error';check.setAttribute('aria-label','Выбрать '+item.path);check.onchange=()=>{if(check.checked)errorSelections.add(item.path);else errorSelections.delete(item.path);$('retry-selected').hidden=!errorSelections.size;$('retry-selected').textContent='Повторить выбранные ('+errorSelections.size+')';};label.append(check,node('strong',item.path));div.append(label,node('p',item.error),node('span',`Оригинал: ${outcomes[item.original_status]||item.original_status}. Превью: ${outcomes[item.preview_status]||item.preview_status}.${item.fallback?' Переход к превью после неудачи оригинала.':''}`));if(item.status!=='scan_error'){const retry=node('button','Повторить этот файл');retry.disabled=state.jobStatus?.live||!state.connected;retry.onclick=()=>safely(()=>retrySelected([item.path]));div.append(retry);}holder.append(div);}$('errors-prev').disabled=state.errorOffset===0;$('errors-next').disabled=!result.has_more;}
-function runtimeLimits(){const previous=state.jobStatus?.settings;if(!state.limitsTouched&&state.limitsJob!==state.job&&previous)return Object.fromEntries(['workers','attempts','timeout','total_timeout','create_zip','adaptive_workers','resume_parts','auto_pause','max_disk_percent','speed_limit_mib'].filter(key=>previous[key]!==undefined).map(key=>[key,previous[key]]));return {workers:Number($('workers').value),attempts:Number($('retries').value),timeout:Number($('timeout').value),total_timeout:Number($('total-timeout').value),...advancedSettings()};}
+function runtimeLimits(){const result=baseRuntimeLimits();result.missing_policy=$('resume-policy').value;return result;}
+function baseRuntimeLimits(){const previous=state.jobStatus?.settings;if(!state.limitsTouched&&state.limitsJob!==state.job&&previous)return Object.fromEntries(['workers','attempts','timeout','total_timeout','create_zip','adaptive_workers','resume_parts','auto_pause','max_disk_percent','speed_limit_mib'].filter(key=>previous[key]!==undefined).map(key=>[key,previous[key]]));return {workers:Number($('workers').value),attempts:Number($('retries').value),timeout:Number($('timeout').value),total_timeout:Number($('total-timeout').value),...advancedSettings()};}
 async function action(verb){
-  if(state.actionPending||!state.job)return;
-  state.actionPending=true;
-  for(const id of ['start-job','pause-job','resume-job','stop-job','stop-active'])$(id).disabled=true;
+  if(!state.job||(verb==='stop'?state.stopPending:state.actionPending))return;
+  if(verb==='stop')state.stopPending=true;
+  state.actionCount=(state.actionCount||0)+1;state.actionPending=true;
+  for(const id of ['start-job','pause-job','resume-job'])$(id).disabled=true;
   if(verb==='stop'){$('phase').textContent='Останавливаем…';$('job-hint').textContent='Отменяем запросы и сохраняем прогресс…';}
   try{
     const scanOnly=state.jobStatus&&(!state.jobStatus.scan_complete||state.jobStatus.settings.scan_only_pending);
     const command=verb==='resume'&&scanOnly?'continue_scan':verb;
-    await api('/api/jobs/'+state.job+'/action',{action:command,limits:['start','resume','retry'].includes(verb)?runtimeLimits():undefined});
-  }finally{state.actionPending=false;await pollJob();}
+    await api('/api/jobs/'+state.job+'/action',{action:command,limits:['start','resume','retry'].includes(verb)?{...runtimeLimits(),...(verb==='retry'&&!state.jobStatus?.errors&&!state.jobStatus?.scan_errors?{missing_policy:'originals'}:{})}:undefined});
+  }finally{if(verb==='stop')state.stopPending=false;state.actionCount--;state.actionPending=state.actionCount>0;await pollJob();}
 }
 function renderRunning(job){
   state.activeJob=job||null;$('estimate').disabled=!state.connected||!!job||state.closing;$('running-bar').hidden=!job||state.closing;
@@ -281,7 +269,7 @@ function renderRunning(job){
   $('running-label').textContent=phases[job.phase]||'Задание выполняется';
   const stopping=job.phase==='stopping';
   $('stop-active').textContent=stopping?'Останавливаем…':!job.scan_complete?'Остановить обход':'Остановить';
-  $('stop-active').disabled=state.actionPending||stopping||['completed','completed_with_errors'].includes(job.phase);
+  $('stop-active').disabled=state.stopPending||stopping||['completed','completed_with_errors'].includes(job.phase);
 }
 async function refreshActivity(){if(state.closing)return;const result=await api('/api/status');renderRunning(result.active_job);}
 async function exitApplication(){
@@ -293,13 +281,13 @@ async function exitApplication(){
   notice('Приложение завершается. Прогресс сохранён; эту вкладку можно закрыть.');
 }
 $('show-active').onclick=()=>safely(async()=>{if(!state.activeJob)return;state.job=state.activeJob.id;state.restoreLimits=true;state.jobStatus=null;showPanel('job');await pollJob();});
-$('stop-active').onclick=()=>safely(async()=>{if(!state.activeJob||state.actionPending)return;const id=state.activeJob.id;$('stop-active').disabled=true;state.actionPending=true;try{await api('/api/jobs/'+id+'/action',{action:'stop'});}finally{state.actionPending=false;await refreshActivity();await pollJob();}});
+$('stop-active').onclick=()=>safely(async()=>{if(!state.activeJob||state.stopPending)return;const id=state.activeJob.id;$('stop-active').disabled=true;state.stopPending=true;try{await api('/api/jobs/'+id+'/action',{action:'stop'});}finally{state.stopPending=false;await refreshActivity();await pollJob();}});
 $('quit-app').onclick=()=>safely(exitApplication);
 setInterval(()=>{if(!state.closing)refreshActivity().catch(()=>{});},3000);
 
 async function retrySelected(paths){await api('/api/jobs/'+state.job+'/action',{action:'retry_selected',paths,limits:runtimeLimits()});errorSelections.clear();await pollJob();}
-$('auth-form').onsubmit=event=>{event.preventDefault();safely(async()=>{const input=$('token');const token=input.value;input.value='';await api('/api/connect',{token});connection(true);await browse('disk:/');await refreshJobs();});};
-$('disconnect').onclick=()=>safely(async()=>{await api('/api/disconnect',{});connection(false);state.browseVersion++;state.thumbVersion++;for(const url of state.urls)URL.revokeObjectURL(url);state.urls=[];state.items=[];$('file-list').replaceChildren(node('div','Диск отключён. Токен удалён из состояния приложения.','empty'));await pollJob();});
+$('auth-form').onsubmit=event=>{event.preventDefault();if(state.authBusy)return;safely(async()=>{state.authBusy=true;$('connect').disabled=true;$('connect').textContent='Проверяем ключ…';try{await api('/api/connect',{token:$('token').value.trim()});$('token').value='';await refreshJobs();await browse('disk:/');notice('Диск подключён.'+(state.job?' Откройте задание и нажмите «Продолжить», чтобы вернуться к загрузке.':''));}finally{state.authBusy=false;$('connect').disabled=false;$('connect').textContent='Подключить';}});};
+$('disconnect').onclick=()=>safely(async()=>{await api('/api/disconnect',{});state.browseVersion++;state.thumbVersion++;for(const url of state.urls)URL.revokeObjectURL(url);state.urls=[];state.items=[];$('file-list').replaceChildren(node('div','Диск отключён. Для продолжения вставьте ключ доступа вверху страницы. Скачанные файлы и история сохранены.','empty'));await pollJob();});
 $('refresh').onclick=()=>safely(()=>browse(state.path,state.offset));
 $('sort').onchange=()=>safely(()=>browse());
 $('filter').oninput=renderFiles;
@@ -332,3 +320,10 @@ setInterval(()=>{if(!state.closing)pollJob().catch(error=>{if(!state.closing)not
 
 function excludePaths(paths){const input=$('exclusions');input.value=[...new Set([...input.value.split(/\r?\n/).filter(Boolean),...paths])].join('\n');for(const path of paths)selected.delete(path);renderFiles();notice('Добавлено в исключения: '+paths.length);}
 function excludeButton(item){const button=node('button','⊖','exclude-button');button.title='Исключить '+item.name;button.setAttribute('aria-label',button.title);button.onclick=()=>excludePaths([item.path]);return button;}
+
+$('key-help').onclick=()=>$('open-help').click();
+$('connect-for-job').onclick=()=>{$('auth-form').hidden=false;$('token').focus();$('auth-form').scrollIntoView({behavior:'smooth',block:'center'});notice('Вставьте ключ доступа вверху страницы и нажмите «Подключить». После перезапуска программы ключ нужно ввести снова; обновление страницы его не удаляет.');};
+$('resume-policy').onchange=()=>{};
+$('recheck-service').onclick=()=>safely(async()=>{$('recheck-service').disabled=true;try{await refreshJobs();notice('Связь с программой восстановлена. Состояние задания обновлено.');}finally{$('recheck-service').disabled=false;}});
+$('reload-page').onclick=()=>location.reload();
+$('open-job-folder').onclick=()=>safely(()=>api('/api/jobs/'+state.job+'/open-folder',{}));

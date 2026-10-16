@@ -241,7 +241,7 @@ class Store:
                 FROM entries e WHERE e.job=? AND e.kind='file' AND e.status!='filtered')""", (job_id,)).fetchone()
         found = dict(found)
         total = found.get("file", 0)
-        processed = sum(counts.get(k, 0) for k in ("done", "existing", "partial", "error", "no_preview", "cancelled", "filtered"))
+        processed = sum(counts.get(k, 0) for k in ("done", "existing", "partial", "error", "no_preview", "filtered"))
         originals = next((r[1] for r in totals if r[0] == "original"), 0)
         previews = next((r[1] for r in totals if r[0] == "preview"), 0)
         saved = sum(r[2] for r in totals)

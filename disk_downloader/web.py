@@ -3,6 +3,7 @@ import os
 import secrets
 import threading
 import json
+import sqlite3
 from pathlib import Path
 
 from flask import Flask, abort, jsonify, render_template, request, send_file, session
@@ -46,6 +47,11 @@ def create_app(state_dir=None, api=None, port=8766):
     app.extensions.update(engine=engine, store=store, disk_api=api, updates=updates, management=management, maintenance=maintenance, backups=backups, recovered=recovered)
     thumbnail_slots = threading.BoundedSemaphore(3)
     dialog_lock = threading.Lock()
+    auth_lock = threading.Lock()
+    instance_id = secrets.token_hex(8)
+
+    def auth_status():
+        return credentials.status() | {"instance_id": instance_id}
     origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
     hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
 
@@ -64,7 +70,7 @@ def create_app(state_dir=None, api=None, port=8766):
             csrf = session.get("csrf")
             supplied = request.headers.get("X-CSRF-Token", "")
             if not csrf or not supplied.isascii() or not secrets.compare_digest(supplied, csrf):
-                abort(403, "Откройте интерфейс приложения: требуется CSRF-токен")
+                abort(403, "Эта вкладка открыта до перезапуска приложения или потеряла связь с ним. Обновите страницу (F5). Скачанные файлы и история сохранены.")
         if request.method == "POST" and origin not in origins:
             abort(403, "Для управляющего запроса требуется локальный Origin")
 
@@ -78,11 +84,15 @@ def create_app(state_dir=None, api=None, port=8766):
 
     @app.errorhandler(Exception)
     def errors(exc):
+        request_id = secrets.token_hex(4)
+        context = {"connect": "Проверка ключа доступа в Яндекс.Диске", "browse": "Получение списка файлов Яндекс.Диска", "job_status": "Обновление состояния задания", "status": "Чтение истории заданий", "job_action": "Управление заданием"}.get(request.endpoint, "Запрос к приложению на этом ПК")
         if isinstance(exc, HTTPException):
-            return jsonify(error=exc.description), exc.code
+            return jsonify(error=exc.description, operation=context, code="session_expired" if exc.code == 403 and "вкладка" in exc.description else "http_error", request_id=request_id), exc.code
         if isinstance(exc, (ValueError, APIError, Suspended, OSError)):
-            return jsonify(error=str(exc) if isinstance(exc, ValueError) else safe_error(exc)), 400
-        return jsonify(error="Внутренняя ошибка приложения"), 500
+            return jsonify(error=str(exc) if isinstance(exc, ValueError) else safe_error(exc), operation=context, code="yandex_error" if isinstance(exc, APIError) else "action_error", request_id=request_id, **auth_status()), 400
+        app.logger.error("Request %s endpoint=%s exception=%s sqlite=%s", request_id, request.endpoint, type(exc).__name__, getattr(exc, "sqlite_errorname", ""))
+        message = safe_error(exc) if isinstance(exc, sqlite3.Error) else "В приложении на этом ПК произошла ошибка. Прогресс уже сохранённых файлов остаётся в истории. Откройте «Сообщить об ошибке» и приложите диагностику."
+        return jsonify(error=message, operation=context, code="local_database_error" if isinstance(exc, sqlite3.Error) else "internal_error", request_id=request_id), 500
 
     def payload():
         data = request.get_json(silent=True)
@@ -228,7 +238,7 @@ def create_app(state_dir=None, api=None, port=8766):
     def status():
         jobs = []
         for row in store.rows("SELECT id FROM jobs WHERE archived=0 ORDER BY started DESC LIMIT 30"):
-            job = store.job(row["id"])
+            job = engine.reconcile(row["id"])
             jobs.append({k: job[k] for k in ("id", "title", "phase", "started", "root")})
         active = None
         for job_id, thread in tuple(engine.threads.items()):
@@ -236,7 +246,7 @@ def create_app(state_dir=None, api=None, port=8766):
                 job = store.job(job_id)
                 active = {key: job[key] for key in ('id', 'phase', 'scan_complete')}
                 break
-        return jsonify(connected=credentials.connected, jobs=jobs, active_job=active)
+        return jsonify(jobs=jobs, active_job=active, **auth_status())
 
     @app.get('/api/history')
     def history():
@@ -312,21 +322,35 @@ def create_app(state_dir=None, api=None, port=8766):
 
     @app.post("/api/connect")
     def connect():
-        with engine.lock:
-            engine.ensure_idle()
-            credentials.set(payload().get("token"))
-            try:
-                api.metadata("disk:/", {"attempts": 1, "timeout": 20}, limit=1)
-            except BaseException:
-                credentials.clear()
-                raise
-            management.armed=True
-        return jsonify(connected=True)
+        data = payload()
+        token = data.get("token")
+        candidate = Credentials()
+        candidate.set(token)  # Validate syntax before starting a network request.
+        candidate.clear()
+        if not auth_lock.acquire(blocking=False):
+            raise ValueError("Ключ уже проверяется. Дождитесь результата подключения; повторно нажимать кнопку не нужно.")
+        try:
+            with engine.lock:
+                engine.ensure_idle()
+                with credentials.lock:
+                    epoch = credentials.epoch
+            if hasattr(api, "verify_token"):
+                api.verify_token(token)
+            else:
+                api.metadata("disk:/", {"attempts": 1, "timeout": 15}, limit=1)
+            with engine.lock:
+                engine.ensure_idle()
+                credentials.set(token, expected_epoch=epoch)
+                management.armed = True
+            return jsonify(**auth_status())
+        finally:
+            token = None
+            auth_lock.release()
 
     @app.post("/api/disconnect")
     def disconnect():
         engine.disconnect()
-        return jsonify(connected=False)
+        return jsonify(**auth_status())
 
     @app.get("/api/browse")
     def browse():
@@ -410,7 +434,7 @@ def create_app(state_dir=None, api=None, port=8766):
 
     @app.get("/api/jobs/<job_id>")
     def job_status(job_id):
-        return jsonify(engine.status(job_id) | {"connected": credentials.connected})
+        return jsonify(engine.status(job_id) | auth_status())
 
     @app.get("/api/jobs/<job_id>/errors")
     def job_errors(job_id):
@@ -441,6 +465,16 @@ def create_app(state_dir=None, api=None, port=8766):
         if os.name == "nt":
             os.startfile(root, "explore")
         return jsonify(path=job["root"], zip_path=job["zip_path"])
+
+    @app.post("/api/jobs/<job_id>/open-folder")
+    def open_folder(job_id):
+        job = store.job(job_id)
+        root = safe_join(job["root"], "")
+        if not os.path.isdir(root):
+            raise ValueError("Папка с результатами не найдена. Возможно, её перенесли или отключили диск. Подключите диск либо выберите новое расположение в режиме «Дозагрузить недостающее».")
+        if os.name == "nt":
+            os.startfile(root, "explore")
+        return jsonify(path=job["root"])
 
     @app.post("/api/jobs/<job_id>/open-journal")
     def open_journal(job_id):
