@@ -309,15 +309,60 @@ class Store:
 
     def summary(self, job_id):
         job = self.job(job_id)
+        mode = "fallback" if job["settings"].get("operation") == "missing" or job["generation"] > 0 else job["settings"]["mode"]
         with self.db() as db:
-            counts = dict(db.execute("SELECT status,COUNT(*) FROM entries WHERE job=? AND kind='file' GROUP BY status", (job_id,)).fetchall())
-            found = db.execute("SELECT kind,COUNT(*) FROM entries WHERE job=? GROUP BY kind", (job_id,)).fetchall()
+            # One indexed pass instead of independent scans for each counter.
+            # Flattened read-only subqueries avoid inventory copies in RAM and
+            # never enter the writer gate (WITH is conservatively a writer).
+            grouped = db.execute("""SELECT kind,status,COUNT(*) AS total,COALESCE(SUM(size),0) AS bytes,
+                SUM(size IS NULL) AS unknown_sizes,
+                SUM(CASE WHEN has_preview=1 THEN 1 ELSE 0 END) AS preview_candidates,
+                SUM(CASE WHEN preview_status='unavailable' THEN 1 ELSE 0 END) AS missing,
+                SUM(CASE WHEN fallback=1 AND status IN ('done','existing') THEN 1 ELSE 0 END) AS replaced,
+                SUM(CASE WHEN status NOT IN ('pending','running','cancelled') AND
+                    (status IN ('error','no_preview') OR error!='') THEN 1 ELSE 0 END) AS failures,
+                COALESCE(SUM(CASE WHEN :mode!='previews' OR media_type NOT IN ('photos','videos') THEN COALESCE(size,0) ELSE 0 END),0) AS original_bytes,
+                SUM(CASE WHEN (:mode!='previews' OR media_type NOT IN ('photos','videos')) AND size IS NULL THEN 1 ELSE 0 END) AS original_unknown,
+                COALESCE(SUM(CASE WHEN status IN ('pending','running') AND
+                    (:mode!='previews' OR media_type NOT IN ('photos','videos')) AND
+                    original_status NOT IN ('failed','downloaded_verified','existing_verified')
+                    THEN COALESCE(size,0) ELSE 0 END),0) AS pending_bytes,
+                SUM(CASE WHEN status NOT IN ('pending','running') THEN 0
+                    WHEN (:mode!='previews' OR media_type NOT IN ('photos','videos')) AND
+                        original_status NOT IN ('failed','downloaded_verified','existing_verified') THEN size IS NULL
+                    WHEN media_type IN ('photos','videos') AND original_status!='existing_verified' AND
+                        (:mode!='fallback' OR original_status='failed') THEN 1 ELSE 0 END) AS pending_unknown,
+                SUM(CASE WHEN status IN ('pending','running') AND media_type IN ('photos','videos') THEN 1 ELSE 0 END) AS pending_previews
+                FROM (
+                    SELECT *,json_extract(file_meta,'$.size') AS size,
+                        COALESCE(json_extract(file_meta,'$.file_type'),'photos') AS media_type,
+                        json_extract(file_meta,'$.has_preview') AS has_preview FROM (
+                        SELECT kind,status,original_status,preview_status,fallback,error,
+                            CASE WHEN kind='file' THEN meta ELSE '{}' END AS file_meta
+                        FROM entries WHERE job=:job
+                    ) AS inputs
+                ) AS values_ GROUP BY kind,status""", {'job':job_id,'mode':mode}).fetchall()
+            counts, found = {}, {}
+            volume, originals_volume, pending = [0,0,0], [0,0], [0,0,0,0]
+            missing = replaced = failures = 0
+            for row in grouped:
+                found[row['kind']] = found.get(row['kind'],0)+row['total']
+                missing += row['missing']; replaced += row['replaced']
+                if row['kind'] != 'file':
+                    continue
+                counts[row['status']] = row['total']
+                failures += row['failures']
+                for index, key in enumerate(('bytes','unknown_sizes','preview_candidates')):
+                    volume[index] += row[key]
+                for index, key in enumerate(('original_bytes','original_unknown')):
+                    originals_volume[index] += row[key]
+                for index, key in enumerate(('pending_bytes','pending_unknown')):
+                    pending[index] += row[key]
+                if row['status'] in ('pending','running'):
+                    pending[2] += row['total']
+                pending[3] += row['pending_previews']
             totals = db.execute("SELECT a.type,COUNT(*),COALESCE(SUM(a.size),0) FROM artifacts a JOIN entries e ON e.job=a.job AND e.path=a.path WHERE a.job=? GROUP BY a.type", (job_id,)).fetchall()
-            volume = db.execute("SELECT COALESCE(SUM(json_extract(meta,'$.size')),0),SUM(CASE WHEN json_extract(meta,'$.size') IS NULL THEN 1 ELSE 0 END),SUM(CASE WHEN json_extract(meta,'$.has_preview')=1 THEN 1 ELSE 0 END) FROM entries WHERE job=? AND kind='file'", (job_id,)).fetchone()
             scan_errors = db.execute("SELECT COUNT(*) FROM scan_errors WHERE job=?", (job_id,)).fetchone()[0]
-            missing = db.execute("SELECT COUNT(*) FROM entries WHERE job=? AND preview_status='unavailable'", (job_id,)).fetchone()[0]
-            replaced = db.execute("SELECT COUNT(*) FROM entries WHERE job=? AND fallback=1 AND status IN ('done','existing')", (job_id,)).fetchone()[0]
-            failures = db.execute("SELECT COUNT(*) FROM entries WHERE job=? AND kind='file' AND status NOT IN ('pending','running','cancelled') AND (status IN ('error','no_preview') OR error!='')", (job_id,)).fetchone()[0]
             previous_results = db.execute("SELECT COUNT(DISTINCT e.path) FROM entries e JOIN artifacts a ON a.job=e.job AND a.path=e.path WHERE e.job=? AND e.kind='file' AND e.priority>0", (job_id,)).fetchone()[0]
             completeness = db.execute("""SELECT COUNT(*),COALESCE(SUM(has_original),0),
                 COALESCE(SUM(NOT has_original AND has_preview),0),
@@ -325,7 +370,6 @@ class Store:
                 SELECT EXISTS(SELECT 1 FROM artifacts a WHERE a.job=e.job AND a.path=e.path AND a.type='original') has_original,
                        EXISTS(SELECT 1 FROM artifacts a WHERE a.job=e.job AND a.path=e.path AND a.type='preview') has_preview
                 FROM entries e WHERE e.job=? AND e.kind='file' AND e.status!='filtered')""", (job_id,)).fetchone()
-        found = dict(found)
         total = found.get("file", 0)
         processed = sum(counts.get(k, 0) for k in ("done", "existing", "partial", "error", "no_preview", "filtered"))
         originals = next((r[1] for r in totals if r[0] == "original"), 0)
@@ -333,12 +377,6 @@ class Store:
         saved = sum(r[2] for r in totals)
         unknown = int(volume[1] or 0)
         preview_count = int(volume[2] or 0)
-        mode = "fallback" if job["settings"].get("operation") == "missing" or job["generation"] > 0 else job["settings"]["mode"]
-        with self.db() as db:
-            original_condition = "(?!='previews' OR COALESCE(json_extract(e.meta,'$.file_type'),'photos') NOT IN ('photos','videos'))"
-            originals_volume = db.execute("SELECT COALESCE(SUM(json_extract(e.meta,'$.size')),0),COALESCE(SUM(json_extract(e.meta,'$.size') IS NULL),0) FROM entries e WHERE e.job=? AND e.kind='file' AND " + original_condition, (job_id, mode)).fetchone()
-            pending_original = original_condition + " AND e.original_status NOT IN ('failed','downloaded_verified','existing_verified')"
-            pending = db.execute("SELECT COALESCE(SUM(CASE WHEN " + pending_original + " THEN COALESCE(json_extract(e.meta,'$.size'),0) ELSE 0 END),0),COALESCE(SUM(CASE WHEN " + pending_original + " THEN json_extract(e.meta,'$.size') IS NULL ELSE CASE WHEN COALESCE(json_extract(e.meta,'$.file_type'),'photos') IN ('photos','videos') AND e.original_status!='existing_verified' AND (?!='fallback' OR e.original_status='failed') THEN 1 ELSE 0 END END),0),COUNT(*),COALESCE(SUM(COALESCE(json_extract(e.meta,'$.file_type'),'photos') IN ('photos','videos')),0) FROM entries e WHERE e.job=? AND e.kind='file' AND e.status IN ('pending','running')", (mode, mode, mode, job_id)).fetchone()
         missing_operation = job["settings"].get("operation") == "missing"
         known = int(pending[0]) if missing_operation else int(originals_volume[0])
         unknown_downloads = int(pending[1]) if missing_operation else int(originals_volume[1])
