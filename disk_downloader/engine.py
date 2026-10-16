@@ -994,6 +994,10 @@ class Engine:
         return False
 
     def process(self, job_id, entry, control):
+        with self.store.session():
+            return self._process(job_id, entry, control)
+
+    def _process(self, job_id, entry, control):
         job = self.store.job(job_id)
         path = entry["path"]
         mode = job["settings"]["mode"]

@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import tempfile
+import threading
 from contextlib import closing, contextmanager
 from pathlib import Path
 
@@ -78,6 +79,7 @@ class Store:
         self.wal = mode == 'WAL'
         self.filename = str(filename)
         self.write_gate = gate_for(self.filename)
+        self._sessions = threading.local()
         Path(filename).parent.mkdir(parents=True, exist_ok=True)
         from .backups import before_upgrade
         before_upgrade(Path(filename))
@@ -151,20 +153,74 @@ class Store:
             yield
 
     @contextmanager
-    def db(self):
+    def session(self):
+        """Reuse a connection inside one file, preserving every commit boundary.
+
+        Nested db() scopes still receive separate connections. No connection is
+        shared between threads or retained after the file operation finishes.
+        """
+        current = getattr(self._sessions, 'scope', None)
+        if current is not None:
+            yield
+            return
+        scope = {'connection':None, 'borrowed':False}
+        self._sessions.scope = scope
+        try:
+            yield
+        finally:
+            self._sessions.scope = None
+            if scope['connection'] is not None:
+                scope['connection'].close()
+
+    def _connect(self):
         conn = sqlite3.connect(self.filename, timeout=30, factory=WriteConnection)
         conn.gate = self.write_gate
-        conn.row_factory = sqlite3.Row
         try:
-            conn.execute("PRAGMA synchronous=FULL")
-            conn.execute("PRAGMA foreign_keys=ON")
-            yield conn
-            conn.commit()
+            conn.row_factory = sqlite3.Row
+            conn.execute('PRAGMA synchronous=FULL')
+            conn.execute('PRAGMA foreign_keys=ON')
+            return conn
         except BaseException:
-            conn.rollback()
+            conn.close()
+            raise
+
+    @contextmanager
+    def db(self):
+        scope = getattr(self._sessions, 'scope', None)
+        reuse = scope is not None and not scope['borrowed']
+        if reuse:
+            if scope['connection'] is None:
+                scope['connection'] = self._connect()
+            conn = scope['connection']
+            scope['borrowed'] = True
+        else:
+            conn = self._connect()
+        discard = committing = False
+        try:
+            yield conn
+            committing = True
+            conn.commit()
+            committing = False
+        except BaseException as exc:
+            discard = committing or isinstance(exc, sqlite3.Error)
+            try:
+                conn.rollback()
+            except BaseException:
+                discard = True
+                raise
             raise
         finally:
-            conn.close()
+            if reuse:
+                try:
+                    if discard:
+                        scope['connection'] = None
+                        conn.close()
+                    else:
+                        conn.release_admission()
+                finally:
+                    scope['borrowed'] = False
+            else:
+                conn.close()
 
     def job(self, job_id):
         with self.db() as db:

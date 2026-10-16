@@ -82,9 +82,12 @@ class WriteConnection(sqlite3.Connection):
         try:
             super().close()
         finally:
-            if self.admitted:
-                self.admitted = False
-                self.gate.release(self)
+            self.release_admission()
+
+    def release_admission(self):
+        if self.admitted:
+            self.admitted = False
+            self.gate.release(self)
 
 
 class WriteCursor(sqlite3.Cursor):
