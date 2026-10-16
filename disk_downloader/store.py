@@ -327,7 +327,7 @@ class Store:
                     (:mode!='previews' OR media_type NOT IN ('photos','videos')) AND
                     original_status NOT IN ('failed','downloaded_verified','existing_verified')
                     THEN COALESCE(size,0) ELSE 0 END),0) AS pending_bytes,
-                SUM(CASE WHEN status NOT IN ('pending','running') THEN 0
+                SUM(CASE WHEN status IS NULL OR status NOT IN ('pending','running') THEN 0
                     WHEN (:mode!='previews' OR media_type NOT IN ('photos','videos')) AND
                         original_status NOT IN ('failed','downloaded_verified','existing_verified') THEN size IS NULL
                     WHEN media_type IN ('photos','videos') AND original_status!='existing_verified' AND
