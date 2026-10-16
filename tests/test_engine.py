@@ -10,7 +10,7 @@ import pytest
 from conftest import make_job, run_job, wait_job, test_timeout
 from disk_downloader.api import APIError
 from disk_downloader.engine import Engine
-from disk_downloader.paths import safe_join
+from disk_downloader.paths import native, safe_join
 from disk_downloader.store import Store
 
 
@@ -198,7 +198,9 @@ def test_foreign_files_and_windows_name_collisions(system):
     artifacts = list(engine.store.rows("SELECT * FROM artifacts WHERE job=?", (job_id,)))
     assert len({r["local"].casefold() for r in artifacts}) == 2 * len(names)
     for row in artifacts:
-        assert Path(root, row["local"]).is_file()
+        # Test roots can exceed MAX_PATH too; inspect the same native path used
+        # by downloads, rather than treating a Windows path limit as a lost file.
+        assert Path(native(Path(root, row["local"]))).is_file()
         assert len(Path(row["local"]).name.encode("utf-16-le")) <= 510
 
 
