@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import shutil
 import subprocess
 import sys
 import threading
@@ -147,11 +148,13 @@ def run(args):
             directory.mkdir()
             killed = False
             first_peak = 0
+            first_outages = 0
             for restart in range(2):
                 command = [sys.executable,str(Path(__file__).resolve()),'--worker','--output',str(directory),
                            '--files',str(args.files),'--slow-fsync-ms',str(args.slow_fsync_ms)]
                 with (directory/f'worker-{restart}.log').open('w',encoding='utf-8') as log:
-                    process = subprocess.Popen(command,stdout=log,stderr=subprocess.STDOUT)
+                    process = subprocess.Popen(command,stdout=log,stderr=subprocess.STDOUT,
+                                               env=dict(os.environ,PYTHONUTF8='1',PYTHONIOENCODING='utf-8'))
                     try:
                         while process.poll() is None:
                             elapsed = time.monotonic()-started
@@ -161,6 +164,7 @@ def run(args):
                             if restart == 0 and progress.exists():
                                 snapshot = json.loads(progress.read_text(encoding='utf-8'))
                                 first_peak = max(first_peak,snapshot['rss_peak_bytes'])
+                                first_outages = max(first_outages,snapshot['outages'])
                                 if snapshot['originals'] >= max(2,args.files//3) and snapshot['phase'] == 'downloading':
                                     process.kill()  # TerminateProcess/SIGKILL, no cleanup path.
                                     process.wait(timeout=10)
@@ -178,10 +182,22 @@ def run(args):
             assert killed, 'Run completed too quickly to exercise abrupt process loss'
             item = json.loads((directory/'worker-result.json').read_text(encoding='utf-8'))
             item['rss_peak_bytes'] = max(first_peak,item['rss_peak_bytes'])
+            item['outages'] += first_outages
             result['cycles'].append(item)
             cycle += 1
             print(json.dumps({'cycles':cycle,'elapsed_seconds':round(time.monotonic()-started),**item}),flush=True)
             atomic_json(args.output/'result.json', result | {'actual_seconds':time.monotonic()-started})
+            if not args.keep_data:
+                # Only our freshly created, verified worker datasets. Preserve
+                # measurements/logs and preserve all data on a failed cycle.
+                for name in ('results','state'):
+                    target = directory/name
+                    resolved = target.resolve(strict=True)
+                    if not resolved.is_relative_to(directory.resolve()) or resolved != target.absolute() or target.is_symlink():
+                        raise RuntimeError('Refusing cleanup outside the owned test cycle')
+                    if getattr(target.stat(follow_symlinks=False),'st_file_attributes',0) & 0x400:
+                        raise RuntimeError('Refusing cleanup of a reparse point')
+                    shutil.rmtree(target)
         result['success'] = True
     finally:
         result['actual_seconds'] = time.monotonic()-started
@@ -196,6 +212,7 @@ if __name__ == '__main__':
     parser.add_argument('--max-seconds',type=float,default=21000)
     parser.add_argument('--slow-fsync-ms',type=float,default=.5)
     parser.add_argument('--worker',action='store_true',help=argparse.SUPPRESS)
+    parser.add_argument('--keep-data',action='store_true',help='Keep verified synthetic datasets; failed cycles are always kept')
     args = parser.parse_args()
     args.output = args.output.resolve()
     if not 10 <= args.files <= 100000 or args.minutes < 0 or args.slow_fsync_ms < 0:

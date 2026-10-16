@@ -7,6 +7,10 @@ import pytest
 
 from disk_downloader.backups import snapshot
 from disk_downloader.store import Store
+from disk_downloader.sqlite_support import safe_wal
+from disk_downloader.sqlite_writes import WriteConnection
+
+pytestmark = pytest.mark.skipif(not safe_wal(), reason='WAL-specific checks require a patched SQLite; legacy rollback mode is tested separately')
 
 
 def test_activity_keeps_wal_open_but_commits_are_visible_and_backup_is_current(tmp_path):
@@ -57,7 +61,7 @@ def test_short_transactions_do_not_close_and_recreate_wal_during_activity(tmp_pa
     last_closes = []
     wal = Path(store.filename+'-wal')
 
-    class Connection(sqlite3.Connection):
+    class Connection(WriteConnection):
         def close(self):
             had_wal = wal.exists()
             super().close()
@@ -65,7 +69,8 @@ def test_short_transactions_do_not_close_and_recreate_wal_during_activity(tmp_pa
                 last_closes.append(True)
 
     def connect(*args, **kwargs):
-        return original(*args, factory=Connection, **kwargs)
+        kwargs['factory'] = Connection
+        return original(*args, **kwargs)
 
     monkeypatch.setattr(sqlite3, 'connect', connect)
     with store.activity():

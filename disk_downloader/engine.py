@@ -51,6 +51,8 @@ def safe_error(exc):
         return str(exc)
     if isinstance(exc, requests.RequestException):
         return "Сетевая ошибка или таймаут"
+    if isinstance(exc, sqlite3.Error):
+        return 'Ошибка базы истории (' + getattr(exc, 'sqlite_errorname', 'SQLITE_ERROR') + ')'
     if isinstance(exc, OSError):
         if exc.errno == 28 or getattr(exc, "winerror", None) == 112:
             return "Недостаточно места на диске"

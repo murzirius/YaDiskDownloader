@@ -9,6 +9,7 @@ from .exclusions import excluded
 from .api import validate_resource
 from .limits import normalize_saved_workers
 from .sqlite_support import journal_mode
+from .sqlite_writes import gate_for, WriteConnection
 
 
 SCHEMA = """
@@ -76,6 +77,7 @@ class Store:
         mode = journal_mode()
         self.wal = mode == 'WAL'
         self.filename = str(filename)
+        self.write_gate = gate_for(self.filename)
         Path(filename).parent.mkdir(parents=True, exist_ok=True)
         from .backups import before_upgrade
         before_upgrade(Path(filename))
@@ -150,11 +152,12 @@ class Store:
 
     @contextmanager
     def db(self):
-        conn = sqlite3.connect(self.filename, timeout=30)
+        conn = sqlite3.connect(self.filename, timeout=30, factory=WriteConnection)
+        conn.gate = self.write_gate
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA synchronous=FULL")
-        conn.execute("PRAGMA foreign_keys=ON")
         try:
+            conn.execute("PRAGMA synchronous=FULL")
+            conn.execute("PRAGMA foreign_keys=ON")
             yield conn
             conn.commit()
         except BaseException:

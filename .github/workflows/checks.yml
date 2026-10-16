@@ -102,4 +102,3 @@ jobs:
           }
           gh release upload $env:RELEASE_TAG dist/release/* --clobber
           exit $LASTEXITCODE
-
