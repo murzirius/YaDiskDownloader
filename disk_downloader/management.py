@@ -18,7 +18,8 @@ class Management:
         return bool(row and row[0] == 'true')
 
     def queue_snapshot(self):
-        return {'paused': self.paused(), 'waiting_for_connection': not self.engine.api.credentials.connected,
+        return {'paused': self.paused() or not self.armed, 'waiting_for_connection': not self.engine.api.credentials.connected,
+                'needs_confirmation': not self.armed,
                 'items': [dict(r) for r in self.store.rows('SELECT q.*,j.title,j.phase FROM job_queue q JOIN jobs j ON j.id=q.job ORDER BY position')]}
 
     def queue_action(self, data):

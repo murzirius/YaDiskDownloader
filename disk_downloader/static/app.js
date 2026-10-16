@@ -54,7 +54,7 @@ function remainingTime(seconds){if(seconds===null||seconds===undefined)return '�
 const dismissedNotices = new Set();
 function notice(message){const boxes=[$('notice'),...document.querySelectorAll('.dialog-notice')];if(!message){for(const box of boxes)box.hidden=true;dismissedNotices.clear();return;}if(dismissedNotices.has(message))return;const dialog=document.querySelector('dialog[open]');if(dialog&&!dialog.querySelector('.dialog-notice')){const local=node('div',undefined,'notice dialog-notice');local.role='status';dialog.prepend(local);boxes.push(local);}for(const box of boxes){box.replaceChildren(node('span',message));const close=node('button','×','notice-close');close.setAttribute('aria-label','Закрыть уведомление');close.onclick=()=>{dismissedNotices.add(message);for(const holder of boxes)holder.hidden=true;};box.append(close);box.hidden=!!dialog&&box===$('notice');}}
 function serviceWarning(message,session=false){if(!message&&state.sessionExpired)return;if(session)state.sessionExpired=true;$('service-warning').hidden=!message;$('service-warning-text').textContent=message||'';$('reload-page').hidden=!session;$('recheck-service').hidden=session;}
-function requestPurpose(path,data){if(path==='/api/connect')return 'Проверка ключа доступа в Яндекс.Диске';if(path.startsWith('/api/browse'))return 'Получение списка файлов Яндекс.Диска';if(path.endsWith('/action'))return ({pause:'Постановка задания на паузу',stop:'Остановка задания',resume:'Продолжение загрузки',continue_scan:'Продолжение поиска файлов',start:'Запуск скачивания',retry:'Повторная загрузка',pack:'Создание ZIP'})[data?.action]||'Управление заданием';if(path==='/api/jobs')return 'Подготовка нового задания';if(path.startsWith('/api/jobs/')||path==='/api/status')return 'Обновление состояния задания';return 'Запрос к приложению на этом ПК';}
+function requestPurpose(path,data){if(path==='/api/folder')return 'Выбор папки Windows';if(path==='/api/connect')return 'Проверка ключа доступа в Яндекс.Диске';if(path.startsWith('/api/browse'))return 'Получение списка файлов Яндекс.Диска';if(path.endsWith('/action'))return ({pause:'Постановка задания на паузу',stop:'Остановка задания',resume:'Продолжение загрузки',continue_scan:'Продолжение поиска файлов',start:'Запуск скачивания',retry:'Повторная загрузка',pack:'Создание ZIP'})[data?.action]||'Управление заданием';if(path==='/api/jobs')return 'Подготовка нового задания';if(path.startsWith('/api/jobs/')||path==='/api/status')return 'Обновление состояния задания';return 'Запрос к приложению на этом ПК';}
 function acceptAuth(result){
   if(result.instance_id&&state.instance&&state.instance!==result.instance_id){serviceWarning('Программа была перезапущена. Обновите страницу, затем подключите ключ доступа и продолжите задание. История и скачанные файлы сохранены.',true);return;}
   if(result.instance_id)state.instance=result.instance_id;
@@ -65,7 +65,7 @@ function acceptAuth(result){
 async function api(path,data){
   const controller=new AbortController(),purpose=requestPurpose(path,data);
   const timeout=path==='/api/connect'?25000:path.endsWith('/action')?15000:data===undefined?15000:60000;
-  const timer=path==='/api/folder'?null:setTimeout(()=>controller.abort(),timeout);
+  const timer=setTimeout(()=>controller.abort(),timeout);
   const options={headers:{'X-CSRF-Token':csrf},credentials:'same-origin',cache:'no-store',signal:controller.signal};
   if(data!==undefined){options.method='POST';options.headers['Content-Type']='application/json';options.body=JSON.stringify(data);}
   try{
@@ -85,9 +85,25 @@ async function api(path,data){
   }finally{if(timer!==null)clearTimeout(timer);}
 }
 async function safely(fn){try{notice('');await fn();}catch(error){notice(error.message);}}
+function singleFlight(operation){let current=null;return(...args)=>{if(!current)current=Promise.resolve().then(()=>operation(...args)).finally(()=>{current=null;});return current;};}
 function connection(connected){state.connected=connected;$('connection').textContent=connected?'Диск подключён':'Не подключён';$('connection').classList.toggle('online',connected);$('auth-form').hidden=connected;$('disconnect').hidden=!connected;$('estimate').disabled=!connected||!!state.activeJob;$('refresh').disabled=!connected;$('next-page').disabled=!connected||!state.hasMore;$('prev-page').disabled=!connected||state.offset===0;}
 function breadcrumb(){const holder=$('breadcrumbs');holder.replaceChildren();const parts=state.path==='disk:/'?[]:state.path.slice(6).split('/');let path='disk:/';const root=node('button','Диск');root.onclick=()=>safely(()=>browse('disk:/',0,true));holder.append(root);for(const part of parts){holder.append(node('span','/','muted'));path=path.replace(/\/$/,'')+'/'+part;const target=path;const button=node('button',part);button.onclick=()=>safely(()=>browse(target,0,true));holder.append(button);}$('up').disabled=parts.length===0||!state.connected;$('back').disabled=!state.history.length||!state.connected;}
-async function browse(path=state.path,offset=0,remember=false){if(!state.connected)return;const version=++state.browseVersion;$('file-list').replaceChildren(node('div','Загрузка списка…','empty'));if(remember&&path!==state.path)state.history.push({path:state.path,offset:state.offset});const result=await api('/api/browse?'+new URLSearchParams({path,offset,sort:$('sort').value}));if(version!==state.browseVersion)return;Object.assign(state,{path:result.path,offset:result.offset,items:result.items,total:result.total,hasMore:result.has_more});breadcrumb();renderFiles();$('page-info').textContent=`${state.items.length?state.offset+1:0}–${state.offset+state.items.length}${state.total===null?'':' из '+state.total} · выбор не ограничен страницей`;$('prev-page').disabled=state.offset===0;$('next-page').disabled=!state.hasMore;}
+async function browse(path=state.path,offset=0,remember=false){
+  if(!state.connected)return;
+  const version=++state.browseVersion;
+  $('file-list').replaceChildren(node('div','Загрузка списка…','empty'));
+  try{
+    const result=await api('/api/browse?'+new URLSearchParams({path,offset,sort:$('sort').value}));
+    if(version!==state.browseVersion)return;
+    if(remember&&path!==state.path)state.history.push({path:state.path,offset:state.offset});
+    Object.assign(state,{path:result.path,offset:result.offset,items:result.items,total:result.total,hasMore:result.has_more});
+    breadcrumb();renderFiles();$('page-info').textContent=`${state.items.length?state.offset+1:0}–${state.offset+state.items.length}${state.total===null?'':' из '+state.total} · выбор не ограничен страницей`;
+    $('prev-page').disabled=state.offset===0;$('next-page').disabled=!state.hasMore;
+  }catch(error){
+    if(version===state.browseVersion){const message=node('div',error.message,'empty'),retry=node('button','Повторить получение списка');retry.onclick=()=>safely(()=>browse(path,offset,remember));message.append(retry);$('file-list').replaceChildren(message);}
+    throw error;
+  }
+}
 function updateSelection(){const whole=$('whole-disk').checked;$('selection-count').textContent=whole?'Выбран весь Диск':`Выбрано: ${selected.size}`;const items=visibleItems();$('select-page').disabled=whole||!items.length;$('select-page').checked=items.length>0&&items.every(item=>selected.has(item.path));$('select-page').indeterminate=items.some(item=>selected.has(item.path))&&!$('select-page').checked;const holder=$('selected-paths');holder.replaceChildren();if(whole){holder.textContent='disk:/ · весь Диск';return;}if(!selected.size){holder.textContent='Выбор пуст';return;}for(const path of selected){const row=node('div',path);holder.append(row);}}
 function visibleItems(){const query=$('filter').value.toLocaleLowerCase('ru-RU');return state.items.filter(item=>(item.name||'').toLocaleLowerCase('ru-RU').includes(query));}
 function checkbox(item){const box=node('input');box.type='checkbox';box.checked=selected.has(item.path);box.disabled=$('whole-disk').checked;box.setAttribute('aria-label','Выбрать '+item.name);box.onchange=()=>{if(box.checked)selected.add(item.path);else selected.delete(item.path);renderFiles();};return box;}
@@ -97,9 +113,10 @@ function renderFiles(){state.thumbVersion++;state.thumbnailObserver?.disconnect(
 function loadThumbnails(){const version=state.thumbVersion;const queue=[];let running=0;const observer=new IntersectionObserver(entries=>{for(const entry of entries){if(entry.isIntersecting){observer.unobserve(entry.target);queue.push(entry.target);}}pump();},{root:$('file-list'),rootMargin:'100px'});state.thumbnailObserver=observer;for(const el of $('file-list').querySelectorAll('[data-preview-path]'))observer.observe(el);async function pump(){if(version!==state.thumbVersion){observer.disconnect();return;}while(running<2&&queue.length){const el=queue.shift();running++;const controller=new AbortController();state.thumbnailControllers.add(controller);(async()=>{try{const response=await fetch('/api/thumbnail?'+new URLSearchParams({path:el.dataset.previewPath,size:state.view==='grid'?'M':'S'}),{headers:{'X-CSRF-Token':csrf},credentials:'same-origin',cache:'no-store',signal:controller.signal});if(!response.ok)return;const blob=await response.blob();if(version!==state.thumbVersion||!state.connected)return;const url=URL.createObjectURL(blob);state.urls.push(url);const img=node('img');img.src=url;img.alt='';el.replaceChildren(img);}catch{}finally{state.thumbnailControllers.delete(controller);running--;pump();}})();}}}
 function advancedSettings(){return {create_zip:$('create-zip').checked,adaptive_workers:false,resume_parts:$('resume-parts').checked,auto_pause:$('auto-pause').checked,max_disk_percent:Number($('max-disk-percent').value),speed_limit_mib:Number($('speed-limit').value),exclusions:$('exclusions').value.split(/\r?\n/).map(value=>value.trim()).filter(Boolean)};}
 function settings(){return {operation:$('operation').value,missing_policy:$('missing-policy').value,paths:[...selected],whole_disk:$('whole-disk').checked,destination:$('destination').value,mode:$('mode').value,file_types:$('file-types')?[...document.querySelectorAll('input[name=file-type]:checked')].map(el=>el.value):['photos','videos','music','files'],preview_size:$('preview-size').value,workers:Number($('workers').value),attempts:Number($('retries').value),timeout:Number($('timeout').value),total_timeout:Number($('total-timeout').value),reports:[...document.querySelectorAll('input[name=report]:checked')].map(el=>el.value),...advancedSettings()};}
-async function refreshJobs(){const result=await api('/api/status');renderRunning(result.active_job);const history=$('job-history');history.replaceChildren();if(!result.jobs.length){history.append(new Option('Нет заданий',''));$('job-content').hidden=true;return;}for(const job of result.jobs)history.append(new Option(`${job.title||job.root.split(/[\\/]/).pop()||job.id.slice(0,8)} · ${phases[job.phase]||job.phase}`,job.id));if(!state.job||!result.jobs.some(job=>job.id===state.job))state.job=result.active_job?.id||result.jobs[0].id;history.value=state.job;showPanel('job');await pollJob();}
+async function refreshJobs(){const result=await api('/api/status');renderRunning(result.active_job);const history=$('job-history');history.replaceChildren();if(!result.jobs.length){history.append(new Option('Нет заданий',''));$('job-content').hidden=true;return;}for(const job of result.jobs)history.append(new Option(`${job.title||String(job.root||'').split(/[\\/]/).pop()||job.id.slice(0,8)} · ${phases[job.phase]||job.phase}`,job.id));if(!state.job||!result.jobs.some(job=>job.id===state.job))state.job=result.active_job?.id||result.jobs[0].id;history.value=state.job;showPanel('job');await pollJob();}
 function counter(holder,label,value,wide=false){const div=node('div',undefined,wide?'storage-counter':undefined);div.append(node('span',label),node('strong',String(value)));holder.append(div);}
 function renderJobCounters(job){
+  if(job.statistics_pending){$('counters').replaceChildren(node('p',job.statistics_error||'Считаем сохранённые файлы в фоне…','hint'));$('extra-counters').replaceChildren();return;}
   const main=$('counters');
   const extra=$('extra-counters');
   main.replaceChildren();
@@ -124,6 +141,7 @@ function renderJobCounters(job){
   ])counter(extra,label,value);
 }
 function renderEstimate(job){
+  if(job.statistics_pending){$('estimate-info').hidden=true;return;}
   const estimate=job.estimate;
   const holder=$('estimate-info');
   const details=$('estimate-details');
@@ -169,14 +187,14 @@ async function pollJob(){
     }
 
     const option=$('job-history').selectedOptions[0];
-    if(option&&option.value===job.id)option.textContent=(job.title||job.root.split(/[\\/]/).pop()||job.id.slice(0,8))+' · '+(phases[job.phase]||job.phase);
+    if(option&&option.value===job.id)option.textContent=(job.title||String(job.root||'').split(/[\\/]/).pop()||job.id.slice(0,8))+' · '+(phases[job.phase]||job.phase);
     $('job-content').hidden=false;
     $('phase').textContent=phases[job.phase]||job.phase;
     const packing=job.phase==='packing'||(job.phase==='paused'&&job.zip_total&&job.zip_done<job.zip_total);
     const percent=packing?(job.zip_total?Math.min(100,job.zip_done*100/job.zip_total):0):job.percent;
-    if(job.phase==='scanning'||!job.scan_complete&&!packing){
+    if(job.statistics_pending||job.phase==='scanning'||!job.scan_complete&&!packing){
       $('progress').removeAttribute('value');
-      $('percentage').textContent='Ищем файлы…';
+      $('percentage').textContent=job.statistics_pending?'Получаем статистику…':'Ищем файлы…';
     }else{
       $('progress').value=percent??0;
       $('percentage').textContent=(percent??0).toLocaleString('ru-RU',{maximumFractionDigits:1})+'%'+(packing?' ZIP':' обработано');
@@ -226,8 +244,8 @@ async function pollJob(){
     $('pack-job').textContent=job.zip_path?'Пересобрать ZIP':'Собрать ZIP';
     if(typeof renderDismissibleNetwork==='function')renderDismissibleNetwork(job);
     else{$('network-warning').hidden=!job.network_waiting;$('network-warning').textContent=job.network_warning||'';}
-    const completenessMessage=['completed','completed_with_errors'].includes(job.phase)?(job.scan_errors?'Обход завершился с ошибками: часть папок могла остаться непроверенной. ':!job.completeness.no_result&&!job.completeness.preview_only?'Все выбранные файлы сохранены в оригинале. ':'')+(job.completeness.preview_only?'Только превью: '+job.completeness.preview_only+'. Это уменьшенные копии. ':'')+(job.completeness.no_result?'Без результата: '+job.completeness.no_result+'. ':''):'';
-    const resultMessage=job.pause_reason||job.error||completenessMessage||(job.phase==='completed_with_errors'?'Результат неполный.':job.phase==='stopped'?'Остановлено. Незавершённых файлов: '+job.cancelled+'.':'');
+    const completenessMessage=!job.statistics_pending&&['completed','completed_with_errors'].includes(job.phase)?(job.scan_errors?'Обход завершился с ошибками: часть папок могла остаться непроверенной. ':!job.completeness.no_result&&!job.completeness.preview_only?'Все выбранные файлы сохранены в оригинале. ':'')+(job.completeness.preview_only?'Только превью: '+job.completeness.preview_only+'. Это уменьшенные копии. ':'')+(job.completeness.no_result?'Без результата: '+job.completeness.no_result+'. ':''):'';
+    const resultMessage=job.pause_reason||job.error||job.statistics_error||completenessMessage||(job.phase==='completed_with_errors'?'Результат неполный.':job.phase==='stopped'?'Остановлено. Незавершённых файлов: '+job.cancelled+'.':'');
     if(typeof renderDismissibleResult==='function')renderDismissibleResult(job,resultMessage);else $('result-info').textContent=resultMessage;
     if(job.zip_path){
       $('download-zip').hidden=false;
@@ -271,7 +289,7 @@ function renderRunning(job){
   $('stop-active').textContent=stopping?'Останавливаем…':!job.scan_complete?'Остановить обход':'Остановить';
   $('stop-active').disabled=state.stopPending||stopping||['completed','completed_with_errors'].includes(job.phase);
 }
-async function refreshActivity(){if(state.closing)return;const result=await api('/api/status');renderRunning(result.active_job);}
+async function refreshActivity(){if(state.closing||state.activityPending)return;state.activityPending=true;try{const result=await api('/api/status');renderRunning(result.active_job);}finally{state.activityPending=false;}}
 async function exitApplication(){
   if(state.closing)return;
   if(typeof askConfirmation==='function'&&!await askConfirmation('Завершить приложение? Текущая работа остановится, прогресс сохранится.'))return;
@@ -286,7 +304,7 @@ $('quit-app').onclick=()=>safely(exitApplication);
 setInterval(()=>{if(!state.closing)refreshActivity().catch(()=>{});},3000);
 
 async function retrySelected(paths){await api('/api/jobs/'+state.job+'/action',{action:'retry_selected',paths,limits:runtimeLimits()});errorSelections.clear();await pollJob();}
-$('auth-form').onsubmit=event=>{event.preventDefault();if(state.authBusy)return;safely(async()=>{state.authBusy=true;$('connect').disabled=true;$('connect').textContent='Проверяем ключ…';try{await api('/api/connect',{token:$('token').value.trim()});$('token').value='';await refreshJobs();await browse('disk:/');notice('Диск подключён.'+(state.job?' Откройте задание и нажмите «Продолжить», чтобы вернуться к загрузке.':''));}finally{state.authBusy=false;$('connect').disabled=false;$('connect').textContent='Подключить';}});};
+$('auth-form').onsubmit=event=>{event.preventDefault();if(state.authBusy)return;safely(async()=>{state.authBusy=true;$('connect').disabled=true;$('connect').textContent='Проверяем ключ…';try{await api('/api/connect',{token:$('token').value.trim()});$('token').value='';const results=await Promise.allSettled([refreshJobs(),browse('disk:/')]);const failed=results.filter(item=>item.status==='rejected').map(item=>item.reason.message);notice('Диск подключён.'+(failed.length?' '+failed.join(' '):state.job?' Откройте задание и нажмите «Продолжить», чтобы вернуться к загрузке.':''));}finally{state.authBusy=false;$('connect').disabled=false;$('connect').textContent='Подключить';}});};
 $('disconnect').onclick=()=>safely(async()=>{await api('/api/disconnect',{});state.browseVersion++;state.thumbVersion++;for(const url of state.urls)URL.revokeObjectURL(url);state.urls=[];state.items=[];$('file-list').replaceChildren(node('div','Диск отключён. Для продолжения вставьте ключ доступа вверху страницы. Скачанные файлы и история сохранены.','empty'));await pollJob();});
 $('refresh').onclick=()=>safely(()=>browse(state.path,state.offset));
 $('sort').onchange=()=>safely(()=>browse());
@@ -301,7 +319,7 @@ $('thumb-size').oninput=()=>document.documentElement.style.setProperty('--thumb'
 $('select-page').onchange=()=>{for(const item of visibleItems()){if($('select-page').checked)selected.add(item.path);else selected.delete(item.path);}renderFiles();};
 $('clear-selection').onclick=()=>{selected.clear();renderFiles();};
 $('whole-disk').onchange=renderFiles;
-$('choose-folder').onclick=()=>safely(async()=>{$('choose-folder').disabled=true;try{const result=await api('/api/folder',{});if(result.path)$('destination').value=result.path;}finally{$('choose-folder').disabled=false;}});
+$('choose-folder').onclick=()=>safely(async()=>{$('choose-folder').disabled=true;try{const path=await chooseFolder($('destination').value);if(path)$('destination').value=path;}finally{$('choose-folder').disabled=false;}});
 $('estimate').onclick=()=>safely(async()=>{$('estimate').disabled=true;try{const result=await api('/api/jobs',settings());state.job=result.id;state.restoreLimits=true;state.limitsTouched=false;state.errorOffset=0;errorSelections.clear();await refreshJobs();}finally{$('estimate').disabled=!state.connected||!!state.activeJob;}});
 $('refresh-jobs').onclick=()=>safely(refreshJobs);
 $('job-history').onchange=()=>{state.job=$('job-history').value;state.restoreLimits=true;state.limitsTouched=false;state.errorOffset=0;errorSelections.clear();safely(pollJob);};
@@ -315,8 +333,8 @@ $('open-journal').onclick=()=>safely(()=>api('/api/jobs/'+state.job+'/open-journ
 $('retry-selected').onclick=()=>safely(()=>retrySelected([...errorSelections]));
 $('settings-tab').onclick=()=>showPanel('settings');
 $('job-tab').onclick=()=>showPanel('job');
-initializePanel();initializeHelp();connection(false);breadcrumb();updateSelection();safely(async()=>{await refreshJobs();if(state.connected)await browse();});
-setInterval(()=>{if(!state.closing)pollJob().catch(error=>{if(!state.closing)notice(error.message);});},1000);
+initializePanel();initializeHelp();connection(false);breadcrumb();updateSelection();safely(async()=>{try{await refreshJobs();}finally{if(state.connected)await browse();}});
+setInterval(()=>{if(!state.closing&&state.job&&!state.polling&&Date.now()>=(state.nextPoll||0))pollJob().then(()=>{state.pollFailures=0;state.nextPoll=0;}).catch(error=>{state.pollFailures=Math.min(4,(state.pollFailures||0)+1);state.nextPoll=Date.now()+Math.min(15000,1000*2**state.pollFailures);if(!state.closing)serviceWarning(error.message);});},1000);
 
 function excludePaths(paths){const input=$('exclusions');input.value=[...new Set([...input.value.split(/\r?\n/).filter(Boolean),...paths])].join('\n');for(const path of paths)selected.delete(path);renderFiles();notice('Добавлено в исключения: '+paths.length);}
 function excludeButton(item){const button=node('button','⊖','exclude-button');button.title='Исключить '+item.name;button.setAttribute('aria-label',button.title);button.onclick=()=>excludePaths([item.path]);return button;}
@@ -327,3 +345,20 @@ $('resume-policy').onchange=()=>{};
 $('recheck-service').onclick=()=>safely(async()=>{$('recheck-service').disabled=true;try{await refreshJobs();notice('Связь с программой восстановлена. Состояние задания обновлено.');}finally{$('recheck-service').disabled=false;}});
 $('reload-page').onclick=()=>location.reload();
 $('open-job-folder').onclick=()=>safely(()=>api('/api/jobs/'+state.job+'/open-folder',{}));
+
+async function chooseFolder(initial=''){if(typeof chooseFolderInApp==='function')return chooseFolderInApp(initial);return chooseNativeFolder(initial);}
+async function chooseNativeFolder(initial=''){
+  if(state.folderSelection)return state.folderSelection;
+  state.folderSelection=(async()=>{
+    let result=await api('/api/folder',{initial});
+    const id=result.request_id;
+    while(result.busy&&!state.closing){
+      await new Promise(resolve=>setTimeout(resolve,400));
+      result=await api('/api/folder');
+      if(result.request_id!==id)throw Error('Выбор папки изменился в другом окне. Нажмите кнопку выбора ещё раз.');
+    }
+    if(result.error)throw Error(result.error);
+    return result.path||'';
+  })();
+  try{return await state.folderSelection;}finally{state.folderSelection=null;}
+}

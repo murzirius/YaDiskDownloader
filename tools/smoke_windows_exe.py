@@ -44,6 +44,23 @@ def native_tray_window(pids):
     return matches[-1] if len(matches) == 2 else None
 
 
+def seed_interrupted_history(directory):
+    from disk_downloader.store import Store
+    from disk_downloader.engine import Engine
+    from disk_downloader.api import DiskAPI, Credentials
+    root = Path(directory)/'Результаты'
+    root.mkdir()
+    (root/'Вложенная папка').mkdir()
+    store = Store(Path(directory)/'state/jobs.sqlite3')
+    settings = Engine(store, DiskAPI(Credentials())).validate_settings({
+        'destination':str(root),'whole_disk':True,'auto_pause':False})
+    with store.db() as db:
+        db.execute('INSERT INTO jobs(id,settings,root,service,phase,started,scan_complete) VALUES(?,?,?,?,?,?,?)',
+                   ('interrupted-smoke',json.dumps(settings),str(root),str(root),'downloading','2026-01-01T00:00:00Z',1))
+        db.execute("INSERT INTO job_queue(job,position,action,state) VALUES('interrupted-smoke',1,'resume','running')")
+    return root
+
+
 def run(executable, output):
     if os.name != 'nt':
         raise RuntimeError('Windows only')
@@ -51,6 +68,7 @@ def run(executable, output):
     results = []
     for exit_mode in ('web', 'native_tray'):
         with tempfile.TemporaryDirectory(prefix='yadisk-exe-smoke-') as directory:
+            root = seed_interrupted_history(directory)
             with socket.socket() as probe:
                 probe.bind(('127.0.0.1',0))
                 port = probe.getsockname()[1]
@@ -80,9 +98,23 @@ def run(executable, output):
                     return value if value['tray']['visible'] else None
                 info = wait_until(runtime,20,'Native tray icon did not start')
                 assert info['frozen'] and info['safe_sqlite_wal'], info
+                from disk_downloader import __build__
+                assert info['build'] == __build__, info
+                state = session.get(base+'/api/status',headers=headers,timeout=3).json()
+                assert state['active_job'] is None and state['jobs'][0]['phase'] == 'interrupted', state
+                queue = session.get(base+'/api/queue',headers=headers,timeout=3).json()
+                assert queue['paused'] and queue['needs_confirmation'] and queue['items'][0]['state'] == 'waiting', queue
+                folders = session.get(base+'/api/local-folders',params={'path':str(root)},headers=headers,timeout=3)
+                folders.raise_for_status()
+                assert folders.json()['folders'] == [{'name':'Вложенная папка','path':str(root/'Вложенная папка')}], folders.text
+                status = session.get(base+'/api/jobs/interrupted-smoke',headers=headers,timeout=3)
+                status.raise_for_status()
+                assert not status.json()['live'] and status.json()['can_resume'], status.text
                 for asset in re.findall(r'(?:src|href)="(/static/[^"?]+)',response.text):
                     asset_response = session.get(base+asset,timeout=5)
                     assert asset_response.status_code == 200, asset
+                    expected = Path(__file__).resolve().parents[1]/'disk_downloader'/asset.lstrip('/')
+                    assert asset_response.content == expected.read_bytes(), 'Stale frozen asset: '+asset
                 assert session.post(base+'/api/exit',json={},headers={'Origin':base},timeout=3).status_code == 403
                 owned_pids = children(process.pid)
                 assert owned_pids, 'Frozen child process was not found'
@@ -112,7 +144,7 @@ def run(executable, output):
                             handle.Close()
                 from run import lock_state
                 lock_state(Path(directory)/'state').close()
-                results.append({'exit':exit_mode,'runtime':info,'startup_seconds':round(quit_started-started,2),'exit_seconds':round(time.monotonic()-quit_started,2),'port_released':True,'children_exited':True})
+                results.append({'exit':exit_mode,'runtime':info,'startup_seconds':round(quit_started-started,2),'exit_seconds':round(time.monotonic()-quit_started,2),'port_released':True,'children_exited':True,'local_folder_picker':True,'interrupted_history':True,'queue_waits_for_user':True})
             finally:
                 session.close()
                 if process.poll() is None:

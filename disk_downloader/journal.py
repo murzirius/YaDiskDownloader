@@ -121,7 +121,9 @@ class Journal:
                         current = json.loads(db.execute("SELECT settings FROM jobs WHERE id=?", (self.job_id,)).fetchone()[0])
                         current.update(journal_local=relative, journal_key=key)
                         db.execute("UPDATE jobs SET settings=? WHERE id=?", (json.dumps(current, ensure_ascii=False), self.job_id))
-                status = self.engine.status(self.job_id)
+                # Journal needs database totals, never a UI snapshot that may
+                # acquire engine locks or stat thousands of local files.
+                status = self.store.summary(self.job_id)
                 updated = datetime.now(timezone.utc).isoformat()
                 summary = {"updated": updated, "id": self.job_id[:12], "phase": PHASES.get(status["phase"], status["phase"]), "files": status["files"], "processed": status["processed"], "saved_bytes": status["saved_bytes"], "root": self.clean(job["root"]), "groups": GROUPS}
                 with self.store.db() as db:

@@ -28,6 +28,8 @@ from .recovery import recover_publications
 from .updater import Installer
 from .service_outputs import root_key, digest_file
 from .limits import normalize_saved_workers
+from .folder_dialog import FolderPicker
+from .request_errors import RequestErrors
 
 
 def create_app(state_dir=None, api=None, port=8766):
@@ -46,7 +48,12 @@ def create_app(state_dir=None, api=None, port=8766):
     app.extensions['installer'] = installer
     app.extensions.update(engine=engine, store=store, disk_api=api, updates=updates, management=management, maintenance=maintenance, backups=backups, recovered=recovered)
     thumbnail_slots = threading.BoundedSemaphore(3)
-    dialog_lock = threading.Lock()
+    browse_slots = threading.BoundedSemaphore(2)
+    local_folder_slots = threading.BoundedSemaphore(2)
+    folder_picker = FolderPicker()
+    app.extensions['folder_picker'] = folder_picker
+    request_errors = RequestErrors(state)
+    engine.request_errors = request_errors
     auth_lock = threading.Lock()
     instance_id = secrets.token_hex(8)
 
@@ -85,12 +92,13 @@ def create_app(state_dir=None, api=None, port=8766):
     @app.errorhandler(Exception)
     def errors(exc):
         request_id = secrets.token_hex(4)
-        context = {"connect": "Проверка ключа доступа в Яндекс.Диске", "browse": "Получение списка файлов Яндекс.Диска", "job_status": "Обновление состояния задания", "status": "Чтение истории заданий", "job_action": "Управление заданием"}.get(request.endpoint, "Запрос к приложению на этом ПК")
+        context = {"local_folders":"Открытие папки на ПК", "queue_status":"Чтение очереди заданий", "queue_action":"Управление очередью заданий", "folder":"Выбор папки Windows", "folder_status":"Выбор папки Windows", "connect": "Проверка ключа доступа в Яндекс.Диске", "browse": "Получение списка файлов Яндекс.Диска", "job_status": "Обновление состояния задания", "status": "Чтение истории заданий", "job_action": "Управление заданием"}.get(request.endpoint, "Запрос к приложению на этом ПК")
         if isinstance(exc, HTTPException):
             return jsonify(error=exc.description, operation=context, code="session_expired" if exc.code == 403 and "вкладка" in exc.description else "http_error", request_id=request_id), exc.code
         if isinstance(exc, (ValueError, APIError, Suspended, OSError)):
             return jsonify(error=str(exc) if isinstance(exc, ValueError) else safe_error(exc), operation=context, code="yandex_error" if isinstance(exc, APIError) else "action_error", request_id=request_id, **auth_status()), 400
         app.logger.error("Request %s endpoint=%s exception=%s sqlite=%s", request_id, request.endpoint, type(exc).__name__, getattr(exc, "sqlite_errorname", ""))
+        request_errors.record(request_id, request.endpoint, exc)
         message = safe_error(exc) if isinstance(exc, sqlite3.Error) else "В приложении на этом ПК произошла ошибка. Прогресс уже сохранённых файлов остаётся в истории. Откройте «Сообщить об ошибке» и приложите диагностику."
         return jsonify(error=message, operation=context, code="local_database_error" if isinstance(exc, sqlite3.Error) else "internal_error", request_id=request_id), 500
 
@@ -112,7 +120,8 @@ def create_app(state_dir=None, api=None, port=8766):
         tray = app.extensions.get("tray")
         from .sqlite_support import safe_wal
         import sqlite3
-        return jsonify(sqlite=sqlite3.sqlite_version, safe_sqlite_wal=safe_wal(), version=__version__, frozen=frozen(), tray=tray.status() if tray else {"visible": False, "error": ""}, can_exit=bool(app.extensions.get("quit_app")), migration=app.extensions.get("migration", {"jobs": 0, "failed_sources": 0}))
+        from . import __build__
+        return jsonify(sqlite=sqlite3.sqlite_version, safe_sqlite_wal=safe_wal(), version=__version__, build=__build__, frozen=frozen(), tray=tray.status() if tray else {"visible": False, "error": ""}, can_exit=bool(app.extensions.get("quit_app")), migration=app.extensions.get("migration", {"jobs": 0, "failed_sources": 0}))
 
     @app.post("/api/exit")
     def exit_app():
@@ -236,10 +245,7 @@ def create_app(state_dir=None, api=None, port=8766):
 
     @app.get("/api/status")
     def status():
-        jobs = []
-        for row in store.rows("SELECT id FROM jobs WHERE archived=0 ORDER BY started DESC LIMIT 30"):
-            job = engine.reconcile(row["id"])
-            jobs.append({k: job[k] for k in ("id", "title", "phase", "started", "root")})
+        jobs = list(store.rows("SELECT id,title,phase,started,root FROM jobs WHERE archived=0 ORDER BY started DESC LIMIT 30"))
         active = None
         for job_id, thread in tuple(engine.threads.items()):
             if thread.is_alive():
@@ -306,6 +312,7 @@ def create_app(state_dir=None, api=None, port=8766):
             safety=backups.restore(data.get('name'))
             credentials.clear()
             engine.controls.clear(); engine.threads.clear(); management.armed=False
+            engine.status_cache.invalidate()
         return jsonify(ok=True,safety_copy=safety)
 
     @app.get('/api/notifications')
@@ -341,7 +348,6 @@ def create_app(state_dir=None, api=None, port=8766):
             with engine.lock:
                 engine.ensure_idle()
                 credentials.set(token, expected_epoch=epoch)
-                management.armed = True
             return jsonify(**auth_status())
         finally:
             token = None
@@ -359,7 +365,12 @@ def create_app(state_dir=None, api=None, port=8766):
         sort = request.args.get("sort", "name")
         if not offset.isascii() or not offset.isdigit() or len(offset) > 8 or sort not in ("name", "-name", "size", "-size", "modified", "-modified"):
             raise ValueError("Некорректные параметры списка")
-        data = api.metadata(path, {"preview_size": "S"}, offset=int(offset), limit=100, sort=sort)
+        if not browse_slots.acquire(blocking=False):
+            raise ValueError("Список папки уже загружается. Дождитесь ответа; повторно нажимать кнопку не нужно.")
+        try:
+            data = api.metadata(path, {"preview_size": "S", "attempts": 1, "timeout": 12, "total_timeout": 12}, offset=int(offset), limit=100, sort=sort)
+        finally:
+            browse_slots.release()
         embedded = data.get("_embedded", {})
         items = []
         for item in embedded.get("items", []):
@@ -410,21 +421,21 @@ def create_app(state_dir=None, api=None, port=8766):
 
     @app.post("/api/folder")
     def folder():
-        if not dialog_lock.acquire(blocking=False):
-            raise ValueError("Диалог выбора папки уже открыт")
+        return jsonify(folder_picker.start(payload().get('initial', '')))
+
+    @app.get("/api/folder")
+    def folder_status():
+        return jsonify(folder_picker.snapshot())
+
+    @app.get('/api/local-folders')
+    def local_folders():
+        if not local_folder_slots.acquire(blocking=False):
+            raise ValueError('Папка ещё открывается. Можно отменить выбор и вставить путь вручную.')
         try:
-            import tkinter
-            from tkinter import filedialog
-            root = tkinter.Tk()
-            root.withdraw()
-            root.attributes("-topmost", True)
-            try:
-                directory = filedialog.askdirectory(title="Папка для результатов Яндекс.Диска", parent=root)
-            finally:
-                root.destroy()
-            return jsonify(path=directory)
+            from .local_folders import listing
+            return jsonify(listing(request.args.get('path', '')))
         finally:
-            dialog_lock.release()
+            local_folder_slots.release()
 
     @app.post("/api/jobs")
     def create_job():
@@ -434,7 +445,7 @@ def create_app(state_dir=None, api=None, port=8766):
 
     @app.get("/api/jobs/<job_id>")
     def job_status(job_id):
-        return jsonify(engine.status(job_id) | auth_status())
+        return jsonify(engine.status_cache.snapshot(store.job(job_id)) | auth_status())
 
     @app.get("/api/jobs/<job_id>/errors")
     def job_errors(job_id):

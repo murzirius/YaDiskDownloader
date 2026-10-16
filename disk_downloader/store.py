@@ -173,12 +173,42 @@ class Store:
             raise ValueError("Задание не найдено")
         result = dict(row)
         try:
+            if not isinstance(result['root'], str) or not Path(result['root']).is_absolute():
+                result['root'] = ''
+                raise ValueError()
             result["settings"] = json.loads(result["settings"])
             if not isinstance(result["settings"], dict):
                 raise ValueError()
             normalize_saved_workers(result['settings'])
+            defaults = {"mode":"fallback", "preview_size":"XXXL", "reports":["json"],
+                        "file_types":["photos","videos","music","files"], "paths":[],
+                        "whole_disk":False, "destination":result["root"], "workers":8,
+                        "attempts":1, "retries":0, "timeout":20, "total_timeout":20,
+                        "missing_policy":"originals", "operation":"new", "exclusions":[]}
+            for key, value in defaults.items():
+                result['settings'].setdefault(key, value)
+            settings = result['settings']
+            if settings['mode'] not in ('previews','both','fallback') or settings['preview_size'] not in ('S','M','L','XL','XXL','XXXL'):
+                raise ValueError()
+            if any(not isinstance(settings[key], list) for key in ('paths','reports','file_types')):
+                raise ValueError()
+            if not settings['paths'] or any(not isinstance(path, str) or not path.startswith('disk:/') for path in settings['paths']):
+                raise ValueError()
+            if not settings['reports'] or any(value not in ('json','csv','html','txt') for value in settings['reports']):
+                raise ValueError()
+            if (not isinstance(settings['exclusions'], list)
+                    or any(not isinstance(value, str) for value in settings['exclusions'])
+                    or any(value not in ('photos','videos','music','files') for value in settings['file_types'])
+                    or not settings['file_types']
+                    or settings['operation'] not in ('new','missing')
+                    or settings['missing_policy'] not in ('originals','any_result')
+                    or not isinstance(settings['whole_disk'], bool)):
+                raise ValueError()
+            if any(isinstance(settings[key], bool) or not isinstance(settings[key], int) or not low <= settings[key] <= high for key,low,high in (('attempts',1,9),('timeout',5,3600),('total_timeout',0,86400))):
+                raise ValueError()
         except (ValueError, TypeError):
-            result["settings"] = {"_invalid": True, "mode": "fallback", "preview_size": "XXXL", "reports": ["json"], "file_types": ["photos", "videos", "music", "files"], "paths": [], "whole_disk": False, "destination": result["root"], "workers": 8, "attempts": 1, "retries": 0, "timeout": 20}
+            result["settings"] = {"_invalid": True, "mode": "fallback", "preview_size": "XXXL", "reports": ["json"], "file_types": ["photos", "videos", "music", "files"], "paths": [], "whole_disk": False, "destination": result["root"], "workers": 8, "attempts": 1, "retries": 0, "timeout": 20, "total_timeout": 20}
+            result['error'] = "Настройки этого задания повреждены или неполны. Скачанные файлы сохранены. Выберите «Дозагрузить недостающее» и укажите прежнюю папку; создавать другие задания можно."
         return result
 
     def update_job(self, job_id, **fields):

@@ -12,6 +12,12 @@ class FolderUsage:
         self.folders = {}
 
     def snapshot(self, root, force=False):
+        try:
+            root = os.fspath(root)
+        except TypeError:
+            root = ''
+        if not isinstance(root, str) or not root or not Path(root).is_absolute():
+            return {"bytes":None,"updated":None,"scanning":False}
         root = str(Path(root).absolute())
         with self.lock:
             item = self.folders.setdefault(root, {"bytes": None, "updated": None, "scanning": False, "due": 0})

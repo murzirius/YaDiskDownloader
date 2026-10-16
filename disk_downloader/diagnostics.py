@@ -10,11 +10,11 @@ from .sqlite_support import safe_wal
 import zipfile
 from datetime import datetime, timezone
 
-from . import __version__
+from . import __version__, __build__
 from .paths import publish, reserve_output, safe_join, temporary_file
 
 
-SETTINGS = ("mode", "preview_size", "file_types", "workers", "attempts", "timeout", "total_timeout", "reports", "create_zip", "auto_pause", "max_disk_percent", "adaptive_workers", "resume_parts", "operation", "speed_limit_mib")
+SETTINGS = ("mode", "preview_size", "file_types", "workers", "attempts", "timeout", "total_timeout", "reports", "create_zip", "auto_pause", "max_disk_percent", "adaptive_workers", "resume_parts", "operation", "speed_limit_mib", "missing_policy")
 
 
 def error_kind(value):
@@ -29,11 +29,16 @@ def bundle(engine, job_id):
     salt = secrets.token_bytes(32)
     def source_id(path):
         return hashlib.sha256(salt + path.encode()).hexdigest()[:16]
-    status = engine.status(job_id)
+    status = engine.status_cache.snapshot(engine.store.job(job_id))
     summary = {key: status.get(key) for key in ("phase", "files", "folders", "processed", "originals", "previews", "errors", "scan_errors", "cancelled", "replacements", "missing_previews", "saved_bytes", "downloaded", "zip_bytes", "partial_bytes", "free_bytes", "workers_status")}
     summary["error_type"] = error_kind(status["error"])
+    summary['statistics_pending'] = bool(status.get('statistics_pending'))
+    if summary['statistics_pending']:
+        for key in summary:
+            if key not in ('phase', 'error_type', 'statistics_pending'):
+                summary[key] = None
     settings = {key: status["settings"][key] for key in SETTINGS if key in status["settings"]}
-    environment = {"app_version": __version__, "sqlite": sqlite3.sqlite_version, "safe_sqlite_wal": safe_wal(), "python": sys.version.split()[0], "system": platform.system(), "system_release": platform.release(), "architecture": platform.machine(), "created": datetime.now(timezone.utc).isoformat()}
+    environment = {"app_version": __version__, "app_build": __build__, "sqlite": sqlite3.sqlite_version, "safe_sqlite_wal": safe_wal(), "python": sys.version.split()[0], "system": platform.system(), "system_release": platform.release(), "architecture": platform.machine(), "created": datetime.now(timezone.utc).isoformat()}
     entries = []
     for row in engine.store.rows("SELECT path,status,error,original_status,preview_status,original_attempts,preview_attempts FROM entries WHERE job=? AND kind='file' AND (error!='' OR status IN ('error','cancelled','no_preview')) LIMIT 1000", (job_id,)):
         row["source_id"] = source_id(row.pop("path"))
@@ -52,7 +57,7 @@ def bundle(engine, job_id):
         if path:
             row["source_id"] = source_id(path)
         events.append(row)
-    return {"environment.json": environment, "settings.json": settings, "summary.json": summary, "errors.json": entries, "events.json": events}
+    return {"environment.json": environment, "settings.json": settings, "summary.json": summary, "errors.json": entries, "events.json": events, "requests.json": engine.request_errors.snapshot() if hasattr(engine, 'request_errors') else []}
 
 
 def write_bundle(engine, job_id):

@@ -27,6 +27,7 @@ from . import exclusions, rate_limit
 from .inventory import compare, write_changes
 from .network import NetworkWait
 from .limits import MAX_WORKERS
+from .status_cache import StatusCache
 
 
 def now():
@@ -158,6 +159,7 @@ class Engine:
         self.shutting_down = False
         self.folder_usage = FolderUsage()
         self.maintenance_busy = False
+        self.status_cache = StatusCache(self)
 
     def validate_settings(self, data):
         if "attempts" not in data and "retries" in data and (isinstance(data["retries"], bool) or not isinstance(data["retries"], int) or not 0 <= data["retries"] <= 8):
@@ -418,13 +420,21 @@ class Engine:
 
     def reconcile(self, job_id):
         """A dead worker must leave a task that can be resumed, never a busy button."""
-        with self.lock:
-            job = self.store.job(job_id)
+        job = self.store.job(job_id)
+        if not self.lock.acquire(blocking=False):
+            return job
+        try:
             thread = self.threads.get(job_id)
+            # The worker may have finished between the first read and this lock.
+            # Re-read before changing its durable phase.
+            if not thread or not thread.is_alive():
+                job = self.store.job(job_id)
             if (not thread or not thread.is_alive()) and job["phase"] in ("new", "scanning", "preparing", "downloading", "packing", "paused", "pausing", "stopping"):
                 self.store.update_job(job_id, phase="interrupted", error=job["error"] or "Работа приложения прервалась. Файлы и прогресс сохранены. Подключите Яндекс.Диск и нажмите «Продолжить».")
                 job = self.store.job(job_id)
             return job
+        finally:
+            self.lock.release()
 
     def status(self, job_id):
         self.reconcile(job_id)
