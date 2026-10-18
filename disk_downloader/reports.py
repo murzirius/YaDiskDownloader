@@ -56,6 +56,15 @@ def merged_records(store, job):
 
 def _write_reports(store, job_id, checkpoint, final_phase):
     job = store.job(job_id)
+    # Errors are current observations, not permanent history. Keep older errors
+    # only while a source remains outside this job's successfully scanned scope.
+    with store.db() as db:
+        if job['scan_complete']:
+            db.execute("""DELETE FROM report_records WHERE root=? AND kind='scan_error'
+              AND EXISTS(SELECT 1 FROM json_each(?) scope WHERE scope.value='disk:/' OR scope.value=report_records.path
+                OR substr(report_records.path,1,length(scope.value)+1)=scope.value||'/')
+              AND NOT EXISTS(SELECT 1 FROM scan_errors s WHERE s.job=? AND (s.path=report_records.path
+                OR substr(report_records.path,1,length(rtrim(s.path,'/'))+1)=rtrim(s.path,'/')||'/'))""", (root_key(job['root']),json.dumps(job['settings']['paths']),job_id))
     batch = []
     for record in records(store, job_id):
         checkpoint()

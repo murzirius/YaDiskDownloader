@@ -59,7 +59,7 @@ class Journal:
             self.error = "Не удалось записать событие журнала"
 
     def start(self, operation):
-        names = {"scan": "Начат обход выбранных источников", "download": "Начата загрузка или дозагрузка", "pack": "Начата повторная сборка ZIP"}
+        names = {"scan": "Начат обход выбранных источников", "download": "Начата загрузка или дозагрузка", "pack": "Начата повторная сборка ZIP", 'manifest':'Обновляем опись загрузки', 'journal':'Обновляем HTML-журнал'}
         self.event("system", names.get(operation, operation))
         self.flush()
         self.thread.start()
@@ -78,7 +78,7 @@ class Journal:
                     control=self.engine.controls.get(self.job_id)
                     if not self.stopped.is_set() and getattr(control,'phase',None)!='packing':
                         write_reports(self.store, self.job_id, checkpoint)
-                        save_import(self.store, self.job_id)
+                        save_import(self.store, self.job_id, checkpoint)
             except (OSError, sqlite3.Error, ValueError):
                 self.error = 'Не удалось обновить отчёты или опись'
             due += self.interval
@@ -88,8 +88,11 @@ class Journal:
     def close(self):
         self.stopped.set()
         if self.thread.is_alive():
-            self.thread.join()
-        self.flush()
+            self.thread.join(3)
+        if self.thread.is_alive():
+            self.error = 'События сохранены в истории. Обновление большого HTML-журнала ещё завершается.'
+            return
+        self.flush(final=True)
         with self.secret_lock:
             self.secrets.clear()
 
@@ -107,15 +110,21 @@ class Journal:
         except (UnicodeError, IsADirectoryError):
             return False
 
-    def flush(self):
+    def flush(self, final=False):
         temp = None
+        started = time.monotonic()
+        def checkpoint():
+            control = self.engine.controls.get(self.job_id)
+            worker_stopped = control and control.stopped and threading.current_thread() is self.engine.threads.get(self.job_id)
+            if (not final and ((threading.current_thread() is self.thread and self.stopped.is_set()) or worker_stopped)) or (final and control and control.stopped and time.monotonic()-started>3):
+                raise ValueError('HTML-журнал обновится позднее; события сохранены в истории')
         try:
             with self.write_lock:
                 job = self.store.job(self.job_id)
                 settings = job["settings"]
                 key = settings.get("journal_key") or uuid.uuid4().hex
                 marker = '<!doctype html><html lang="ru" data-journal="' + self.job_id + ":" + key + '">'
-                relative, replacing = location(self.store, job, 'journal', 'log.html')
+                relative, replacing = location(self.store, job, 'journal', 'log.html',checkpoint)
                 if settings.get("journal_local") != relative or settings.get("journal_key") != key:
                     with self.store.db() as db:
                         current = json.loads(db.execute("SELECT settings FROM jobs WHERE id=?", (self.job_id,)).fetchone()[0])
@@ -135,6 +144,7 @@ class Journal:
                     stream.write(marker + "\n" + before + '{"summary":' + encoded(summary) + ',"events":[')
                     first = True
                     for row in self.store.rows("SELECT e.time,e.category,e.level,e.message,e.path FROM journal_events e LEFT JOIN jobs j ON j.id=e.job LEFT JOIN journal_jobs jj ON jj.job=e.job WHERE COALESCE(j.root,jj.root)=? AND e.id<=? ORDER BY e.id", (job['root'], ceiling)):
+                        checkpoint()
                         if not first:
                             stream.write(",\n")
                         stream.write(encoded(dict(row)))
@@ -142,7 +152,7 @@ class Journal:
                     stream.write("]}" + after)
                     stream.flush()
                     os.fsync(stream.fileno())
-                finish(self.store, job, 'journal', relative, temp, replacing)
+                finish(self.store, job, 'journal', relative, temp, replacing,checkpoint)
                 self.saved = updated
                 self.error = ""
         except (OSError, sqlite3.Error, ValueError, UnicodeError):

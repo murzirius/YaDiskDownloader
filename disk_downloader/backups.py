@@ -128,7 +128,7 @@ class Backups:
                 for table in own:
                     target.execute('DELETE FROM "' + table + '"')
                 for table in own:
-                    if table not in tables or table in ('verification_cache', 'partial_ownership', 'pending_publications', 'service_outputs', 'pending_service_outputs', 'temporary_files'):
+                    if table not in tables or table in ('verification_cache', 'verification_results', 'partial_ownership', 'pending_publications', 'service_outputs', 'pending_service_outputs', 'temporary_files'):
                         continue
                     available = {r[1] for r in source.execute('PRAGMA table_info("' + table + '")')}
                     columns = [r[1] for r in target.execute('PRAGMA table_info("' + table + '")') if r[1] in available]

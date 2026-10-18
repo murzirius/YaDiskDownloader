@@ -6,12 +6,12 @@ from .paths import native
 
 
 class FolderUsage:
-    def __init__(self, interval=10):
+    def __init__(self, interval=300):
         self.interval = interval
         self.lock = threading.Lock()
         self.folders = {}
 
-    def snapshot(self, root, force=False):
+    def snapshot(self, root, force=False, active=False):
         try:
             root = os.fspath(root)
         except TypeError:
@@ -20,14 +20,23 @@ class FolderUsage:
             return {"bytes":None,"updated":None,"scanning":False}
         root = str(Path(root).absolute())
         with self.lock:
-            item = self.folders.setdefault(root, {"bytes": None, "updated": None, "scanning": False, "due": 0})
-            if not item["scanning"] and (force or time.monotonic() >= item["due"]):
+            item = self.folders.setdefault(root, {"bytes": None, "updated": None, "scanning": False, "due": 0, "error":"", "checked":0})
+            due = item['checked'] + (min(30, self.interval) if active else self.interval)
+            if not item["scanning"] and sum(value['scanning'] for value in self.folders.values()) < 2 and (force or not item['checked'] or time.monotonic() >= due):
                 item["scanning"] = True
-                threading.Thread(target=self.scan, args=(root,), daemon=True, name="disk-folder-usage").start()
+                try:
+                    threading.Thread(target=self.scan, args=(root,), daemon=True, name="disk-folder-usage").start()
+                except RuntimeError:
+                    item.update(scanning=False,error='На ПК не удалось начать подсчёт размера папки. Повторите обновление объёма позже.')
+            while len(self.folders)>64:
+                victim=next((key for key,value in self.folders.items() if key!=root and not value['scanning']),None)
+                if victim is None: break
+                del self.folders[victim]
             return dict(item)
 
     def scan(self, root):
         total = 0
+        error = ''
         queue = [native(root)]
         while queue:
             directory = queue.pop()
@@ -43,8 +52,8 @@ class FolderUsage:
                             else:
                                 total += entry.stat(follow_symlinks=False).st_size
                         except OSError:
-                            continue
+                            error = 'Часть файлов на ПК недоступна. Размер папки удалось проверить не полностью.'
             except OSError:
-                continue
+                error = 'Папка на ПК недоступна. Проверьте подключение диска и права доступа.'
         with self.lock:
-            self.folders[root].update(bytes=total, updated=time.time(), due=time.monotonic()+self.interval, scanning=False)
+            self.folders[root].update(bytes=None if error else total, updated=time.time(), due=time.monotonic()+self.interval, checked=time.monotonic(), scanning=False, error=error)

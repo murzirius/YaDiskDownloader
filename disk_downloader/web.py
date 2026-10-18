@@ -4,6 +4,8 @@ import secrets
 import threading
 import json
 import sqlite3
+import shutil
+import tempfile
 from pathlib import Path
 
 from flask import Flask, abort, jsonify, render_template, request, send_file, session
@@ -24,11 +26,12 @@ from .runtime import state_folder, destination_folder, frozen
 from .backups import Backups
 from .management import Management
 from .maintenance import Maintenance
-from .recovery import recover_publications
+from .recovery import Recovery
 from .updater import Installer
 from .service_outputs import root_key, digest_file
 from .limits import normalize_saved_workers
 from .folder_dialog import FolderPicker
+from .import_state import find_import
 from .request_errors import RequestErrors
 
 
@@ -38,15 +41,17 @@ def create_app(state_dir=None, api=None, port=8766):
     app.config.update(MAX_CONTENT_LENGTH=1024 * 1024, SESSION_COOKIE_NAME=f"disk_downloader_{port}", SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Strict", SEND_FILE_MAX_AGE_DEFAULT=0)
     state = Path(state_dir or state_folder())
     store = Store(state / "jobs.sqlite3")
-    recovered = recover_publications(store)
+    recovery = Recovery(store)
     credentials = api.credentials if api else Credentials()
     api = api or DiskAPI(credentials)
     engine = Engine(store, api)
+    engine.recovery = recovery
+    recovery.start()
     updates = Updates(store)
     management, maintenance, backups = Management(engine), Maintenance(engine), Backups(store)
     installer = Installer(engine,updates,backups,port)
     app.extensions['installer'] = installer
-    app.extensions.update(engine=engine, store=store, disk_api=api, updates=updates, management=management, maintenance=maintenance, backups=backups, recovered=recovered)
+    app.extensions.update(engine=engine, store=store, disk_api=api, updates=updates, management=management, maintenance=maintenance, backups=backups, recovered=0, recovery=recovery)
     thumbnail_slots = threading.BoundedSemaphore(3)
     browse_slots = threading.BoundedSemaphore(2)
     local_folder_slots = threading.BoundedSemaphore(2)
@@ -58,7 +63,15 @@ def create_app(state_dir=None, api=None, port=8766):
     instance_id = secrets.token_hex(8)
 
     def auth_status():
-        return credentials.status() | {"instance_id": instance_id}
+        return credentials.status() | {"instance_id": instance_id, 'recovery':recovery.snapshot()}
+
+    @app.post('/api/recovery')
+    def retry_recovery():
+        with engine.lock:
+            if any(t.is_alive() for t in engine.threads.values()) or engine.maintenance_busy:
+                raise ValueError('Остановите текущую работу перед восстановлением')
+            recovery.start()
+        return jsonify(recovery.snapshot())
     origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
     hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
 
@@ -272,7 +285,14 @@ def create_app(state_dir=None, api=None, port=8766):
     def queue_action(): return jsonify(management.queue_action(payload()))
 
     @app.get('/api/verification')
-    def verification_status(): return jsonify(maintenance.snapshot())
+    def verification_status():
+        offset = request.args.get('offset','0')
+        if not offset.isascii() or not offset.isdigit() or len(offset)>8:
+            raise ValueError('Некорректная страница проверки')
+        return jsonify(maintenance.snapshot(int(offset)))
+
+    @app.post('/api/verification/repair')
+    def verification_repair(): return jsonify(settings=maintenance.repair_settings())
 
     @app.post('/api/verification')
     def verify_folder():
@@ -313,6 +333,8 @@ def create_app(state_dir=None, api=None, port=8766):
             credentials.clear()
             engine.controls.clear(); engine.threads.clear(); management.armed=False
             engine.status_cache.invalidate()
+            with maintenance.lock:
+                maintenance.result={'busy':False,'processed':0,'total':0,'items':[],'counts':{},'complete':False}
         return jsonify(ok=True,safety_copy=safety)
 
     @app.get('/api/notifications')
@@ -443,9 +465,35 @@ def create_app(state_dir=None, api=None, port=8766):
             raise ValueError("Сначала завершите или остановите текущую операцию")
         return jsonify(id=engine.create(payload()))
 
+    @app.post('/api/destination')
+    def inspect_destination():
+        value=payload().get('path')
+        if not isinstance(value,str) or not Path(value).is_absolute() or len(value)>30000 or '\0' in value:
+            raise ValueError('Укажите полный путь к папке на ПК, например D:\\Фото')
+        path=Path(value).resolve()
+        if path.exists() and not path.is_dir():
+            raise ValueError('На ПК по этому пути находится файл. Выберите папку.')
+        parent=path
+        while not parent.exists() and parent!=parent.parent:
+            parent=parent.parent
+        if not parent.is_dir():
+            raise ValueError('Диск на ПК недоступен. Проверьте подключение и выберите папку снова.')
+        with tempfile.TemporaryFile(dir=parent, prefix='.yadisk-write-test-') as probe:
+            probe.write(b'check'); probe.flush()
+        usage=shutil.disk_usage(parent)
+        previous=find_import(store,path) if path.is_dir() else None
+        return jsonify(path=str(path),exists=path.is_dir(),writable=True,free_bytes=usage.free,total_bytes=usage.total,used_percent=round((usage.total-usage.free)*100/max(1,usage.total),1),previous_import=bool(previous))
+
     @app.get("/api/jobs/<job_id>")
     def job_status(job_id):
         return jsonify(engine.status_cache.snapshot(store.job(job_id)) | auth_status())
+
+    @app.post('/api/jobs/<job_id>/refresh-usage')
+    def refresh_folder_usage(job_id):
+        job=store.job(job_id)
+        engine.folder_usage.snapshot(job['root'],force=True)
+        engine.status_cache.invalidate()
+        return jsonify(ok=True)
 
     @app.get("/api/jobs/<job_id>/errors")
     def job_errors(job_id):

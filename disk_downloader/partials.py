@@ -33,14 +33,14 @@ class Partials:
     def __init__(self, store):
         self.store = store
 
-    def discard(self, job, path, kind, remove=True):
+    def discard(self, job, path, kind, remove=True, checkpoint=lambda: None):
         with self.store.db() as db:
             row = db.execute("SELECT * FROM partials WHERE job=? AND path=? AND type=?", (job["id"], path, kind)).fetchone()
             owned = row and db.execute("SELECT 1 FROM partial_ownership WHERE job=? AND local=?", (job["id"], row["local"])).fetchone()
         if row and remove and owned and valid_partial(row):
             try:
                 filename = safe_join(job["root"], row["local"])
-                if os.stat(filename).st_nlink == 1 and os.path.getsize(filename) == row["size"] and digest_prefix(filename, row["size"], lambda: None)[0].hexdigest() == row["sha256"]:
+                if os.stat(filename).st_nlink == 1 and os.path.getsize(filename) == row["size"] and digest_prefix(filename, row["size"], checkpoint)[0].hexdigest() == row["sha256"]:
                     os.unlink(filename)
             except (OSError, ValueError):
                 pass
@@ -96,7 +96,7 @@ class Partials:
                     stream.truncate(row["size"])
                 return row, filename, sha, md5
             except (OSError, ValueError):
-                self.discard(job, path, kind)
+                self.discard(job, path, kind, checkpoint=checkpoint)
         filename = temporary_file(job["root"], self.store, 'partial')
         row = {"job": job["id"], "path": path, "type": kind, "local": Path(filename).name, "fingerprint": stamp, "size": 0, "sha256": hashlib.sha256().hexdigest(), "etag": "", "total": None}
         with self.store.db() as db:

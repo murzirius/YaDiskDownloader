@@ -49,6 +49,9 @@ CREATE TABLE IF NOT EXISTS verification_cache (
  job TEXT NOT NULL, local TEXT NOT NULL, signature TEXT NOT NULL,
  PRIMARY KEY(job,local)
 );
+CREATE TABLE IF NOT EXISTS verification_results (
+ run TEXT,path TEXT,type TEXT,local TEXT,status TEXT,PRIMARY KEY(run,path,type)
+);
 CREATE TABLE IF NOT EXISTS journal_events (
  id INTEGER PRIMARY KEY AUTOINCREMENT, job TEXT NOT NULL, time TEXT NOT NULL,
  category TEXT NOT NULL, level TEXT NOT NULL, message TEXT NOT NULL, path TEXT NOT NULL
@@ -176,6 +179,7 @@ class Store:
         conn = sqlite3.connect(self.filename, timeout=30, factory=WriteConnection)
         conn.gate = self.write_gate
         try:
+            conn.create_function('unicode_fold', 1, lambda value: (value or '').casefold(), deterministic=True)
             conn.row_factory = sqlite3.Row
             conn.execute('PRAGMA synchronous=FULL')
             conn.execute('PRAGMA foreign_keys=ON')

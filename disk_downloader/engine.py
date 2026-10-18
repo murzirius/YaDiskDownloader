@@ -94,6 +94,7 @@ class Control:
         self.adaptive = None
         self.selected_paths = None
         self.rate_limiter = rate_limit.RateLimiter(0)
+        self.verification = None
 
     def event(self, group, message, path="", level="info"):
         if self.journal:
@@ -136,7 +137,7 @@ class Control:
     def snapshot(self):
         with self.lock:
             elapsed = (self.finished or self.pause_started or time.monotonic()) - self.started - self.elapsed_before - self.network.elapsed
-            return {"active": list(self.active.values()), "speed": self.transferred / max(0.1, elapsed)}
+            return {"active": list(self.active.values()), "speed": self.transferred / max(0.1, elapsed), 'verification':dict(self.verification) if self.verification else None}
 
     def active_clock(self):
         with self.condition:
@@ -215,6 +216,9 @@ class Engine:
                 "destination": destination, "operation": operation, **values}
 
     def ensure_idle(self):
+        recovery = getattr(self,'recovery',None)
+        if recovery and (recovery.snapshot()['busy'] or recovery.snapshot()['error']):
+            raise ValueError('Сначала дождитесь восстановления после сбоя или нажмите «Повторить восстановление». Сохранённые файлы проверяются на ПК.')
         if self.maintenance_busy or any(thread.is_alive() for thread in self.threads.values()):
             raise ValueError("Сейчас выполняется другая работа. Вернитесь к текущему заданию и нажмите «Остановить», затем дождитесь остановки. Скачанные файлы останутся; после этого можно подключить ключ или запустить другое задание.")
 
@@ -243,6 +247,7 @@ class Engine:
         settings = self.validate_settings(data)
         if previous:
             settings["comparison_available"] = bool(previous.get("store") or previous.get("inventory_available"))
+            settings['_inherit_source'] = {'job':previous['id']} if previous.get('store') else {'manifest':previous['file'].name}
         job_id = uuid.uuid4().hex
         root = Path(settings["destination"]) if settings["operation"] == "missing" else Path(settings["destination"]) / ("Disk-" + job_id[:12])
         if settings["operation"] == "new":
@@ -257,8 +262,6 @@ class Engine:
             db.execute("INSERT INTO names(job,identity,local,folded) VALUES(?,?,?,?)", (job_id, "@service", service, service.casefold()))
             db.execute("UPDATE jobs SET generation=? WHERE id=?", (generation, job_id))
         try:
-            if previous:
-                inherit(self.store, job_id, previous)
             self.launch(job_id, "scan")
         except Exception:
             with self.store.db() as db:
@@ -281,7 +284,7 @@ class Engine:
                 raise ValueError("Приложение завершается")
             if any(t.is_alive() for t in self.threads.values()):
                 raise ValueError("Дождитесь завершения текущей операции или остановите её")
-            if operation != "pack" and not self.api.credentials.connected:
+            if operation not in ('pack','manifest','journal') and not self.api.credentials.connected:
                 raise ValueError("Подключите Диск перед продолжением")
             control = Control()
             control.journal = Journal(self, job_id, self.journal_interval)
@@ -296,6 +299,9 @@ class Engine:
             control.space_check = lambda: self.check_space(job_id, control)
             control.selected_paths = tuple(paths) if paths else None
             control.reuse_scanned = operation == "download" and not paths and (job["settings"].get("operation") == "missing" or job["phase"] in ("paused", "stopped", "interrupted", "failed") or job["generation"] > 0)
+            if operation == 'download' and not paths:
+                with self.store.db() as db:
+                    db.execute("UPDATE job_queue SET state='running',error='' WHERE job=?", (job_id,))
             self.controls[job_id] = control
             thread = threading.Thread(target=self.run, args=(job_id, operation, control), daemon=True)
             self.threads[job_id] = thread
@@ -319,7 +325,7 @@ class Engine:
                 action = 'resume'
             if job["settings"].get("_invalid") and action not in ("stop",):
                 raise ValueError("Настройки задания повреждены. Создайте дозагрузку в прежнюю папку.")
-            if action in ("start", "resume", "retry", "retry_selected", "pack"):
+            if action in ("start", "resume", "retry", "retry_selected", "pack", "save_manifest", "refresh_journal"):
                 own = self.threads.get(job_id)
                 if not (action == "resume" and own and own.is_alive() and self.controls[job_id].paused):
                     self.ensure_idle()
@@ -411,6 +417,12 @@ class Engine:
             if action == "pack":
                 self.launch(job_id, "pack")
                 return
+            if action == 'save_manifest':
+                self.launch(job_id,'manifest')
+                return
+            if action == 'refresh_journal':
+                self.launch(job_id,'journal')
+                return
             raise ValueError("Неизвестная команда")
 
     def disconnect(self):
@@ -497,8 +509,9 @@ class Engine:
             except (OSError, PathError):
                 pass
         status["local_bytes"] = status["saved_bytes"] + service_bytes
-        usage = self.folder_usage.snapshot(status["root"])
-        status["folder_bytes"] = usage["bytes"] if usage["bytes"] is not None else status["local_bytes"]
+        usage = self.folder_usage.snapshot(status["root"], active=live and not (control and control.paused))
+        status["folder_bytes"] = max(usage['bytes'], status['local_bytes']) if usage['bytes'] is not None else None if usage.get('error') else status['local_bytes']
+        status['folder_bytes_error'] = usage.get('error','')
         status["folder_bytes_scanning"] = usage["scanning"]
         status["folder_bytes_updated"] = usage["updated"]
         status["eta_seconds"] = None
@@ -585,8 +598,41 @@ class Engine:
     def _run(self, job_id, operation, control):
         saved_scan = False
         try:
+            previous_job = self.store.job(job_id)
             self.store.update_job(job_id, error="", ended=None, pause_reason="")
+            job = self.store.job(job_id)
+            if job['settings'].get('_inherit_source'):
+                self.phase(job_id, control, 'preparing')
+                source = job['settings']['_inherit_source']
+                if source.get('job'):
+                    previous = {'job':self.store.job(source['job']),'store':self.store,'id':source['job']}
+                else:
+                    previous = find_import(self.store, Path(job['root']), exclude_job=job_id)
+                if not previous:
+                    raise ValueError('На ПК не найдена прежняя опись загрузки. Проверьте папку или создайте дозагрузку заново.')
+                inherit(self.store,job_id,previous,control.check,lambda count:control.progress(job['root'],count,None,'Читаем историю скачанной папки',unit='objects'))
+                settings = self.store.job(job_id)['settings']
+                settings.pop('_inherit_source',None)
+                self.store.update_job(job_id,settings=json.dumps(settings,ensure_ascii=False))
+                with control.lock: control.active.clear()
+            if operation in ('manifest','journal'):
+                self.phase(job_id,control,'preparing')
+                control.progress(job_id,0,None,'Обновляем опись на ПК' if operation=='manifest' else 'Обновляем HTML-журнал')
             control.journal.start(operation)
+            if operation == 'journal':
+                control.check()
+                self.store.update_job(job_id,phase=previous_job['phase'],error=previous_job['error'],ended=previous_job['ended'])
+                saved_scan=True
+                return
+            if operation == 'manifest':
+                self.phase(job_id,control,'preparing')
+                save_import(self.store,job_id,control.check)
+                saved_scan=True
+                summary=self.store.summary(job_id)
+                phase='stopped' if not summary['scan_complete'] else 'ready' if self.store.job(job_id)['settings'].get('scan_only_pending') else 'completed_with_errors' if summary['errors'] or summary['scan_errors'] else 'completed' if summary['processed']==summary['files'] else 'stopped'
+                self.store.update_job(job_id,phase=phase,ended=now())
+                control.event('system','Опись в папке на ПК обновлена',level='success')
+                return
             if operation == "pack":
                 self.prepare_paths(job_id, control)
                 job = self.store.job(job_id)
@@ -621,10 +667,14 @@ class Engine:
             control.event("system", PHASES.get(self.store.job(job_id)["phase"], "Операция завершена"))
             control.journal.close()
             try:
-                if not saved_scan:
+                if not saved_scan and not self.store.job(job_id)['settings'].get('_inherit_source'):
                     save_import(self.store, job_id)
-            except (OSError, sqlite3.Error, ValueError):
-                pass
+            except (OSError, sqlite3.Error, ValueError) as exc:
+                warning = 'Не удалось обновить опись в папке на ПК. Файлы и история сохранены в приложении. Проверьте доступ к папке и свободное место; затем повторите сохранение описи.'
+                control.journal.error = warning
+                self.store.update_job(job_id, error=warning)
+                if self.store.job(job_id)['phase'] == 'completed':
+                    self.store.update_job(job_id, phase='completed_with_errors')
             with control.lock:
                 control.active.clear()
                 control.finished = time.monotonic()
@@ -819,10 +869,22 @@ class Engine:
         if prime and (job["settings"].get("operation") == "missing" or job["generation"] > 0 or getattr(control, "reuse_scanned", False)):
             self.check_local_results(job, control)
             return
-        with self.store.db() as db:
-            rows = db.execute("SELECT e.path,e.meta,e.status,a.type,a.local,a.size,a.sha256,a.fingerprint,v.signature FROM entries e JOIN artifacts a ON a.job=e.job AND a.path=e.path LEFT JOIN verification_cache v ON v.job=a.job AND v.local=a.local WHERE e.job=? AND e.kind='file' AND (? OR e.status='pending') ORDER BY e.path,a.type", (job_id, prime)).fetchall()
+        rows = self.store.rows("SELECT e.path,e.meta,e.status,a.type,a.local,a.size,a.sha256,a.fingerprint,v.signature FROM entries e JOIN artifacts a ON a.job=e.job AND a.path=e.path LEFT JOIN verification_cache v ON v.job=a.job AND v.local=a.local WHERE e.job=? AND e.kind='file' AND (? OR e.status='pending') ORDER BY e.path,a.type", (job_id, prime))
         candidates = {}
+        def flush_candidates():
+            with self.store.db() as db:
+                for path, value in candidates.items():
+                    db.execute("UPDATE entries SET priority=? WHERE job=? AND path=?", (value["priority"], job_id, path))
+                    if prime and (job["settings"].get("operation") == "missing" or job["generation"] > 0):
+                        if value["original"]:
+                            db.execute("UPDATE entries SET status='existing',error='',original_status='existing_verified',preview_status='not_needed',fallback=0 WHERE job=? AND path=?", (job_id, path))
+                            db.execute("DELETE FROM artifacts WHERE job=? AND path=? AND type='preview'", (job_id, path))
+                        elif value["status"] == "existing":
+                            db.execute("UPDATE entries SET status='pending' WHERE job=? AND path=?", (job_id, path))
+            candidates.clear()
         for index, row in enumerate(rows):
+            if len(candidates)>=200 and row['path'] not in candidates:
+                flush_candidates()
             if control:
                 control.check()
                 if index % 250 == 0:
@@ -848,24 +910,34 @@ class Engine:
                 value["priority"] = max(value["priority"], 2 if row["type"] == "original" else 1)
             if row["type"] == "original" and confirmed:
                 value["original"] = True
-        with self.store.db() as db:
-            for path, value in candidates.items():
-                db.execute("UPDATE entries SET priority=? WHERE job=? AND path=?", (value["priority"], job_id, path))
-                if prime and (job["settings"].get("operation") == "missing" or job["generation"] > 0):
-                    if value["original"]:
-                        db.execute("UPDATE entries SET status='existing',error='',original_status='existing_verified',preview_status='not_needed',fallback=0 WHERE job=? AND path=?", (job_id, path))
-                        db.execute("DELETE FROM artifacts WHERE job=? AND path=? AND type='preview'", (job_id, path))
-                    elif value["status"] == "existing":
-                        db.execute("UPDATE entries SET status='pending' WHERE job=? AND path=?", (job_id, path))
+        flush_candidates()
 
     def check_local_results(self, job, control):
+        with self.store.session():
+            try:
+                return self._check_local_results(job, control)
+            finally:
+                if control:
+                    control.verification_records = None
+
+    def _check_local_results(self, job, control):
         """Finish local verification before any download workers are started."""
         control = control or Control()
         job_id = job["id"]
         with self.store.db() as db:
             total = db.execute("SELECT COUNT(*) FROM entries WHERE job=? AND kind='file' AND status!='filtered'", (job_id,)).fetchone()[0]
         checked = found = 0
+        originals = previews = 0
         cursor = ""
+        updates, remove_previews = [], []
+        def flush():
+            if not updates and not remove_previews:
+                return
+            with self.store.db() as db:
+                db.executemany("UPDATE entries SET status=?,priority=?,error='',original_status=?,preview_status=?,fallback=0 WHERE job=? AND path=?", updates)
+                db.executemany("DELETE FROM artifacts WHERE job=? AND path=? AND type='preview'", remove_previews)
+            updates.clear()
+            remove_previews.clear()
         control.event("cache", "Проверка папки перед дозагрузкой")
         while True:
             control.check()
@@ -873,6 +945,9 @@ class Engine:
                 rows = db.execute("SELECT * FROM entries WHERE job=? AND kind='file' AND status!='filtered' AND path>? ORDER BY path LIMIT 200", (job_id, cursor)).fetchall()
             if not rows:
                 break
+            with self.store.db() as db:
+                artifacts = db.execute('SELECT a.*,v.signature FROM artifacts a LEFT JOIN verification_cache v ON v.job=a.job AND v.local=a.local WHERE a.job=? AND a.path>=? AND a.path<=?', (job_id,rows[0]['path'],rows[-1]['path'])).fetchall()
+            control.verification_records = {(row['path'],row['type']):dict(row) for row in artifacts}
             for row in rows:
                 control.check()
                 entry = dict(row)
@@ -899,20 +974,31 @@ class Engine:
                     # An unreadable local file must not prevent the remaining folder check.
                     with self.store.db() as db:
                         db.execute("DELETE FROM artifacts WHERE job=? AND path=?", (job_id, entry["path"]))
-                with self.store.db() as db:
-                    if original:
-                        db.execute("UPDATE entries SET status='existing',priority=2,error='',original_status='existing_verified',preview_status='not_needed',fallback=0 WHERE job=? AND path=?", (job_id, entry["path"]))
-                        db.execute("DELETE FROM artifacts WHERE job=? AND path=? AND type='preview'", (job_id, entry["path"]))
-                    elif preview and job["settings"].get("missing_policy", "originals") == "any_result":
-                        db.execute("UPDATE entries SET status='existing',priority=1,error='',original_status='not_requested',preview_status='existing_verified',fallback=0 WHERE job=? AND path=?", (job_id, entry["path"]))
-                    else:
-                        db.execute("UPDATE entries SET status='pending',priority=?,error='',original_status='not_requested',preview_status=?,fallback=0 WHERE job=? AND path=?", (int(bool(preview)), "existing_verified" if preview else "not_requested", job_id, entry["path"]))
+                if original:
+                    desired = ('existing',2,'existing_verified','not_needed')
+                    if (entry['path'],'preview') in control.verification_records:
+                        remove_previews.append((job_id,entry['path']))
+                elif preview and job['settings'].get('missing_policy','originals') == 'any_result':
+                    desired = ('existing',1,'not_requested','existing_verified')
+                else:
+                    desired = ('pending',int(bool(preview)),'not_requested','existing_verified' if preview else 'not_requested')
+                previous = tuple(entry[key] for key in ('status','priority','original_status','preview_status'))
+                if previous != desired or entry['error'] or entry['fallback']:
+                    updates.append((*desired,job_id,entry['path']))
+                if not original:
+                    # Publish invalidations before checking a slow / unavailable
+                    # next file. Verified result records remain durable per file.
+                    flush()
                 checked += 1
                 found += bool(original or preview)
+                originals += bool(original)
+                previews += bool(preview)
                 with control.lock:
                     control.active.clear()
+                    control.verification = {'checked':checked,'total':total,'originals':originals,'previews':previews,'missing':checked-found,'complete':checked==total}
                 control.progress(entry["path"], checked, total, "Проверка скачанной папки", unit="objects")
             cursor = rows[-1]["path"]
+            flush()
         control.event("cache", f"Папка проверена: {checked} файлов, уже есть результат у {found}. Сначала будут скачаны файлы без результата.")
 
     def remember_file(self, job, relative, sha):
@@ -929,8 +1015,12 @@ class Engine:
         return sha.hexdigest(), md5.hexdigest()
 
     def reusable(self, job, entry, kind, meta, control):
-        with self.store.db() as db:
-            artifact = db.execute("SELECT * FROM artifacts WHERE job=? AND path=? AND type=?", (job["id"], entry["path"], kind)).fetchone()
+        records = getattr(control,'verification_records',None)
+        if records is not None:
+            artifact = records.get((entry['path'],kind))
+        else:
+            with self.store.db() as db:
+                artifact = db.execute("SELECT a.*,v.signature FROM artifacts a LEFT JOIN verification_cache v ON v.job=a.job AND v.local=a.local WHERE a.job=? AND a.path=? AND a.type=?", (job["id"], entry["path"], kind)).fetchone()
         if not artifact:
             if job["settings"].get("operation") != "missing" or kind != "original" or not (meta.get("md5") or meta.get("sha256")):
                 return False
@@ -958,19 +1048,24 @@ class Engine:
             valid = artifact["fingerprint"] == fingerprint(meta) and (kind != "preview" or (artifact["preview_size"] == job["settings"]["preview_size"] or job["settings"].get("missing_policy") == "any_result") and artifact["size"] <= PREVIEW_MAX_BYTES)
             if kind == "original" and meta.get("sha256"):
                 valid = valid and artifact["sha256"].lower() == meta["sha256"].lower()
-            valid = valid and os.path.isfile(filename) and os.path.getsize(filename) == artifact["size"]
+            import stat
+            signature = file_signature(filename, artifact['sha256']) if valid else None
+            valid = valid and stat.S_ISREG(os.stat(filename).st_mode) and signature[2] == artifact['size']
             if valid:
-                info = os.stat(filename)
-                signature = file_signature(filename, artifact["sha256"])
                 encoded = json.dumps(signature)
-                with self.store.db() as db:
-                    cached_row = db.execute("SELECT signature FROM verification_cache WHERE job=? AND local=?", (job["id"], artifact["local"])).fetchone()
-                cached = signature[-1] is not None and cached_row is not None and cached_row[0] == encoded
+                cached = signature[-1] is not None and artifact.get('signature') == encoded
+                hashed = 0
+                def hash_checkpoint():
+                    nonlocal hashed
+                    control.check()
+                    hashed = min(artifact['size'],hashed+1024*1024)
+                    control.progress(entry['path'],hashed,artifact['size'],'Проверяем содержимое файла на ПК')
                 if not cached and kind == "original" and meta.get("md5") and not meta.get("sha256"):
-                    sha, md5 = self.partials_digest(filename, artifact["size"], control)
-                    valid = sha == artifact["sha256"] and md5.lower() == meta["md5"].lower()
+                    from .partials import digest_prefix
+                    sha, md5 = digest_prefix(filename, artifact['size'], hash_checkpoint)
+                    valid = sha.hexdigest() == artifact["sha256"] and md5.hexdigest().lower() == meta["md5"].lower()
                 else:
-                    valid = cached or file_hash(filename, control.check) == artifact["sha256"]
+                    valid = cached or file_hash(filename, hash_checkpoint) == artifact["sha256"]
                 if valid and not cached and kind == "preview":
                     with Image.open(filename) as image:
                         if image.width * image.height > 16_000_000:
@@ -980,7 +1075,6 @@ class Engine:
                     if valid:
                         with Image.open(filename) as image:
                             image.load()
-                after = os.stat(filename)
                 valid = valid and signature == file_signature(filename, artifact["sha256"])
                 if valid and not cached and signature[-1] is not None:
                     with self.store.db() as db:
@@ -1088,8 +1182,9 @@ class Engine:
             if exc.status == 401:
                 control.stop()
                 raise Suspended(str(exc))
-            with self.store.db() as db:
-                db.execute("DELETE FROM artifacts WHERE job=? AND path=?", (job_id, path))
+            # A failed source lookup says nothing about an already saved copy.
+            # Only a successful metadata comparison / local verification may
+            # invalidate it. Keep it in reports and archives during outages.
             self.store.update_entry(job_id, path, status="error", error=safe_error(exc), original_status=original_status, preview_status=preview_status)
             finalized = True
             control.event("errors", "Ошибка обработки файла: " + safe_error(exc), path, "error")

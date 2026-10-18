@@ -4,6 +4,8 @@ import re
 import sqlite3
 import threading
 import time
+import json
+import uuid
 from contextlib import closing
 from pathlib import Path
 
@@ -28,9 +30,28 @@ class Maintenance:
         self.result={'busy':False,'processed':0,'total':0,'items':[],'counts':{}}
         self.thread=None
 
-    def snapshot(self):
+    def snapshot(self, offset=0):
+        if not isinstance(offset, int) or not 0 <= offset <= 10000000:
+            raise ValueError('Некорректная страница проверки')
         with self.lock:
-            return dict(self.result,items=list(self.result['items']),counts=dict(self.result['counts']))
+            result = dict(self.result, items=[], counts=dict(self.result['counts']))
+        run = result.get('run')
+        if run:
+            with self.store.db() as db:
+                rows = db.execute('SELECT path,type,local,status FROM verification_results WHERE run=? ORDER BY path,type LIMIT 101 OFFSET ?', (run, offset)).fetchall()
+            result.update(items=[dict(row) for row in rows[:100]], has_more=len(rows)>100, offset=offset)
+        return result
+
+    def repair_settings(self):
+        with self.lock:
+            result = dict(self.result)
+            if result['busy'] or result.get('cancelled') or result.get('error') or not result.get('complete'):
+                raise ValueError('Сначала завершите проверку папки без ошибок. Отменённая проверка содержит только часть результатов.')
+            if not result.get('problems'):
+                raise ValueError('Все проверенные результаты на месте. Дозагрузка не нужна.')
+            # Recheck the complete original scope, never a truncated UI page.
+            settings = dict(self.scope)
+        return settings | {'operation':'missing', 'destination':result['root']}
 
     def start(self, data):
         with self.engine.lock:
@@ -44,10 +65,18 @@ class Maintenance:
             previous={'job':job,'store':self.store,'id':job_id} if job else find_import(self.store,root)
             if not previous: raise ValueError('В папке нет сохранённой описи загрузки')
             self.cancel.clear(); self.engine.maintenance_busy=True
+            self.scope = dict(previous['job']['settings'])
+            with self.store.db() as db:
+                db.execute('DELETE FROM verification_results')
             with self.lock:
-                self.result={'busy':True,'root':root,'processed':0,'total':0,'items':[],'counts':{},'error':''}
+                self.result={'busy':True,'run':uuid.uuid4().hex,'root':root,'processed':0,'total':0,'items':[],'counts':{},'error':'','complete':False,'problems':0,'current':'','checked_bytes':0}
             self.thread=threading.Thread(target=self.verify,args=(root,previous),name='disk-verify',daemon=True)
-            self.thread.start()
+            try:
+                self.thread.start()
+            except Exception:
+                self.engine.maintenance_busy=False
+                with self.lock: self.result['busy']=False
+                raise
         return self.snapshot()
 
     def verify(self, root, previous):
@@ -57,35 +86,62 @@ class Maintenance:
                 db.row_factory=sqlite3.Row
                 where=' WHERE job=?' if previous.get('store') else ''
                 args=(previous['id'],) if where else ()
-                total=db.execute('SELECT COUNT(*) FROM artifacts'+where,args).fetchone()[0]
+                inventory = 'entries' if previous.get('store') else 'inventory'
+                inventory_exists = bool(db.execute("SELECT 1 FROM sqlite_master WHERE name=?", (inventory,)).fetchone())
+                selection = 'SELECT path,type,local,size,sha256,1 AS recorded FROM artifacts'+where
+                if inventory_exists:
+                    condition = 'e.job=? AND ' if previous.get('store') else ''
+                    match = 'a.job=e.job AND ' if previous.get('store') else ''
+                    local = 'e.local' if previous.get('store') else '(SELECT n.local FROM names n WHERE n.identity=e.path)'
+                    selection += " UNION ALL SELECT e.path,'original',"+local+",json_extract(e.meta,'$.size'),json_extract(e.meta,'$.sha256'),0 FROM "+inventory+" e WHERE "+condition+"e.kind='file' AND NOT EXISTS(SELECT 1 FROM artifacts a WHERE "+match+"a.path=e.path)"
+                    if previous.get('store'):
+                        selection += " AND e.status!='filtered'"
+                parameters = args + (args if inventory_exists else ())
+                total=db.execute('SELECT COUNT(*) FROM ('+selection+')',parameters).fetchone()[0]
                 with self.lock: self.result['total']=total
-                for row in db.execute('SELECT path,type,local,size,sha256 FROM artifacts'+where+' ORDER BY path,type',args):
+                rows = self.store.rows(selection+' ORDER BY path,type',parameters) if previous.get('store') else db.execute(selection+' ORDER BY path,type',parameters)
+                pending = []
+                for row in rows:
                     if self.cancel.is_set(): break
                     status='ok'
                     try:
+                        with self.lock: self.result['current']=row['path']
+                        if not row['local']:
+                            raise FileNotFoundError()
                         file=safe_join(root,row['local'])
-                        before=os.stat(file)
+                        before=file_signature(file, row['sha256'])
                         if not re.fullmatch('[a-fA-F0-9]{64}',row['sha256'] or ''): status='invalid_record'
-                        elif before.st_size!=row['size']: status='damaged'
+                        elif before[2]!=row['size']: status='damaged'
                         else:
                             sha=hashlib.sha256()
                             with open(file,'rb') as stream:
                                 while chunk:=stream.read(1024*1024):
                                     if self.cancel.is_set(): break
                                     sha.update(chunk)
+                                    with self.lock: self.result['checked_bytes'] += len(chunk)
                             if self.cancel.is_set(): break
-                            after=os.stat(file)
-                            if (before.st_size,before.st_mtime_ns,before.st_ino)!=(after.st_size,after.st_mtime_ns,after.st_ino): status='changed_during_check'
+                            after=file_signature(file, row['sha256'])
+                            if before!=after: status='changed_during_check'
                             elif sha.hexdigest()!=row['sha256'].lower(): status='damaged'
-                    except FileNotFoundError: status='missing'
+                    except FileNotFoundError: status='missing' if row['recorded'] else 'not_downloaded'
                     except (OSError,ValueError): status='unavailable'
                     with self.lock:
                         self.result['processed']+=1
                         self.result['counts'][status]=self.result['counts'].get(status,0)+1
-                        if status!='ok' and len(self.result['items'])<2000:
-                            self.result['items'].append({'path':row['path'],'type':row['type'],'local':row['local'],'status':status})
+                        if status!='ok':
+                            self.result['problems'] += 1
+                            pending.append((self.result['run'],row['path'],row['type'],row['local'],status))
+                    if len(pending) >= 100:
+                        with self.store.db() as target:
+                            target.executemany('INSERT OR REPLACE INTO verification_results VALUES(?,?,?,?,?)',pending)
+                        pending.clear()
+                if pending:
+                    with self.store.db() as target:
+                        target.executemany('INSERT OR REPLACE INTO verification_results VALUES(?,?,?,?,?)',pending)
+                with self.lock:
+                    self.result['complete'] = not self.cancel.is_set() and self.result['processed'] == total
         except (OSError,ValueError,sqlite3.Error):
-            with self.lock: self.result['error']='Не удалось прочитать опись или папку'
+            with self.lock: self.result['error']='Приложение на ПК не смогло проверить опись или папку. Проверьте доступ к диску и запустите проверку снова.'
         finally:
             with self.lock:
                 self.result['busy']=False; self.result['cancelled']=self.cancel.is_set()

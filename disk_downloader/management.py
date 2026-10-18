@@ -31,6 +31,13 @@ class Management:
                 if verb in ('pause', 'resume'):
                     db.execute("INSERT OR REPLACE INTO preferences VALUES('queue_paused',?)", ('true' if verb == 'pause' else 'false',))
                     if verb == 'resume': self.armed = True
+                elif verb == 'retry':
+                    row = db.execute("SELECT state FROM job_queue WHERE job=?", (data.get('job'),)).fetchone()
+                    if not row or row[0] != 'blocked':
+                        raise ValueError('Выберите задание очереди, которое ждёт исправления ошибки')
+                    db.execute("UPDATE job_queue SET state='waiting',error='' WHERE job=?", (data['job'],))
+                    db.execute("INSERT OR REPLACE INTO preferences VALUES('queue_paused','false')")
+                    self.armed = True
                 elif verb == 'add':
                     job = self.store.job(data.get('job'))
                     if job['settings'].get('_invalid') or job['archived']:
@@ -107,7 +114,7 @@ class Management:
             raise ValueError('Некорректный статус')
         if not isinstance(query,str) or len(query)>200 or not isinstance(offset,int) or not 0<=offset<=1000000:
             raise ValueError('Некорректный поиск')
-        sql = " FROM jobs WHERE archived=? AND (?='all' OR phase=?) AND (instr(lower(title),lower(?))>0 OR instr(lower(root),lower(?))>0 OR instr(id,?)>0)"
+        sql = " FROM jobs WHERE archived=? AND (?='all' OR phase=?) AND (instr(unicode_fold(title),unicode_fold(?))>0 OR instr(unicode_fold(root),unicode_fold(?))>0 OR instr(id,?)>0)"
         args = (int(archived),phase,phase,query,query,query)
         with self.store.db() as db:
             total = db.execute('SELECT COUNT(*)'+sql,args).fetchone()[0]
@@ -131,6 +138,8 @@ class Management:
                 elif action in ('archive','unarchive'):
                     db.execute('UPDATE jobs SET archived=? WHERE id=?', (int(action=='archive'),job_id))
                 elif action == 'delete':
+                    if db.execute("SELECT 1 FROM jobs WHERE CASE WHEN json_valid(settings) THEN json_extract(settings,'$._inherit_source.job') END=? LIMIT 1",(job_id,)).fetchone():
+                        raise ValueError('История этого задания нужна для подготовки дозагрузки. Сначала завершите подготовку или удалите новую запись дозагрузки.')
                     if data.get('confirm') != job_id:
                         raise ValueError('Подтвердите удаление записи задания')
                     # Preserve journal events and root-level report/output ownership for the folder.

@@ -28,6 +28,9 @@ class StatusCache:
             due = item.get('due', 0) if item else 0
             if item and item.get('value') and item['value']['phase'] != job['phase']:
                 due = 0
+                # Old counters must not appear as a finished scan / download.
+                # Controls remain immediate while the new phase is counted.
+                result['statistics_pending'] = True
             if token not in self.pending and len(self.pending) < 2 and time.monotonic() >= due:
                 self.pending.add(token)
                 threading.Thread(target=self.refresh, args=(key, token), name='disk-statistics', daemon=True).start()

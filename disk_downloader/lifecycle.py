@@ -41,6 +41,8 @@ class Shutdown:
         manager, maintenance = self.app.extensions['management'], self.app.extensions['maintenance']
         manager.stopped.set()
         maintenance.cancel.set()
+        recovery = self.app.extensions.get('recovery')
+        if recovery: recovery.cancel.set()
         for control in tuple(engine.controls.values()):
             self.attempt(control.stop)
         tray = self.app.extensions.get('tray')
@@ -55,6 +57,8 @@ class Shutdown:
             self.attempt(channel.close)
         self.attempt(lambda: self.server.task_dispatcher.shutdown(timeout=1))
         workers = list(engine.threads.values())
+        if maintenance.thread: workers.append(maintenance.thread)
+        if recovery and recovery.thread: workers.append(recovery.thread)
         for worker in workers:
             if worker is not threading.current_thread():
                 worker.join(max(0, deadline - time.monotonic()))

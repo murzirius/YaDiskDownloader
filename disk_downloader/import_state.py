@@ -11,12 +11,16 @@ from .paths import publish, replace_owned, reserve_output, safe_join, temporary_
 FORMAT = "disk-local-import-v1"
 
 
-def find_import(store, root):
+def find_import(store, root, exclude_job=None):
     normalized = os.path.normcase(str(Path(root).resolve()))
     for row in store.rows("SELECT id,root FROM jobs ORDER BY started DESC"):
+        if row['id'] == exclude_job:
+            continue
         same_name = Path(root).name == "Disk-" + row["id"][:12]
         if os.path.normcase(str(Path(row["root"]).resolve())) == normalized or same_name:
             job = store.job(row["id"])
+            if job['settings'].get('_inherit_source'):
+                continue
             return {"job": job, "store": store, "id": job["id"]}
     manifests = []
     for filename in Path(root).glob(".disk-import*.sqlite3"):
@@ -40,52 +44,52 @@ def find_import(store, root):
     return None
 
 
-def inherit(store, job_id, previous):
-    root = store.job(job_id)["root"]
-    with store.db() as target:
-        if previous.get("store"):
-            with previous["store"].db() as source:
-                for row in source.execute("SELECT path,kind,meta FROM entries WHERE job=?", (previous["id"],)):
-                    remote_path(row[0])
-                    target.execute("INSERT OR IGNORE INTO baseline VALUES(?,?,?,?)", (job_id, *row))
-                for row in source.execute("SELECT b.path,b.kind,b.meta FROM baseline b LEFT JOIN changes c ON c.job=b.job AND c.path=b.path WHERE b.job=? AND (c.status='unknown' OR ?=0)", (previous["id"], previous["job"]["scan_complete"])):
-                    remote_path(row[0])
-                    target.execute("INSERT OR IGNORE INTO baseline VALUES(?,?,?,?)", (job_id, *row))
-                for row in source.execute("SELECT identity,local,folded FROM names WHERE job=?", (previous["id"],)):
-                    safe_join(root, row[1])
-                    target.execute("INSERT OR IGNORE INTO names VALUES(?,?,?,?)", (job_id, *row))
-                for row in source.execute("SELECT local,signature FROM verification_cache WHERE job=?", (previous["id"],)):
-                    safe_join(root, row[0])
-                    target.execute("INSERT OR IGNORE INTO verification_cache VALUES(?,?,?)", (job_id, *row))
-                for row in source.execute("SELECT path,type,local,size,sha256,fingerprint,preview_size FROM artifacts WHERE job=?", (previous["id"],)):
-                    remote_path(row[0])
-                    safe_join(root, row[2])
-                    target.execute("INSERT OR IGNORE INTO artifacts VALUES(?,?,?,?,?,?,?,?)", (job_id, *row))
-                for row in source.execute("SELECT path,type,local,fingerprint,size,sha256,etag,total FROM partials WHERE job=?", (previous["id"],)):
-                    remote_path(row[0])
-                    safe_join(root, row[2])
-                    target.execute("INSERT OR IGNORE INTO partials VALUES(?,?,?,?,?,?,?,?,?)", (job_id, *row))
-        else:
-            with closing(sqlite3.connect(previous["file"].resolve().as_uri() + "?mode=ro", uri=True)) as source:
-                if source.execute("SELECT 1 FROM sqlite_master WHERE name='inventory'").fetchone():
-                    for row in source.execute("SELECT path,kind,meta FROM inventory"):
-                        remote_path(row[0])
-                        target.execute("INSERT OR IGNORE INTO baseline VALUES(?,?,?,?)", (job_id, *row))
-                for row in source.execute("SELECT identity,local,folded FROM names"):
-                    safe_join(root, row[1])
-                    target.execute("INSERT OR IGNORE INTO names VALUES(?,?,?,?)", (job_id, *row))
-                for row in source.execute("SELECT path,type,local,size,sha256,fingerprint,preview_size FROM artifacts"):
-                    remote_path(row[0])
-                    safe_join(root, row[2])
-                    target.execute("INSERT OR IGNORE INTO artifacts VALUES(?,?,?,?,?,?,?,?)", (job_id, *row))
-                if source.execute("SELECT 1 FROM sqlite_master WHERE name='partials'").fetchone():
-                    for row in source.execute("SELECT path,type,local,fingerprint,size,sha256,etag,total FROM partials"):
-                        remote_path(row[0])
-                        safe_join(root, row[2])
-                        target.execute("INSERT OR IGNORE INTO partials VALUES(?,?,?,?,?,?,?,?,?)", (job_id, *row))
+def inherit(store, job_id, previous, checkpoint=lambda: None, progress=lambda count: None):
+    """Copy in bounded, restartable batches without holding a writer during IO."""
+    root = store.job(job_id)['root']
+    same = bool(previous.get('store'))
+    source_context = previous['store'].db() if same else closing(sqlite3.connect(previous['file'].resolve().as_uri()+'?mode=ro',uri=True))
+    with source_context as source:
+        available = {row[0] for row in source.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        tasks = []
+        inventory = 'entries' if same else 'inventory'
+        where = ' WHERE job=?' if same else ''
+        args = (previous['id'],) if same else ()
+        if inventory in available:
+            tasks.append(('baseline','SELECT path,kind,meta FROM '+inventory+where,args,0,None))
+        if same:
+            tasks.append(('baseline',"SELECT b.path,b.kind,b.meta FROM baseline b LEFT JOIN changes c ON c.job=b.job AND c.path=b.path WHERE b.job=? AND (c.status='unknown' OR ?=0)",(previous['id'],previous['job']['scan_complete']),0,None))
+        for table,columns,remote,local in (
+            ('names','identity,local,folded',None,1),
+            ('artifacts','path,type,local,size,sha256,fingerprint,preview_size',0,2),
+            ('partials','path,type,local,fingerprint,size,sha256,etag,total',0,2),
+        ):
+            if table in available:
+                tasks.append((table,'SELECT '+columns+' FROM '+table+where,args,remote,local))
+        # An external manifest is not trusted to skip hashing local content.
+        if same:
+            tasks.append(('verification_cache','SELECT local,signature FROM verification_cache'+where,args,None,0))
+        count = 0
+        for table,sql,parameters,remote,local in tasks:
+            rows = previous['store'].rows(sql,parameters) if same else source.execute(sql,parameters)
+            batch = []
+            for record in rows:
+                checkpoint()
+                row = tuple(record.values()) if isinstance(record,dict) else tuple(record)
+                if remote is not None: remote_path(row[remote])
+                if local is not None: safe_join(root,row[local])
+                batch.append((job_id,*row))
+                if len(batch)>=200:
+                    with store.db() as target:
+                        target.executemany('INSERT OR IGNORE INTO '+table+' VALUES('+','.join('?' for _ in batch[0])+')',batch)
+                    count+=len(batch); progress(count); batch.clear()
+            if batch:
+                with store.db() as target:
+                    target.executemany('INSERT OR IGNORE INTO '+table+' VALUES('+','.join('?' for _ in batch[0])+')',batch)
+                count+=len(batch); progress(count)
 
 
-def save_import(store, job_id):
+def save_import(store, job_id, checkpoint=lambda: None):
     job = store.job(job_id)
     local = job["settings"].get("manifest_local")
     owned = False
@@ -104,18 +108,22 @@ def save_import(store, job_id):
         job["settings"]["manifest_local"] = local
         store.update_job(job_id, settings=json.dumps(job["settings"], ensure_ascii=False))
     temp = temporary_file(job["root"], store, 'manifest')
+    def checked(rows):
+        for row in rows:
+            checkpoint()
+            yield row
     try:
         with closing(sqlite3.connect(temp)) as db:
             db.executescript("CREATE TABLE import_meta(key TEXT PRIMARY KEY,value TEXT); CREATE TABLE names(identity TEXT PRIMARY KEY,local TEXT,folded TEXT); CREATE TABLE artifacts(path TEXT,type TEXT,local TEXT,size INTEGER,sha256 TEXT,fingerprint TEXT,preview_size TEXT,PRIMARY KEY(path,type)); CREATE TABLE partials(path TEXT,type TEXT,local TEXT,fingerprint TEXT,size INTEGER,sha256 TEXT,etag TEXT,total INTEGER,PRIMARY KEY(path,type)); CREATE TABLE inventory(path TEXT PRIMARY KEY,kind TEXT,meta TEXT);")
             db.execute("CREATE TABLE verification_cache(local TEXT PRIMARY KEY,signature TEXT NOT NULL)")
             db.executemany("INSERT INTO import_meta VALUES(?,?)", [("format", FORMAT), ("settings", json.dumps(job["settings"], ensure_ascii=False)), ("service", job["service"]), ("generation", str(job["generation"]))])
             with store.db() as source:
-                db.executemany("INSERT INTO verification_cache VALUES(?,?)", source.execute("SELECT local,signature FROM verification_cache WHERE job=?", (job_id,)))
-                db.executemany("INSERT INTO inventory VALUES(?,?,?)", source.execute("SELECT path,kind,meta FROM entries WHERE job=?", (job_id,)))
-                db.executemany("INSERT OR IGNORE INTO inventory VALUES(?,?,?)", source.execute("SELECT b.path,b.kind,b.meta FROM baseline b LEFT JOIN changes c ON c.job=b.job AND c.path=b.path WHERE b.job=? AND (c.status='unknown' OR ?=0)", (job_id, job["scan_complete"])))
-                db.executemany("INSERT INTO names VALUES(?,?,?)", source.execute("SELECT identity,local,folded FROM names WHERE job=?", (job_id,)))
-                db.executemany("INSERT INTO artifacts VALUES(?,?,?,?,?,?,?)", source.execute("SELECT path,type,local,size,sha256,fingerprint,preview_size FROM artifacts WHERE job=?", (job_id,)))
-                db.executemany("INSERT INTO partials VALUES(?,?,?,?,?,?,?,?)", source.execute("SELECT path,type,local,fingerprint,size,sha256,etag,total FROM partials WHERE job=?", (job_id,)))
+                db.executemany("INSERT INTO verification_cache VALUES(?,?)", checked(source.execute("SELECT local,signature FROM verification_cache WHERE job=?", (job_id,))))
+                db.executemany("INSERT INTO inventory VALUES(?,?,?)", checked(source.execute("SELECT path,kind,meta FROM entries WHERE job=?", (job_id,))))
+                db.executemany("INSERT OR IGNORE INTO inventory VALUES(?,?,?)", checked(source.execute("SELECT b.path,b.kind,b.meta FROM baseline b LEFT JOIN changes c ON c.job=b.job AND c.path=b.path WHERE b.job=? AND (c.status='unknown' OR ?=0)", (job_id, job["scan_complete"]))))
+                db.executemany("INSERT INTO names VALUES(?,?,?)", checked(source.execute("SELECT identity,local,folded FROM names WHERE job=?", (job_id,))))
+                db.executemany("INSERT INTO artifacts VALUES(?,?,?,?,?,?,?)", checked(source.execute("SELECT path,type,local,size,sha256,fingerprint,preview_size FROM artifacts WHERE job=?", (job_id,))))
+                db.executemany("INSERT INTO partials VALUES(?,?,?,?,?,?,?,?)", checked(source.execute("SELECT path,type,local,fingerprint,size,sha256,etag,total FROM partials WHERE job=?", (job_id,))))
             db.commit()
         target = safe_join(job["root"], local)
         if owned and os.path.exists(target):
