@@ -205,3 +205,34 @@ def test_refreshed_folder_size_does_not_keep_deleted_files_in_history(system,mon
     monkeypatch.setattr(engine.folder_usage,'snapshot',lambda *args,**kwargs:{'bytes':0,'updated':time.time(),'scanning':False})
     status=engine.status(job['id'])
     assert status['saved_bytes']>0 and status['folder_bytes']==0
+
+
+def test_completed_job_requests_final_folder_size(system,monkeypatch):
+    engine,api,_=system
+    api.file('disk:/one.bin',b'content',preview=False)
+    forced=threading.Event()
+    def snapshot(root,force=False,**kwargs):
+        if force: forced.set()
+        return {'bytes':0,'updated':time.time(),'scanning':False}
+    monkeypatch.setattr(engine.folder_usage,'snapshot',snapshot)
+    job_id=make_job(system,mode='fallback')
+    forced.clear()
+    engine.action(job_id,'start')
+    result=wait_job(engine,job_id)
+    assert result['phase']=='completed' and forced.is_set()
+
+
+def test_forced_folder_refresh_survives_busy_worker_limit(tmp_path):
+    usage=FolderUsage()
+    root=str(tmp_path)
+    (tmp_path/'file.bin').write_bytes(b'abc')
+    for name in ('busy-one','busy-two'):
+        usage.folders[name]={'bytes':None,'updated':None,'checked':time.monotonic(),'due':0,'error':'','scanning':True}
+    assert usage.snapshot(root,force=True)['scanning']
+    assert usage.folders[root]['dirty'] and not usage.folders[root]['scanning']
+    usage.folders['busy-one']['scanning']=False
+    usage.snapshot(root)
+    due=time.monotonic()+test_timeout(5)
+    while usage.folders[root]['scanning'] and time.monotonic()<due:time.sleep(.01)
+    assert not usage.folders[root]['scanning'] and not usage.folders[root]['dirty']
+    assert usage.folders[root]['bytes']==3

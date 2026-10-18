@@ -20,21 +20,26 @@ class FolderUsage:
             return {"bytes":None,"updated":None,"scanning":False}
         root = str(Path(root).absolute())
         with self.lock:
-            item = self.folders.setdefault(root, {"bytes": None, "updated": None, "scanning": False, "due": 0, "error":"", "checked":0})
+            item = self.folders.setdefault(root, {"bytes": None, "updated": None, "scanning": False, "due": 0, "error":"", "checked":0, 'generation':0,'dirty':False})
+            if force:
+                item['generation']=item.get('generation',0)+1
+                item['dirty']=True
             due = item['checked'] + (min(30, self.interval) if active else self.interval)
-            if not item["scanning"] and sum(value['scanning'] for value in self.folders.values()) < 2 and (force or not item['checked'] or time.monotonic() >= due):
+            if not item["scanning"] and sum(value['scanning'] for value in self.folders.values()) < 2 and (item.get('dirty') or not item['checked'] or time.monotonic() >= due):
                 item["scanning"] = True
                 try:
-                    threading.Thread(target=self.scan, args=(root,), daemon=True, name="disk-folder-usage").start()
+                    threading.Thread(target=self.scan, args=(root,item.get('generation',0)), daemon=True, name="disk-folder-usage").start()
                 except RuntimeError:
                     item.update(scanning=False,error='На ПК не удалось начать подсчёт размера папки. Повторите обновление объёма позже.')
             while len(self.folders)>64:
                 victim=next((key for key,value in self.folders.items() if key!=root and not value['scanning']),None)
                 if victim is None: break
                 del self.folders[victim]
-            return dict(item)
+            return dict(item,scanning=item['scanning'] or item.get('dirty',False))
 
-    def scan(self, root):
+    def scan(self, root, generation=None):
+        if generation is None:
+            with self.lock: generation=self.folders[root].get('generation',0)
         total = 0
         error = ''
         queue = [native(root)]
@@ -56,4 +61,5 @@ class FolderUsage:
             except OSError:
                 error = 'Папка на ПК недоступна. Проверьте подключение диска и права доступа.'
         with self.lock:
-            self.folders[root].update(bytes=None if error else total, updated=time.time(), due=time.monotonic()+self.interval, checked=time.monotonic(), scanning=False, error=error)
+            item=self.folders[root]
+            item.update(bytes=None if error else total, updated=time.time(), due=time.monotonic()+self.interval, checked=time.monotonic(), scanning=False, error=error,dirty=item.get('generation',0)!=generation)

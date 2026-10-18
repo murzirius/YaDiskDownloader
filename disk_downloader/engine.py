@@ -679,6 +679,11 @@ class Engine:
                 control.active.clear()
                 control.finished = time.monotonic()
 
+            # One final sweep includes the last media file, reports and manifest.
+            # Idle history polling does not need to rescan the entire folder.
+            if not self.shutting_down and operation != 'scan':
+                self.folder_usage.snapshot(self.store.job(job_id)['root'],force=True)
+
     def scan(self, job_id, control):
         job = self.store.job(job_id)
         settings = job["settings"]
