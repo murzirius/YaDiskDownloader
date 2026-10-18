@@ -44,7 +44,7 @@ def find_import(store, root, exclude_job=None):
     return None
 
 
-def inherit(store, job_id, previous, checkpoint=lambda: None, progress=lambda count: None):
+def inherit(store, job_id, previous, checkpoint=lambda: None, progress=lambda count: None, details=None):
     """Copy in bounded, restartable batches without holding a writer during IO."""
     root = store.job(job_id)['root']
     same = bool(previous.get('store'))
@@ -70,7 +70,15 @@ def inherit(store, job_id, previous, checkpoint=lambda: None, progress=lambda co
         if same:
             tasks.append(('verification_cache','SELECT local,signature FROM verification_cache'+where,args,None,0))
         count = 0
+        total = None
+        if details:
+            total = 0
+            for _,sql,parameters,_,_ in tasks:
+                checkpoint()
+                total += source.execute('SELECT COUNT(*) FROM ('+sql+')',parameters).fetchone()[0]
+            details(0,total,None)
         for table,sql,parameters,remote,local in tasks:
+            if details:details(count,total,table)
             rows = previous['store'].rows(sql,parameters) if same else source.execute(sql,parameters)
             batch = []
             for record in rows:
@@ -83,10 +91,12 @@ def inherit(store, job_id, previous, checkpoint=lambda: None, progress=lambda co
                     with store.db() as target:
                         target.executemany('INSERT OR IGNORE INTO '+table+' VALUES('+','.join('?' for _ in batch[0])+')',batch)
                     count+=len(batch); progress(count); batch.clear()
+                    if details:details(count,total,table)
             if batch:
                 with store.db() as target:
                     target.executemany('INSERT OR IGNORE INTO '+table+' VALUES('+','.join('?' for _ in batch[0])+')',batch)
                 count+=len(batch); progress(count)
+                if details:details(count,total,table)
 
 
 def save_import(store, job_id, checkpoint=lambda: None):

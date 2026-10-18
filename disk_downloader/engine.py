@@ -615,7 +615,9 @@ class Engine:
                     previous = find_import(self.store, Path(job['root']), exclude_job=job_id)
                 if not previous:
                     raise ValueError('На ПК не найдена прежняя опись загрузки. Проверьте папку или создайте дозагрузку заново.')
-                inherit(self.store,job_id,previous,control.check,lambda count:control.progress(job['root'],count,None,'Читаем историю скачанной папки',unit='objects'))
+                history_labels = {'baseline':'список файлов и папок','names':'имена и пути','artifacts':'скачанные копии','partials':'недокачанные части','verification_cache':'результаты прежних проверок'}
+                control.progress(job['root'],0,None,'Подсчитываем записи истории',unit='records')
+                inherit(self.store,job_id,previous,control.check,details=lambda count,total,stage:control.progress(job['root'],count,total,'Читаем историю: '+history_labels.get(stage,'подготовка списка'),unit='records'))
                 settings = self.store.job(job_id)['settings']
                 settings.pop('_inherit_source',None)
                 self.store.update_job(job_id,settings=json.dumps(settings,ensure_ascii=False))

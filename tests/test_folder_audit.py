@@ -130,7 +130,8 @@ def test_inheritance_runs_outside_request_and_can_stop_resume(system,monkeypatch
     first=run_job(system,mode='fallback')
     entered=threading.Event()
     from disk_downloader.engine import inherit
-    def blocked(store,job_id,previous,checkpoint,progress):
+    def blocked(store,job_id,previous,checkpoint,progress=lambda count:None,details=None):
+        if details:details(1,4,'names')
         entered.set()
         while True:
             checkpoint()
@@ -140,6 +141,8 @@ def test_inheritance_runs_outside_request_and_can_stop_resume(system,monkeypatch
     job_id=engine.create({'destination':first['root'],'operation':'missing'})
     assert time.monotonic()-started<test_timeout(2)
     assert entered.wait(test_timeout(5))
+    activity=engine.controls[job_id].snapshot()['active']
+    assert activity[0]['unit']=='records' and activity[0]['done']==1 and activity[0]['size']==4
     assert engine.lock.acquire(blocking=False)
     engine.lock.release()
     engine.action(job_id,'stop')
