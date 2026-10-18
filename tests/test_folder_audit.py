@@ -195,3 +195,13 @@ def test_phase_transition_does_not_display_stale_finished_counters(system,monkey
     monkeypatch.setattr(engine.status_cache,'refresh',lambda *args:None)
     result=engine.status_cache.snapshot(job)
     assert result['phase']=='ready' and result['statistics_pending']
+
+
+def test_refreshed_folder_size_does_not_keep_deleted_files_in_history(system,monkeypatch):
+    engine,api,_=system
+    api.file('disk:/removed.bin',b'saved content',preview=False)
+    job=run_job(system,mode='fallback')
+    (Path(job['root'])/'removed.bin').unlink()
+    monkeypatch.setattr(engine.folder_usage,'snapshot',lambda *args,**kwargs:{'bytes':0,'updated':time.time(),'scanning':False})
+    status=engine.status(job['id'])
+    assert status['saved_bytes']>0 and status['folder_bytes']==0

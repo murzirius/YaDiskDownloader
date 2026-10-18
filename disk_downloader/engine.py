@@ -510,7 +510,7 @@ class Engine:
                 pass
         status["local_bytes"] = status["saved_bytes"] + service_bytes
         usage = self.folder_usage.snapshot(status["root"], active=live and not (control and control.paused))
-        status["folder_bytes"] = max(usage['bytes'], status['local_bytes']) if usage['bytes'] is not None else None if usage.get('error') else status['local_bytes']
+        status["folder_bytes"] = usage['bytes'] if usage['bytes'] is not None else None if usage.get('error') else status['local_bytes']
         status['folder_bytes_error'] = usage.get('error','')
         status["folder_bytes_scanning"] = usage["scanning"]
         status["folder_bytes_updated"] = usage["updated"]
