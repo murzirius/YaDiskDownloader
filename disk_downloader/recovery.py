@@ -6,7 +6,8 @@ from .service_outputs import digest_file
 
 
 def recover_publications(store, checkpoint=lambda: None, progress=lambda path: None):
-    recovered = 0
+    from .duplicates import recover_moves
+    recovered = recover_moves(store,checkpoint,progress)
     for row in store.rows('SELECT * FROM pending_service_outputs'):
         checkpoint()
         progress(row['local'])
@@ -52,7 +53,7 @@ class Recovery:
         with self.lock:
             if self.result['busy']: return
             with self.store.db() as db:
-                total=db.execute('SELECT (SELECT COUNT(*) FROM pending_publications)+(SELECT COUNT(*) FROM pending_service_outputs)').fetchone()[0]
+                total=db.execute('SELECT (SELECT COUNT(*) FROM pending_publications)+(SELECT COUNT(*) FROM pending_service_outputs)+(SELECT COUNT(*) FROM duplicate_moves)').fetchone()[0]
             self.result.update(busy=bool(total),error='',processed=0,total=total,current='')
             if not total: return
             self.cancel.clear()

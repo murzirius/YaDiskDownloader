@@ -26,6 +26,7 @@ from .runtime import state_folder, destination_folder, frozen
 from .backups import Backups
 from .management import Management
 from .maintenance import Maintenance
+from .duplicate_review import DuplicateReview
 from .recovery import Recovery
 from .updater import Installer
 from .service_outputs import root_key, digest_file
@@ -33,6 +34,7 @@ from .limits import normalize_saved_workers
 from .folder_dialog import FolderPicker
 from .import_state import find_import
 from .request_errors import RequestErrors
+from .insights import DestinationChecks, download_plan, files as job_files, problems as job_problems
 
 
 def create_app(state_dir=None, api=None, port=8766):
@@ -49,6 +51,8 @@ def create_app(state_dir=None, api=None, port=8766):
     recovery.start()
     updates = Updates(store)
     management, maintenance, backups = Management(engine), Maintenance(engine), Backups(store)
+    duplicate_review=DuplicateReview(engine)
+    app.extensions['duplicate_review']=duplicate_review
     installer = Installer(engine,updates,backups,port)
     app.extensions['installer'] = installer
     app.extensions.update(engine=engine, store=store, disk_api=api, updates=updates, management=management, maintenance=maintenance, backups=backups, recovered=0, recovery=recovery)
@@ -59,6 +63,8 @@ def create_app(state_dir=None, api=None, port=8766):
     app.extensions['folder_picker'] = folder_picker
     request_errors = RequestErrors(state)
     engine.request_errors = request_errors
+    destination_checks = DestinationChecks(store)
+    app.extensions['destination_checks'] = destination_checks
     auth_lock = threading.Lock()
     instance_id = secrets.token_hex(8)
 
@@ -134,7 +140,8 @@ def create_app(state_dir=None, api=None, port=8766):
         from .sqlite_support import safe_wal
         import sqlite3
         from . import __build__
-        return jsonify(sqlite=sqlite3.sqlite_version, safe_sqlite_wal=safe_wal(), version=__version__, build=__build__, frozen=frozen(), tray=tray.status() if tray else {"visible": False, "error": ""}, can_exit=bool(app.extensions.get("quit_app")), migration=app.extensions.get("migration", {"jobs": 0, "failed_sources": 0}))
+        from .desktop import status as desktop_status
+        return jsonify(sqlite=sqlite3.sqlite_version, safe_sqlite_wal=safe_wal(), version=__version__, build=__build__, frozen=frozen(), tray=tray.status() if tray else {"visible": False, "error": ""}, desktop=desktop_status(), can_exit=bool(app.extensions.get("quit_app")), migration=app.extensions.get("migration", {"jobs": 0, "failed_sources": 0}))
 
     @app.post("/api/exit")
     def exit_app():
@@ -301,6 +308,23 @@ def create_app(state_dir=None, api=None, port=8766):
             maintenance.cancel.set()
             return jsonify(ok=True)
         return jsonify(maintenance.start(data))
+
+    @app.get('/api/jobs/<job_id>/duplicates')
+    def duplicate_list(job_id):
+        offset=request.args.get('offset','0')
+        if not offset.isascii() or not offset.isdigit() or len(offset)>8:raise ValueError('Некорректная страница дубликатов.')
+        return jsonify(duplicate_review.snapshot(job_id,int(offset)))
+
+    @app.post('/api/jobs/<job_id>/duplicates')
+    def duplicate_cleanup(job_id):
+        data=payload()
+        if data.get('action')=='cancel':
+            store.job(job_id)
+            with duplicate_review.lock:
+                if duplicate_review.result['job']!=job_id:raise ValueError('В этом задании очистка не запущена.')
+            duplicate_review.cancel()
+            return jsonify(duplicate_review.snapshot(job_id))
+        return jsonify(duplicate_review.start(job_id,data))
 
     @app.post('/api/cleanup-preview')
     def cleanup_preview(): return jsonify(maintenance.cleanup_preview(payload().get('root')))
@@ -483,6 +507,44 @@ def create_app(state_dir=None, api=None, port=8766):
         usage=shutil.disk_usage(parent)
         previous=find_import(store,path) if path.is_dir() else None
         return jsonify(path=str(path),exists=path.is_dir(),writable=True,free_bytes=usage.free,total_bytes=usage.total,used_percent=round((usage.total-usage.free)*100/max(1,usage.total),1),previous_import=bool(previous))
+
+    @app.post('/api/destination-check')
+    def start_destination_check():
+        return jsonify(destination_checks.start(payload().get('path')))
+
+    @app.get('/api/destination-check')
+    def destination_check_status():
+        return jsonify(destination_checks.snapshot())
+
+    @app.get('/api/jobs/<job_id>/plan')
+    def job_plan(job_id):
+        return jsonify(download_plan(store,job_id))
+
+    @app.get('/api/jobs/<job_id>/files')
+    def search_job_files(job_id):
+        offset=request.args.get('offset','0')
+        if not offset.isascii() or not offset.isdigit() or len(offset)>8:
+            raise ValueError('Некорректная страница списка файлов. Повторите поиск.')
+        return jsonify(job_files(store,job_id,request.args.get('q',''),request.args.get('state','all'),int(offset)))
+
+    @app.get('/api/jobs/<job_id>/problems')
+    def grouped_job_problems(job_id):
+        return jsonify(job_problems(store,job_id))
+
+    @app.post('/api/jobs/<job_id>/open-file-folder')
+    def open_file_folder(job_id):
+        job=store.job(job_id)
+        path=payload().get('path')
+        with store.db() as db:
+            row=db.execute("SELECT local FROM artifacts WHERE job=? AND path=? ORDER BY type LIMIT 1",(job_id,path)).fetchone()
+        if not row:raise ValueError('У этого файла пока нет сохранённой копии. Можно повторить загрузку.')
+        filename=safe_join(job['root'],row['local'])
+        if not os.path.isfile(filename):raise ValueError('Файл на устройстве не найден. Подключите накопитель или запустите дозагрузку.')
+        if os.name=='nt':
+            import subprocess
+            explorer=Path(os.environ.get('SystemRoot',r'C:\Windows'))/'explorer.exe'
+            subprocess.Popen([str(explorer),'/select,'+str(filename)])
+        return jsonify(ok=True)
 
     @app.get("/api/jobs/<job_id>")
     def job_status(job_id):

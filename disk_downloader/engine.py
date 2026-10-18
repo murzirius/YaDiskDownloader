@@ -95,6 +95,10 @@ class Control:
         self.selected_paths = None
         self.rate_limiter = rate_limit.RateLimiter(0)
         self.verification = None
+        self.verification_cached = 0
+        self.verification_hashed = 0
+        self.duplicate_locks = [threading.RLock() for _ in range(64)]
+        self.duplicate_cleanup_lock = threading.RLock()
 
     def event(self, group, message, path="", level="info"):
         if self.journal:
@@ -198,11 +202,15 @@ class Engine:
         if operation not in ("new", "missing"):
             raise ValueError("Некорректный способ загрузки")
         missing_policy = data.get("missing_policy", "originals")
-        if missing_policy not in ("originals", "any_result"):
+        if missing_policy not in ("originals", "any_result", "both"):
             raise ValueError("Выберите, что считать скачанным: только оригинал или оригинал и превью.")
         values["missing_policy"] = missing_policy
+        verification_mode = data.get('verification_mode','fast')
+        if verification_mode not in ('fast','full'):
+            raise ValueError('Выберите быструю или полную проверку скачанных файлов.')
+        values['verification_mode'] = verification_mode
         values["retries"] = values["attempts"] - 1
-        for name, default in (("create_zip", True), ("auto_pause", True), ("resume_parts", True), ("adaptive_workers", False)):
+        for name, default in (("create_zip", True), ("auto_pause", True), ("resume_parts", True), ("adaptive_workers", False), ("deduplicate", False)):
             value = data.get(name, default)
             if not isinstance(value, bool):
                 raise ValueError("Некорректная настройка " + name)
@@ -249,6 +257,8 @@ class Engine:
                 data["whole_disk"] = previous["job"]["settings"].get("whole_disk", False)
         settings = self.validate_settings(data)
         if previous:
+            if sorted(previous['job']['settings'].get('paths',[])) != sorted(settings['paths']):
+                settings['destination_warning'] = 'Выбор исходных папок отличается от прежней загрузки в эту папку. Проверьте выбранные пути перед запуском. Прежние файлы останутся на месте.'
             settings["comparison_available"] = bool(previous.get("store") or previous.get("inventory_available"))
             settings['_inherit_source'] = {'job':previous['id']} if previous.get('store') else {'manifest':previous['file'].name}
         job_id = uuid.uuid4().hex
@@ -362,6 +372,8 @@ class Engine:
                     raise ValueError("Для изменения ограничений остановите задание и продолжите с новыми параметрами")
                 if not self.api.credentials.connected and control.requires_connection():
                     raise ValueError("Для продолжения загрузки подключите Яндекс.Диск: вставьте ключ доступа вверху страницы. Скачанные файлы сохранены.")
+                if limits and any(limits.get(key,job['settings'].get(key,default)) != job['settings'].get(key,default) for key,default in (('deduplicate',False),('verification_mode','fast'))):
+                    raise ValueError('Чтобы изменить проверку или защиту от дубликатов, нажмите «Остановить», дождитесь остановки и затем «Продолжить».')
                 if limits and limits.get("missing_policy", job["settings"].get("missing_policy", "originals")) != job["settings"].get("missing_policy", "originals"):
                     raise ValueError("Чтобы изменить учёт превью, нажмите «Остановить», дождитесь остановки и затем «Продолжить».")
                 if limits:
@@ -390,7 +402,7 @@ class Engine:
                     if found != len(paths):
                         raise ValueError("Выбранный файл не принадлежит заданию")
                 if limits:
-                    keys = ("workers", "attempts", "timeout", "total_timeout", "create_zip", "auto_pause", "max_disk_percent", "adaptive_workers", "resume_parts", "speed_limit_mib", "missing_policy")
+                    keys = ("workers", "attempts", "timeout", "total_timeout", "create_zip", "auto_pause", "max_disk_percent", "adaptive_workers", "resume_parts", "speed_limit_mib", "missing_policy", "verification_mode", "deduplicate")
                     validated = self.validate_settings({**job["settings"], **{k: limits[k] for k in keys if k in limits}})
                     job["settings"].update({k: validated[k] for k in (*keys, "retries")})
                     self.store.update_job(job_id, settings=json.dumps(job["settings"], ensure_ascii=False))
@@ -527,7 +539,8 @@ class Engine:
             phase = status["phase"]
             work = status["remaining_work"]
             remaining_bytes, unknown_files = work["bytes"], work["unknown_files"]
-            if status["settings"]["mode"] == "both" and status["settings"].get("operation") != "missing" and not status["generation"]:
+            want_both = status['settings'].get('missing_policy') == 'both' or status["settings"]["mode"] == "both" and status["settings"].get("operation") != "missing" and not status["generation"]
+            if want_both:
                 unknown_files = max(unknown_files, work["preview_files"])
             with control.lock:
                 for item in status["active"]:
@@ -543,7 +556,7 @@ class Engine:
                 if phase == "packing":
                     status["eta_seconds"] = control.remaining_time.estimate(phase, status["zip_done"], 0, max(0, status["zip_total"] - status["zip_done"]), 0)
                 else:
-                    original_only = status["settings"]["mode"] == "fallback" or status["settings"].get("operation") == "missing" or status["generation"] > 0
+                    original_only = not want_both and (status["settings"]["mode"] == "fallback" or status["settings"].get("operation") == "missing" or status["generation"] > 0)
                     status["eta_seconds"] = control.remaining_time.estimate(phase, control.transferred, status["processed"], remaining_bytes, work["files"], unknown_files, original_only=original_only)
                 status["eta_message"] = control.remaining_time.reason
                 status["eta_basis"] = control.remaining_time.basis
@@ -968,7 +981,14 @@ class Engine:
                 original = preview = False
                 try:
                     original = self.reusable(job, entry, "original", meta, control)
-                    preview = not original and preview_type(meta) and self.reusable(job, entry, "preview", meta, control)
+                    want_both = job['settings'].get('missing_policy') == 'both'
+                    if original and job['settings'].get('deduplicate'):
+                        from .duplicates import compact
+                        compact(self,job,entry,'original',meta,control)
+                    preview = (not original or want_both) and preview_type(meta) and self.reusable(job, entry, "preview", meta, control)
+                    if preview and job['settings'].get('deduplicate'):
+                        from .duplicates import compact
+                        compact(self,job,entry,'preview',meta,control)
                     if (original or preview) and job["settings"].get("operation") != "missing":
                         # A restart resumes a saved inventory. Before skipping
                         # its verified copies, check whether the source changed.
@@ -987,9 +1007,10 @@ class Engine:
                     with self.store.db() as db:
                         db.execute("DELETE FROM artifacts WHERE job=? AND path=?", (job_id, entry["path"]))
                 if original:
-                    desired = ('existing',2,'existing_verified','not_needed')
-                    if (entry['path'],'preview') in control.verification_records:
-                        remove_previews.append((job_id,entry['path']))
+                    need_preview = want_both and preview_type(meta)
+                    desired = ('pending' if need_preview and not preview else 'existing',2,'existing_verified','existing_verified' if preview else 'not_requested' if need_preview else 'not_needed')
+                    if not want_both:
+                        self.remove_preview(job, entry['path'], control)
                 elif preview and job['settings'].get('missing_policy','originals') == 'any_result':
                     desired = ('existing',1,'not_requested','existing_verified')
                 else:
@@ -1004,14 +1025,59 @@ class Engine:
                 checked += 1
                 found += bool(original or preview)
                 originals += bool(original)
-                previews += bool(preview)
+                previews += bool(preview and not original)
                 with control.lock:
                     control.active.clear()
-                    control.verification = {'checked':checked,'total':total,'originals':originals,'previews':previews,'missing':checked-found,'complete':checked==total}
+                    control.verification = {'checked':checked,'total':total,'originals':originals,'previews':previews,'missing':checked-found,'complete':checked==total,'cached':control.verification_cached,'hashed':control.verification_hashed}
                 control.progress(entry["path"], checked, total, "Проверка скачанной папки", unit="objects")
             cursor = rows[-1]["path"]
             flush()
         control.event("cache", f"Папка проверена: {checked} файлов, уже есть результат у {found}. Сначала будут скачаны файлы без результата.")
+
+    def remove_preview(self, job, path, control):
+        while not control.duplicate_cleanup_lock.acquire(timeout=.15):control.check()
+        try:return self._remove_preview(job,path,control)
+        finally:control.duplicate_cleanup_lock.release()
+
+    def _remove_preview(self, job, path, control):
+        """Keep modified/foreign files and retain their record when cleanup fails."""
+        from .preview_cleanup import remove_owned
+        with self.store.db() as db:
+            entry = db.execute('SELECT * FROM entries WHERE job=? AND path=?',(job['id'],path)).fetchone()
+            original = db.execute("SELECT a.*,v.signature FROM artifacts a LEFT JOIN verification_cache v ON v.job=a.job AND v.local=a.local WHERE a.job=? AND a.path=? AND a.type='original'", (job['id'], path)).fetchone()
+            preview = db.execute("SELECT * FROM artifacts WHERE job=? AND path=? AND type='preview'", (job['id'], path)).fetchone()
+        if not original or not preview or original['local'] == preview['local']:
+            return
+        with self.store.db() as db:
+            shared=db.execute('SELECT COUNT(*) FROM artifacts WHERE job=? AND local=?',(job['id'],preview['local'])).fetchone()[0]>1
+            if shared:
+                db.execute("DELETE FROM artifacts WHERE job=? AND path=? AND type='preview'",(job['id'],path))
+                return
+        try:
+            if not entry or not self.reusable(job,dict(entry),'preview',json.loads(entry['meta']),control):
+                return
+            original_file = safe_join(job['root'],original['local'])
+            signature = file_signature(original_file,original['sha256'])
+            if signature[2] != original['size']:
+                return
+            cached = signature[-1] is not None and original['signature'] == json.dumps(signature)
+            if not cached and file_hash(original_file,control.check) != original['sha256']:
+                return
+            def checkpoint():
+                control.check()
+                if file_signature(original_file,original['sha256']) != signature:
+                    raise OSError('Original changed during preview cleanup')
+            checkpoint()
+            if not remove_owned(job['root'], dict(preview), checkpoint):
+                control.event('cache', 'Превью оставлено: файл изменён или открыт другой программой.', path, 'warning')
+                return
+        except OSError:
+            control.event('cache', 'Оригинал сохранён. Превью пока не удалено: проверьте доступ к файлу на устройстве.', path, 'warning')
+            return
+        with self.store.db() as db:
+            db.execute("DELETE FROM artifacts WHERE job=? AND path=? AND type='preview' AND local=? AND sha256=?", (job['id'], path, preview['local'], preview['sha256']))
+            db.execute('DELETE FROM verification_cache WHERE job=? AND local=?', (job['id'], preview['local']))
+        control.event('cache', 'Оригинал сохранён и проверен. Прежнее превью удалено.', path, 'success')
 
     def remember_file(self, job, relative, sha):
         signature = file_signature(safe_join(job["root"], relative), sha)
@@ -1065,7 +1131,11 @@ class Engine:
             valid = valid and stat.S_ISREG(os.stat(filename).st_mode) and signature[2] == artifact['size']
             if valid:
                 encoded = json.dumps(signature)
-                cached = signature[-1] is not None and artifact.get('signature') == encoded
+                cached = job['settings'].get('verification_mode','fast') != 'full' and signature[-1] is not None and artifact.get('signature') == encoded
+                if cached:
+                    control.verification_cached += 1
+                else:
+                    control.verification_hashed += 1
                 hashed = 0
                 def hash_checkpoint():
                     nonlocal hashed
@@ -1107,8 +1177,10 @@ class Engine:
         job = self.store.job(job_id)
         path = entry["path"]
         mode = job["settings"]["mode"]
+        if job['settings'].get('missing_policy') == 'both':
+            mode = 'both'
         if job["settings"].get("operation") == "missing" or job["generation"] > 0:
-            mode = "fallback"
+            mode = "both" if job['settings'].get('missing_policy') == 'both' else "fallback"
         errors = []
         other_errors = []
         completed, reused = [], []
@@ -1140,21 +1212,26 @@ class Engine:
             kinds = ["preview"] if mode == "previews" else ["original"] if mode == "originals" else ["original", "preview"]
             for kind in kinds:
                 control.check()
-                if kind == "preview" and "original" in completed and (mode == "fallback" or "original" in reused):
+                if kind == "preview" and "original" in completed and mode == "fallback":
                     preview_status = "not_needed"
-                    with self.store.db() as db:
-                        db.execute("DELETE FROM artifacts WHERE job=? AND path=? AND type='preview'", (job_id, path))
+                    self.remove_preview(job, path, control)
                     break
                 if kind == "preview" and mode == "fallback":
                     fallback = True
                 try:
-                    was_reused = self.reusable(job, entry, kind, meta, control)
-                    if was_reused:
-                        reused.append(kind)
-                        outcome = "existing_verified"
-                    else:
-                        self.transfer(job, entry, kind, meta, control)
-                        outcome = "downloaded_verified"
+                    from .duplicates import content_lock, reuse, compact
+                    with content_lock(job,kind,meta,control):
+                        was_reused = self.reusable(job, entry, kind, meta, control)
+                        if not was_reused and job['settings'].get('deduplicate'):
+                            was_reused = reuse(self,job,entry,kind,meta,control)
+                        if was_reused:
+                            reused.append(kind)
+                            outcome = "existing_verified"
+                        else:
+                            self.transfer(job, entry, kind, meta, control)
+                            outcome = "downloaded_verified"
+                        if job['settings'].get('deduplicate'):
+                            compact(self,job,entry,kind,meta,control)
                     completed.append(kind)
                     label = "Оригинал" if kind == "original" else "Превью"
                     result = (" уже скачан, проверка пройдена" if kind == "original" else " уже скачано, проверка пройдена") if was_reused else (" скачан и проверен" if kind == "original" else " скачано и проверено")
@@ -1482,7 +1559,7 @@ class Engine:
                         output.writestr(relative + "/", b"")
                 report_folder = job["service"] + "/reports"
                 output.writestr(report_folder + "/", b"")
-                artifacts = self.store.rows("SELECT a.local,a.size,a.sha256 FROM artifacts a JOIN entries e ON e.job=a.job AND e.path=a.path WHERE a.job=? ORDER BY a.local", (job_id,))
+                artifacts = self.store.rows("SELECT DISTINCT a.local,a.size,a.sha256 FROM artifacts a JOIN entries e ON e.job=a.job AND e.path=a.path WHERE a.job=? ORDER BY a.local", (job_id,))
                 files = ((r["local"], r["size"], r["sha256"], r["local"]) for r in artifacts)
                 import itertools
                 report_files = ((r, os.path.getsize(safe_join(job["root"], r)), None, report_folder + ("/changes.html" if r == reports[-1] else "/report." + r.rsplit(".", 1)[1])) for r in reports)

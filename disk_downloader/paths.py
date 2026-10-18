@@ -167,12 +167,17 @@ def reserve_output(store, job, name):
     return candidate
 
 
-def safe_join(root, relative):
+def relative_parts(relative):
     if not isinstance(relative, str) or relative.startswith(("/", "\\")):
         raise PathError("Недопустимый локальный путь")
     parts = relative.split("/") if relative else []
     if any(p in ("", ".", "..") or ":" in p or "\\" in p or p.endswith((".", " ")) or any(ord(c) < 32 for c in p) or re.fullmatch(r"(?i)(CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])", p.split(".")[0]) for p in parts):
         raise PathError("Недопустимый локальный путь")
+    return parts
+
+
+def safe_join(root, relative):
+    parts = relative_parts(relative)
     root = Path(root).absolute()
     candidate = root.joinpath(*parts)
     real_root = root.resolve()

@@ -34,6 +34,10 @@ class Tray:
             self.notification_stop.set()
             self.quit_app()
 
+    def open(self):
+        from .desktop import show
+        if not show():webbrowser.open(self.url)
+
     def active(self):
         for job_id, thread in tuple(self.engine.threads.items()):
             control = self.engine.controls.get(job_id)
@@ -70,12 +74,12 @@ class Tray:
 
                 def _on_notify(self,wparam,lparam):
                     if lparam==0x405:  # NIN_BALLOONUSERCLICK (WM_USER + 5)
-                        webbrowser.open(owner.url)
+                        owner.open()
                     else:
                         super()._on_notify(wparam,lparam)
             icon_class=ClickableIcon
         self.icon = icon_class("YaDiskDownloader", image(), "YaDiskDownloader", menu=pystray.Menu(
-            pystray.MenuItem("Открыть приложение", lambda icon, item: webbrowser.open(self.url), default=True),
+            pystray.MenuItem("Открыть приложение", lambda icon, item: self.open(), default=True),
             pystray.MenuItem(lambda item: self.pause_label(), lambda icon, item: self.toggle_async(), enabled=lambda item: bool(self.active())),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Завершить приложение", lambda icon, item: self.exit(), enabled=lambda item: not self.exiting.is_set())

@@ -3,7 +3,7 @@ import os
 import sqlite3
 from contextlib import closing
 from pathlib import Path
-from .paths import remote_path
+from .paths import remote_path,relative_parts,PathError
 
 from .paths import forget_temporary, publish, replace_owned, reserve_output, safe_join, temporary_file
 
@@ -65,10 +65,13 @@ def inherit(store, job_id, previous, checkpoint=lambda: None, progress=lambda co
             ('partials','path,type,local,fingerprint,size,sha256,etag,total',0,2),
         ):
             if table in available:
-                tasks.append((table,'SELECT '+columns+' FROM '+table+where,args,remote,local))
+                selection = 'SELECT '+columns+' FROM '+table+where
+                if table == 'names':
+                    selection += (' AND ' if where else ' WHERE ') + "(identity LIKE 'disk:/%' OR identity LIKE '@preview:disk:/%' OR identity LIKE '@output:%' OR identity='@service')"
+                tasks.append((table,selection,args,remote,local))
         # An external manifest is not trusted to skip hashing local content.
         if same:
-            tasks.append(('verification_cache','SELECT local,signature FROM verification_cache'+where,args,None,0))
+            tasks.append(('verification_cache',"SELECT v.local,v.signature FROM verification_cache v WHERE v.job=? AND EXISTS(SELECT 1 FROM artifacts a WHERE a.job=v.job AND a.local=v.local AND a.type IN ('original','preview'))",args,None,0))
         count = 0
         total = None
         if details:
@@ -85,7 +88,13 @@ def inherit(store, job_id, previous, checkpoint=lambda: None, progress=lambda co
                 checkpoint()
                 row = tuple(record.values()) if isinstance(record,dict) else tuple(record)
                 if remote is not None: remote_path(row[remote])
-                if local is not None: safe_join(root,row[local])
+                if local is not None:
+                    if table == 'names' and row[0].startswith('@output:'):
+                        # Keep collision reservations, without touching report/log files.
+                        parts=relative_parts(row[local])
+                        if len(str(Path(root).absolute().joinpath(*parts)))>30000:
+                            raise PathError('Путь превышает предел файловой системы')
+                    else:safe_join(root,row[local])
                 batch.append((job_id,*row))
                 if len(batch)>=200:
                     with store.db() as target:

@@ -18,19 +18,19 @@ from disk_downloader.store import Store
 from disk_downloader.tray import Tray
 
 
-def test_old_jobs_and_profiles_are_reduced_to_eight(system):
+def test_old_jobs_and_profiles_are_bounded_to_twenty(system):
     engine, _, tmp = system
     job = make_job(system)
-    settings = engine.store.job(job)['settings'] | {'workers': 20, 'adaptive_workers': False}
+    settings = engine.store.job(job)['settings'] | {'workers': 50, 'adaptive_workers': False}
     with engine.store.db() as db:
         db.execute('UPDATE jobs SET settings=? WHERE id=?', (json.dumps(settings), job))
         db.execute('INSERT INTO profiles VALUES(?,?)', ('Old', json.dumps(settings)))
     restored = Store(engine.store.filename)
-    assert restored.job(job)['settings']['workers'] == 8
+    assert restored.job(job)['settings']['workers'] == 20
     profile = next(restored.rows('SELECT settings FROM profiles'))
-    assert json.loads(profile['settings'])['workers'] == 8
+    assert json.loads(profile['settings'])['workers'] == 20
     with pytest.raises(ValueError):
-        engine.validate_settings(settings | {'workers': 9})
+        engine.validate_settings(settings | {'workers': 21})
 
 
 def test_scan_can_stop_and_continue_without_starting_download(system, monkeypatch):

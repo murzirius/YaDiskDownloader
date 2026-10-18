@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS names (
 CREATE TABLE IF NOT EXISTS artifacts (
  job TEXT NOT NULL, path TEXT NOT NULL, type TEXT NOT NULL, local TEXT NOT NULL,
  size INTEGER NOT NULL, sha256 TEXT NOT NULL, fingerprint TEXT NOT NULL,
- preview_size TEXT, PRIMARY KEY(job,path,type), UNIQUE(job,local)
+ preview_size TEXT, PRIMARY KEY(job,path,type)
 );
 CREATE TABLE IF NOT EXISTS scan_errors (
  job TEXT NOT NULL, path TEXT NOT NULL, error TEXT NOT NULL,
@@ -71,6 +71,8 @@ CREATE TABLE IF NOT EXISTS partials (
 CREATE TABLE IF NOT EXISTS partial_ownership (job TEXT,local TEXT,PRIMARY KEY(job,local));
 CREATE TABLE IF NOT EXISTS service_outputs (root TEXT,kind TEXT,local TEXT,sha256 TEXT,PRIMARY KEY(root,kind));
 CREATE TABLE IF NOT EXISTS temporary_files (root TEXT,local TEXT,purpose TEXT,created REAL,PRIMARY KEY(root,local));
+CREATE TABLE IF NOT EXISTS duplicate_candidates (job TEXT,local TEXT,canonical TEXT,type TEXT,size INTEGER,sha256 TEXT,PRIMARY KEY(job,local));
+CREATE TABLE IF NOT EXISTS duplicate_moves (job TEXT,local TEXT,quarantine TEXT,sha256 TEXT,size INTEGER,PRIMARY KEY(job,local));
 CREATE TABLE IF NOT EXISTS pending_publications (job TEXT,path TEXT,type TEXT,temp TEXT,local TEXT,size INTEGER,sha256 TEXT,fingerprint TEXT,preview_size TEXT,PRIMARY KEY(job,path,type));
 CREATE TABLE IF NOT EXISTS job_queue (job TEXT PRIMARY KEY,position INTEGER,action TEXT,state TEXT DEFAULT 'waiting',error TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS report_records (root TEXT,path TEXT,kind TEXT,data TEXT,PRIMARY KEY(root,path,kind));
@@ -93,6 +95,16 @@ class Store:
             setup.execute("PRAGMA journal_mode=" + mode)
         with self.db() as db:
             db.executescript(SCHEMA)
+            # Older versions allowed just one remote reference per local file.
+            # Migrate transactionally; the upgrade backup retains the old schema.
+            unique_local = any(row[2] and [r[2] for r in db.execute('PRAGMA index_info("'+row[1]+'")')] == ['job','local'] for row in db.execute('PRAGMA index_list(artifacts)').fetchall())
+            if unique_local:
+                db.execute('ALTER TABLE artifacts RENAME TO artifacts_legacy')
+                db.execute('CREATE TABLE artifacts (job TEXT NOT NULL,path TEXT NOT NULL,type TEXT NOT NULL,local TEXT NOT NULL,size INTEGER NOT NULL,sha256 TEXT NOT NULL,fingerprint TEXT NOT NULL,preview_size TEXT,PRIMARY KEY(job,path,type))')
+                db.execute('INSERT INTO artifacts SELECT * FROM artifacts_legacy')
+                db.execute('DROP TABLE artifacts_legacy')
+            db.execute('CREATE INDEX IF NOT EXISTS artifact_content ON artifacts(job,type,sha256,size,preview_size)')
+            db.execute('CREATE INDEX IF NOT EXISTS artifact_local ON artifacts(job,local)')
             columns = {row[1] for row in db.execute("PRAGMA table_info(entries)")}
             for name in ("original_attempts", "preview_attempts", "priority"):
                 if name not in columns:
@@ -121,6 +133,8 @@ class Store:
                     settings["attempts"] = min(9, max(1, retries + 1)) if isinstance(retries, int) and not isinstance(retries, bool) else 1
                     settings["retries"] = settings["attempts"] - 1
                     changed = True
+                if settings.pop("duplicate_cleanup", None) is not None:
+                    changed = True
                 if settings.get("adaptive_workers") is not False:
                     settings["adaptive_workers"] = False
                     changed = True
@@ -134,6 +148,8 @@ class Store:
                 except (ValueError, TypeError):
                     continue
                 workers_changed = normalize_saved_workers(settings)
+                if settings.pop("duplicate_cleanup", None) is not None:
+                    workers_changed = True
                 if 'total_timeout' not in settings:
                     settings['total_timeout'] = settings.get('timeout', 20)
                     workers_changed = True
@@ -264,7 +280,7 @@ class Store:
                     or any(value not in ('photos','videos','music','files') for value in settings['file_types'])
                     or not settings['file_types']
                     or settings['operation'] not in ('new','missing')
-                    or settings['missing_policy'] not in ('originals','any_result')
+                    or settings['missing_policy'] not in ('originals','any_result','both')
                     or not isinstance(settings['whole_disk'], bool)):
                 raise ValueError()
             if any(isinstance(settings[key], bool) or not isinstance(settings[key], int) or not low <= settings[key] <= high for key,low,high in (('attempts',1,9),('timeout',5,3600),('total_timeout',0,86400))):
@@ -333,7 +349,8 @@ class Store:
 
     def summary(self, job_id):
         job = self.job(job_id)
-        mode = "fallback" if job["settings"].get("operation") == "missing" or job["generation"] > 0 else job["settings"]["mode"]
+        mode = ("both" if job['settings'].get('missing_policy') == 'both' else "fallback") if job["settings"].get("operation") == "missing" or job["generation"] > 0 else job["settings"]["mode"]
+        if job['settings'].get('missing_policy') == 'both':mode='both'
         with self.db() as db:
             # One indexed pass instead of independent scans for each counter.
             # Flattened read-only subqueries avoid inventory copies in RAM and
@@ -398,7 +415,10 @@ class Store:
         processed = sum(counts.get(k, 0) for k in ("done", "existing", "partial", "error", "no_preview", "filtered"))
         originals = next((r[1] for r in totals if r[0] == "original"), 0)
         previews = next((r[1] for r in totals if r[0] == "preview"), 0)
-        saved = sum(r[2] for r in totals)
+        with self.db() as db:
+            physical = db.execute('SELECT COALESCE(SUM(size),0),COUNT(*) FROM (SELECT a.local,MAX(a.size) size FROM artifacts a JOIN entries e ON e.job=a.job AND e.path=a.path WHERE a.job=? GROUP BY a.local)',(job_id,)).fetchone()
+            saved = physical[0]
+            duplicates = sum(r[1] for r in totals)-physical[1]
         unknown = int(volume[1] or 0)
         preview_count = int(volume[2] or 0)
         missing_operation = job["settings"].get("operation") == "missing"
@@ -410,7 +430,7 @@ class Store:
                    percent=round(processed * 100 / total, 2) if job["scan_complete"] and total else (100 if job["scan_complete"] else None),
                    originals=originals, previews=previews, replacements=replaced, existing=counts.get("existing", 0),
                    missing_previews=missing, cancelled=counts.get("cancelled", 0), errors=failures,
-                   scan_errors=scan_errors, saved_bytes=saved, previous_results=previous_results,
+                   scan_errors=scan_errors, saved_bytes=saved, duplicates=duplicates, previous_results=previous_results,
                    completeness=dict(zip(('selected', 'originals', 'preview_only', 'no_result'), map(int, completeness))),
                    remaining_work={"bytes": int(pending[0]), "unknown_files": int(pending[1]), "files": int(pending[2]), "preview_files": int(pending[3])},
                    estimate={"known_bytes": known, "unknown_sizes": unknown_downloads,

@@ -8,13 +8,8 @@ import json
 import re
 from pathlib import Path
 
-from waitress import create_server
-
-from disk_downloader.web import create_app
 from disk_downloader.runtime import frozen, state_folder, program_folder
-from disk_downloader.migration import migrate, candidates
-from disk_downloader.tray import Tray
-from disk_downloader.lifecycle import Shutdown
+from disk_downloader import desktop
 
 
 def message(text):
@@ -50,10 +45,18 @@ def lock_state(folder):
 
 
 def main():
+    desktop.progress('Загружаем компоненты приложения…',10)
+    from waitress import create_server
+    from disk_downloader.web import create_app
+    from disk_downloader.migration import migrate, candidates
+    from disk_downloader.tray import Tray
+    from disk_downloader.lifecycle import Shutdown
     parser = argparse.ArgumentParser(description="Локальное скачивание Яндекс.Диска")
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--no-tray", action="store_true")
+    parser.add_argument('--window',action='store_true',help='Показать окно управления Windows')
+    parser.add_argument('--no-window',action='store_true',help='Запустить без окна управления')
     parser.add_argument("--state-dir")
     parser.add_argument('--apply-update')
     parser.add_argument('--update-ack')
@@ -66,6 +69,7 @@ def main():
         return 0
     if not 1024 <= args.port <= 65535:
         parser.error("Порт должен быть от 1024 до 65535")
+    desktop.progress('Проверяем порт и папку состояния…',25)
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         if os.name == "nt":
@@ -84,7 +88,9 @@ def main():
         listener.close()
         message("Папка состояния занята другим процессом или недоступна. Завершите его или выберите отдельную --state-dir.")
         return 1
+    desktop.progress('Подготавливаем историю и профили…',40)
     migration = migrate(state, candidates(program_folder())) if not args.state_dir else {"jobs": 0, "failed_sources": 0}
+    desktop.progress('Открываем базу и восстанавливаем состояние…',60)
     app = create_app(state, port=args.port)
     app.extensions["migration"] = migration
     server = create_server(app, sockets=[listener], threads=12, clear_untrusted_proxy_headers=True)
@@ -94,6 +100,7 @@ def main():
     shutdown = Shutdown(app, server, state_lock)
     app.extensions["quit_app"] = shutdown
     app.extensions['management'].start()
+    desktop.progress('Запускаем локальный сервер и управление…',85)
     if os.name == "nt" and not args.no_tray:
         try:
             tray = Tray(app.extensions["engine"], url, shutdown)
@@ -101,7 +108,7 @@ def main():
             tray.start()
         except Exception:
             message("Не удалось создать значок в трее. Завершение доступно в меню «Обновления и диагностика».")
-    if not args.no_browser:
+    if not args.no_browser and not desktop._window:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     if args.update_ack:
         from disk_downloader import __version__
@@ -111,6 +118,7 @@ def main():
         with ack.open('x', encoding='utf-8') as stream:
             json.dump({'version':__version__}, stream)
             stream.flush(); os.fsync(stream.fileno())
+    desktop.ready(app,url,shutdown)
     try:
         server.run()
     except KeyboardInterrupt:
@@ -126,7 +134,8 @@ def main():
 
 if __name__ == "__main__":
     try:
-        sys.exit(main())
+        window = os.name=='nt' and '--no-window' not in sys.argv and '--apply-update' not in sys.argv and ('--window' in sys.argv or frozen() and '--no-browser' not in sys.argv)
+        sys.exit(desktop.launch(main) if window else main())
     except Exception:
         if frozen():
             message("Не удалось запустить YaDiskDownloader. Проверьте доступ к папке состояния и свободное место на диске.")

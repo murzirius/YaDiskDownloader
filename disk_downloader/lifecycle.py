@@ -41,6 +41,8 @@ class Shutdown:
         manager, maintenance = self.app.extensions['management'], self.app.extensions['maintenance']
         manager.stopped.set()
         maintenance.cancel.set()
+        duplicate_review=self.app.extensions.get('duplicate_review')
+        if duplicate_review:duplicate_review.cancel()
         recovery = self.app.extensions.get('recovery')
         if recovery: recovery.cancel.set()
         for control in tuple(engine.controls.values()):
@@ -58,6 +60,7 @@ class Shutdown:
         self.attempt(lambda: self.server.task_dispatcher.shutdown(timeout=1))
         workers = list(engine.threads.values())
         if maintenance.thread: workers.append(maintenance.thread)
+        if duplicate_review and duplicate_review.thread:workers.append(duplicate_review.thread)
         if recovery and recovery.thread: workers.append(recovery.thread)
         for worker in workers:
             if worker is not threading.current_thread():

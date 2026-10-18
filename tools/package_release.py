@@ -18,7 +18,7 @@ def source_files():
     for name in ('disk_downloader','docs','tests','tools','.github'):
         for file in sorted((ROOT/name).rglob('*')):
             if not file.is_file() or file.is_symlink() or any(p in ('__pycache__','.pytest_cache','.venv','.state') for p in file.relative_to(ROOT).parts): continue
-            if file.suffix.lower() not in ('.py','.js','.css','.html','.md','.txt','.yml','.yaml'): continue
+            if file.suffix.lower() not in ('.py','.js','.cjs','.css','.html','.md','.txt','.yml','.yaml'): continue
             yield file
 
 

@@ -123,6 +123,7 @@ class Management:
 
     def history_action(self, job_id, data):
         with self.engine.lock:
+            if self.engine.maintenance_busy:raise ValueError('Дождитесь завершения проверки или очистки файлов перед изменением истории.')
             job = self.store.job(job_id)
             thread = self.engine.threads.get(job_id)
             if thread and thread.is_alive(): raise ValueError('Операция недоступна для активного задания')
@@ -143,7 +144,7 @@ class Management:
                     if data.get('confirm') != job_id:
                         raise ValueError('Подтвердите удаление записи задания')
                     # Preserve journal events and root-level report/output ownership for the folder.
-                    for table in ('entries','names','artifacts','partials','partial_ownership','pending_publications','baseline','changes','verification_cache','scan_errors'):
+                    for table in ('entries','names','artifacts','partials','partial_ownership','pending_publications','duplicate_candidates','baseline','changes','verification_cache','scan_errors'):
                         db.execute('DELETE FROM '+table+' WHERE job=?', (job_id,))
                     db.execute('DELETE FROM jobs WHERE id=?', (job_id,))
                     self.engine.controls.pop(job_id,None); self.engine.threads.pop(job_id,None)

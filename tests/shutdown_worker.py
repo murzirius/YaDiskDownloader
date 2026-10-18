@@ -7,12 +7,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import run
+from disk_downloader import web,lifecycle
 from conftest import FakeAPI
 from disk_downloader.engine import Control
 from disk_downloader.tray import Tray
 
 folder, mode, port = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
-original_create, original_shutdown = run.create_app, run.Shutdown
+original_create, original_shutdown = web.create_app, lifecycle.Shutdown
 
 
 def create(state, port):
@@ -55,7 +56,7 @@ def create(state, port):
     return app
 
 
-run.create_app = create
-run.Shutdown = lambda *args: original_shutdown(*args, grace=3, force_after=6)
+web.create_app = create
+lifecycle.Shutdown = lambda *args: original_shutdown(*args, grace=3, force_after=6)
 sys.argv = ['run.py', '--port', str(port), '--state-dir', str(folder/'state'), '--no-tray', '--no-browser']
 raise SystemExit(run.main())
