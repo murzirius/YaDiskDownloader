@@ -87,7 +87,9 @@ jobs:
       - uses: actions/upload-artifact@v6
         with:
           name: Windows-release
-          path: dist/release/*
+          path: |
+            dist/release/*-Windows-x64.zip
+            dist/release/*-Windows-CMD.zip
       - name: Publish checked release assets
         if: startsWith(github.ref, 'refs/tags/v')
         env:
@@ -95,10 +97,17 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         shell: pwsh
         run: |
+          $windowsArchive = "dist/release/YaDiskDownloader-${env:RELEASE_TAG}-Windows-x64.zip"
+          $cmdArchive = "dist/release/YaDiskDownloader-${env:RELEASE_TAG}-Windows-CMD.zip"
+          foreach ($archive in @($windowsArchive, $cmdArchive)) {
+            if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+              throw "Release archive is missing: $archive"
+            }
+          }
           gh release view $env:RELEASE_TAG *> $null
           if ($LASTEXITCODE -ne 0) {
             gh release create $env:RELEASE_TAG --verify-tag --title "YaDiskDownloader $env:RELEASE_TAG" --notes-file "docs/release-$env:RELEASE_TAG.md"
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
-          gh release upload $env:RELEASE_TAG dist/release/* --clobber
+          gh release upload $env:RELEASE_TAG $windowsArchive $cmdArchive --clobber
           exit $LASTEXITCODE
