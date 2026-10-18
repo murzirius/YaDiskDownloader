@@ -124,7 +124,9 @@ def save_import(store, job_id, checkpoint=lambda: None):
                 db.executemany("INSERT INTO names VALUES(?,?,?)", checked(source.execute("SELECT identity,local,folded FROM names WHERE job=?", (job_id,))))
                 db.executemany("INSERT INTO artifacts VALUES(?,?,?,?,?,?,?)", checked(source.execute("SELECT path,type,local,size,sha256,fingerprint,preview_size FROM artifacts WHERE job=?", (job_id,))))
                 db.executemany("INSERT INTO partials VALUES(?,?,?,?,?,?,?,?)", checked(source.execute("SELECT path,type,local,fingerprint,size,sha256,etag,total FROM partials WHERE job=?", (job_id,))))
+            checkpoint()
             db.commit()
+        checkpoint()
         target = safe_join(job["root"], local)
         if owned and os.path.exists(target):
             replace_owned(temp, target)

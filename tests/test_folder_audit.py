@@ -236,3 +236,46 @@ def test_forced_folder_refresh_survives_busy_worker_limit(tmp_path):
     while usage.folders[root]['scanning'] and time.monotonic()<due:time.sleep(.01)
     assert not usage.folders[root]['scanning'] and not usage.folders[root]['dirty']
     assert usage.folders[root]['bytes']==3
+
+
+def test_manifest_cancelled_after_commit_does_not_replace_previous(system,monkeypatch):
+    import sqlite3
+    import disk_downloader.import_state as module
+    engine,api,_=system
+    api.file('disk:/kept.bin',b'keep',preview=False)
+    job=run_job(system,mode='fallback')
+    manifest=Path(job['root'])/engine.store.job(job['id'])['settings']['manifest_local']
+    before=manifest.read_bytes()
+    cancelled=threading.Event()
+    connect=sqlite3.connect
+    class LateCancel(sqlite3.Connection):
+        def commit(self):
+            super().commit()
+            cancelled.set()
+    def connecting(filename,*args,**kwargs):
+        if str(filename).endswith('.part'):kwargs['factory']=LateCancel
+        return connect(filename,*args,**kwargs)
+    monkeypatch.setattr(module.sqlite3,'connect',connecting)
+    def checkpoint():
+        if cancelled.is_set():raise ValueError('cancelled')
+    with pytest.raises(ValueError,match='cancelled'):
+        module.save_import(engine.store,job['id'],checkpoint)
+    assert cancelled.is_set() and manifest.read_bytes()==before
+
+
+def test_journal_close_waits_for_writer_before_final_flush(system,monkeypatch):
+    from disk_downloader.journal import Journal
+    engine,api,_=system
+    api.file('disk:/one.bin',preview=False)
+    job=run_job(system,mode='fallback')
+    journal=Journal(engine,job['id'])
+    released=threading.Event()
+    journal.thread=threading.Thread(target=lambda:released.wait(test_timeout(10)))
+    timer=threading.Timer(3.3,released.set)
+    journal.thread.start();timer.start()
+    def final_flush(final=False):
+        assert final and not journal.thread.is_alive()
+    monkeypatch.setattr(journal,'flush',final_flush)
+    try:journal.close()
+    finally:
+        released.set();journal.thread.join(test_timeout(10));timer.cancel()

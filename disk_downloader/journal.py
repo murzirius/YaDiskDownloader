@@ -88,10 +88,9 @@ class Journal:
     def close(self):
         self.stopped.set()
         if self.thread.is_alive():
-            self.thread.join(3)
-        if self.thread.is_alive():
-            self.error = 'События сохранены в истории. Обновление большого HTML-журнала ещё завершается.'
-            return
+            # Exports check stopped between records and before publication.
+            # Never orphan a writer that could overwrite a newer manifest.
+            self.thread.join()
         self.flush(final=True)
         with self.secret_lock:
             self.secrets.clear()
