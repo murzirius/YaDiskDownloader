@@ -222,7 +222,7 @@ async function pollJob(){
     $('job-settings').textContent=`${modes[job.settings.mode]} · ${(job.settings.file_types||Object.keys(typeLabels)).map(value=>typeLabels[value]).join(', ')} · ${job.settings.preview_size} · ${job.settings.workers} потока · ${job.settings.reports.join(', ')} · ${job.settings.whole_disk?'весь Диск':job.settings.paths.length+' исходных путей'}`;
     const live=job.live;
     const scanOnly=!job.scan_complete||job.settings.scan_only_pending;
-    $('resume-job').textContent=scanOnly?'Продолжить обход':'Продолжить загрузку';
+    $('resume-job').textContent=job.requires_connection===false?'Продолжить работу':scanOnly?'Продолжить обход':'Продолжить загрузку';
     $('stop-job').textContent=job.phase==='stopping'?'Останавливаем…':scanOnly?'Остановить обход':job.phase==='packing'?'Остановить ZIP':'Остановить загрузку';
     $('job-hint').textContent=state.closing?'Завершаем приложение…':job.phase==='stopping'?'Отменяем запросы и сохраняем прогресс…':job.phase==='ready'?(live?'Завершаем подготовку следующего этапа.':'Список готов. Нажмите «Начать скачивание».'):job.phase==='scanning'?'Составляем список файлов. Можно остановить и продолжить позже.':job.phase==='preparing'?'Проверяем локальные файлы и подготавливаем результаты.':job.phase==='paused'?'Работа на паузе. Для продолжения нажмите кнопку выше.':['stopped','interrupted'].includes(job.phase)?(scanOnly?'Обход остановлен. «Продолжить обход» вернёт вас к оценке.':(state.connected?'Прогресс сохранён. В блоке «Как продолжить загрузку» выберите, достаточно ли превью, и нажмите «Продолжить загрузку».':'Прогресс сохранён. Нажмите «Подключить Диск, чтобы продолжить», вставьте ключ доступа, затем продолжите загрузку.')):'Закрытие вкладки не останавливает работу. Для выхода используйте «Выход». ';
     if(live)renderRunning({id:job.id,phase:job.phase,scan_complete:job.scan_complete});
@@ -234,9 +234,9 @@ async function pollJob(){
     $('pause-job').disabled=state.actionPending||job.phase==='stopping';
     $('pause-job').hidden=!job.can_pause;
     $('resume-job').hidden=!job.can_resume||!['paused','stopped','interrupted','failed'].includes(job.phase);
-    $('resume-job').disabled=state.actionPending||(!state.connected&&!packing);
-    $('connect-for-job').hidden=state.connected||!job.can_resume||!['ready','paused','stopped','interrupted','failed'].includes(job.phase);
-    $('resume-options').hidden=!job.can_resume||!['ready','paused','stopped','interrupted','failed'].includes(job.phase);
+    $('resume-job').disabled=state.actionPending||(!state.connected&&job.requires_connection!==false);
+    $('connect-for-job').hidden=state.connected||job.requires_connection===false||!job.can_resume||!['ready','paused','stopped','interrupted','failed'].includes(job.phase);
+    $('resume-options').hidden=job.requires_connection===false||!job.can_resume||!['ready','paused','stopped','interrupted','failed'].includes(job.phase);
     $('resume-policy').disabled=live;
     $('resume-options-hint').textContent=live?'Чтобы изменить учёт превью, остановите задание. Затем выберите вариант и продолжите — прогресс сохранится.':'Проверим папку перед продолжением. Сначала скачаем файлы без копий. Готовые оригиналы повторно не скачиваем.';
     $('stop-job').hidden=!live;

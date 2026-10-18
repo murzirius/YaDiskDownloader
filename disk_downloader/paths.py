@@ -1,6 +1,7 @@
 import hashlib
 import os
 import re
+import sqlite3
 import tempfile
 import time
 from functools import lru_cache
@@ -117,9 +118,28 @@ def temporary_file(root, store=None, purpose='temporary'):
     os.close(descriptor)
     if store:
         from .service_outputs import root_key
-        with store.db() as db:
-            db.execute('INSERT INTO temporary_files VALUES(?,?,?,?)', (root_key(root), Path(filename).name, purpose, time.time()))
+        try:
+            with store.db() as db:
+                db.execute('INSERT INTO temporary_files VALUES(?,?,?,?)', (root_key(root), Path(filename).name, purpose, time.time()))
+        except BaseException:
+            try:
+                os.unlink(filename)
+            except OSError:
+                pass
+            raise
     return filename
+
+
+def forget_temporary(store, root, filename):
+    """Forget only a vanished owned temp, never discard a resumable part."""
+    from .service_outputs import root_key
+    if not os.path.lexists(filename):
+        try:
+            with store.db() as db:
+                db.execute('DELETE FROM temporary_files WHERE root=? AND local=?', (root_key(root),Path(filename).name))
+        except sqlite3.Error:
+            # Registry housekeeping is recoverable; result commits are separate.
+            pass
 
 
 def replace_owned(source, target):

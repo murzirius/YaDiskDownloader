@@ -44,10 +44,19 @@ class Partials:
                     os.unlink(filename)
             except (OSError, ValueError):
                 pass
+        missing = False
+        if row and valid_partial(row):
+            try:
+                missing = not os.path.lexists(safe_join(job['root'],row['local']))
+            except (OSError,ValueError):
+                pass
         with self.store.db() as db:
             db.execute("DELETE FROM partials WHERE job=? AND path=? AND type=?", (job["id"], path, kind))
             if row:
                 db.execute("DELETE FROM partial_ownership WHERE job=? AND local=?", (job["id"], row["local"]))
+                if missing:
+                    from .service_outputs import root_key
+                    db.execute('DELETE FROM temporary_files WHERE root=? AND local=?',(root_key(job['root']),row['local']))
 
     def prepare(self, job, path, kind, stamp, checkpoint):
         with self.store.db() as db:

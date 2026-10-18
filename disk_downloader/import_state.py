@@ -5,7 +5,7 @@ from contextlib import closing
 from pathlib import Path
 from .paths import remote_path
 
-from .paths import publish, replace_owned, reserve_output, safe_join, temporary_file
+from .paths import forget_temporary, publish, replace_owned, reserve_output, safe_join, temporary_file
 
 
 FORMAT = "disk-local-import-v1"
@@ -135,3 +135,4 @@ def save_import(store, job_id, checkpoint=lambda: None):
     finally:
         if os.path.exists(temp):
             os.unlink(temp)
+        forget_temporary(store,job['root'],temp)

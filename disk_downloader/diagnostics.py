@@ -11,7 +11,7 @@ import zipfile
 from datetime import datetime, timezone
 
 from . import __version__, __build__
-from .paths import publish, reserve_output, safe_join, temporary_file
+from .paths import forget_temporary, publish, reserve_output, safe_join, temporary_file
 
 
 SETTINGS = ("mode", "preview_size", "file_types", "workers", "attempts", "timeout", "total_timeout", "reports", "create_zip", "auto_pause", "max_disk_percent", "adaptive_workers", "resume_parts", "operation", "speed_limit_mib", "missing_policy")
@@ -70,8 +70,11 @@ def write_bundle(engine, job_id):
             for name, data in files.items():
                 archive.writestr(name, json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
             archive.writestr("README.txt", "Диагностика YaDiskDownloader. Без ключей, временных ссылок, имён и путей файлов, исходного содержимого, профилей и базы SQLite. До 1000 ошибок файлов и 2000 последних событий. Идентификаторы source_id связывают ошибки и события одного источника.".encode("utf-8"))
+        with open(temp,'r+b') as stream:
+            os.fsync(stream.fileno())
         publish(temp, safe_join(job["root"], local))
         return local
     finally:
         if os.path.exists(temp):
             os.unlink(temp)
+        forget_temporary(engine.store,job['root'],temp)

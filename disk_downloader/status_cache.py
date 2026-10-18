@@ -45,6 +45,7 @@ class StatusCache:
         live = bool(thread and thread.is_alive())
         result.update(control.snapshot() if live and control else {'active': [], 'speed': 0})
         result['live'] = live
+        result['requires_connection'] = not (live and control and not control.requires_connection())
         finishing = job['phase'] in ('ready', 'stopped', 'failed', 'completed', 'completed_with_errors')
         if live and control and not finishing:
             result['phase'] = 'stopping' if control.stopped else 'paused' if control.paused else job['phase']

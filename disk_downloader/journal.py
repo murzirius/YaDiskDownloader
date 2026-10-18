@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .paths import PathError, publish, replace_owned, reserve_output, safe_join, temporary_file
+from .paths import forget_temporary, PathError, publish, replace_owned, reserve_output, safe_join, temporary_file
 from .service_outputs import location, finish
 
 
@@ -160,5 +160,6 @@ class Journal:
             if temp and os.path.exists(temp):
                 try:
                     os.unlink(temp)
+                    forget_temporary(self.store,job['root'],temp)
                 except OSError:
                     self.error = "Не удалось удалить временный файл журнала"

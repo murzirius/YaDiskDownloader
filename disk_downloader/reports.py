@@ -5,7 +5,7 @@ import os
 import threading
 from itertools import groupby
 
-from .paths import publish, reserve_output, safe_join, temporary_file
+from .paths import forget_temporary, publish, reserve_output, safe_join, temporary_file
 from .service_outputs import location, finish, root_key
 
 REPORT_LOCK = threading.RLock()
@@ -125,5 +125,6 @@ def _write_reports(store, job_id, checkpoint, final_phase):
         finally:
             if os.path.exists(temp):
                 os.unlink(temp)
+                forget_temporary(store,job['root'],temp)
         paths.append(relative)
     return paths

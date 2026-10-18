@@ -5,6 +5,7 @@ import math
 import re
 import io
 import http.client
+import sys
 from contextlib import nullcontext, contextmanager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -13,13 +14,18 @@ from urllib.parse import urljoin, urlsplit
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.exceptions import ConnectTimeoutError, NameResolutionError, NewConnectionError
+from urllib3.util.connection import allowed_gai_family
 
 from .paths import remote_path
+from .dns import Resolver
 
 
 BASE = "https://cloud-api.yandex.net/v1/disk"
 SIZES = ("S", "M", "L", "XL", "XXL", "XXXL")
 PREVIEW_MAX_BYTES = 64 * 1024 * 1024
+DNS_RESOLVER = Resolver()
 
 
 class Suspended(Exception):
@@ -71,7 +77,13 @@ class Deadline:
     def __enter__(self):
         if self.network:
             self.network.register(self)
-        self.thread.start()
+        try:
+            self.thread.start()
+        except BaseException:
+            self.finished.set()
+            if self.network:
+                self.network.unregister(self)
+            raise
         return self
 
     def __exit__(self, kind, value, traceback):
@@ -122,8 +134,10 @@ class Deadline:
             self.expired.set()
             raise NetworkError(self.timeout_message())
 
-    def attach(self, connection=None, response=None):
+    def attach(self, connection=None, response=None, sock=None):
         with self.lock:
+            if sock is not None:
+                self.sockets.append(sock)
             if connection is not None:
                 self.connections.append(connection)
             if response is not None:
@@ -133,6 +147,10 @@ class Deadline:
                 if sock is not None:
                     self.sockets.append(sock)
         self.check()
+
+    def detach_socket(self, sock):
+        with self.lock:
+            self.sockets = [item for item in self.sockets if item is not sock]
 
     def abort(self):
         with self.lock:
@@ -173,6 +191,67 @@ class DeadlineAdapter(HTTPAdapter):
         super().init_poolmanager(connections, maxsize, block, **kwargs)
         deadline = self.deadline
 
+        def new_socket(connection):
+            host, port = connection._dns_host, connection.port
+            family = allowed_gai_family()
+            try:
+                try:
+                    addresses = DNS_RESOLVER.resolve(host,port,family,deadline.check)
+                except RuntimeError:
+                    raise APIError('Приложение на ПК не смогло запустить определение адреса сервера. Закройте лишние программы и повторите загрузку.') from None
+                except NetworkError:
+                    if deadline.expired.is_set():
+                        raise NetworkError('Не удалось определить адрес сервера (DNS): ' + deadline.timeout_message()) from None
+                    raise
+                error = None
+                for af, kind, protocol, _, address in addresses:
+                    deadline.check()
+                    sock = None
+                    try:
+                        sock = socket.socket(af,kind,protocol)
+                        deadline.attach(sock=sock)
+                        for option in connection.socket_options or ():
+                            sock.setsockopt(*option)
+                        limit = connection.timeout
+                        remaining = deadline.remaining()
+                        limit = min(limit,remaining) if isinstance(limit,(int,float)) else remaining
+                        sock.settimeout(limit if math.isfinite(limit) else None)
+                        if connection.source_address:
+                            sock.bind(connection.source_address)
+                        sock.connect(address)
+                        deadline.check()
+                        # TLS starts after _new_conn(). It gets the remaining
+                        # budget, not the original pre-DNS/connect timeout.
+                        limit = min(limit,deadline.remaining())
+                        sock.settimeout(limit if math.isfinite(limit) else None)
+                        sys.audit('http.client.connect',connection,connection.host,connection.port)
+                        return sock
+                    except BaseException as exc:
+                        if sock is not None:
+                            deadline.detach_socket(sock)
+                            sock.close()
+                        if not isinstance(exc,OSError):
+                            raise
+                        error = exc
+                DNS_RESOLVER.invalidate(host,port,family)
+                if error is not None:
+                    raise error
+                raise OSError('System DNS returned no addresses')
+            except socket.gaierror as exc:
+                raise NameResolutionError(connection.host,connection,exc) from exc
+            except socket.timeout as exc:
+                raise ConnectTimeoutError(connection,'Истекло время подключения к серверу') from exc
+            except OSError as exc:
+                raise NewConnectionError(connection,'Не удалось подключиться к серверу') from exc
+
+        class TimedHTTPConnection(HTTPConnection):
+            def _new_conn(self):
+                return new_socket(self)
+
+        class TimedHTTPSConnection(HTTPSConnection):
+            def _new_conn(self):
+                return new_socket(self)
+
         class ProgressRaw(io.RawIOBase):
             def __init__(self, raw):
                 self.raw = raw
@@ -205,6 +284,7 @@ class DeadlineAdapter(HTTPAdapter):
                 self.fp = io.BufferedReader(ProgressRaw(self.fp.detach()))
 
         class TimedHTTPPool(HTTPConnectionPool):
+            ConnectionCls = TimedHTTPConnection
             def _new_conn(self):
                 conn = super()._new_conn()
                 conn.response_class = ProgressResponse
@@ -212,6 +292,7 @@ class DeadlineAdapter(HTTPAdapter):
                 return conn
 
         class TimedHTTPSPool(HTTPSConnectionPool):
+            ConnectionCls = TimedHTTPSConnection
             def _new_conn(self):
                 conn = super()._new_conn()
                 conn.response_class = ProgressResponse

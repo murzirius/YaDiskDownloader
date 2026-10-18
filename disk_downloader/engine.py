@@ -18,7 +18,7 @@ from .api import APIError, Deadline, NetworkError, PausedRequest, PREVIEW_MAX_BY
 from .import_state import find_import, inherit, save_import
 from .file_types import FILE_TYPES, file_type, preview_type, selected_type
 from .estimation import RemainingTime
-from .paths import file_signature, PathError, component, digest, native, normalize_selection, parent_path, publish, remote_path, reserve_output, safe_join, suffix, temporary_file
+from .paths import file_signature, forget_temporary, PathError, component, digest, native, normalize_selection, parent_path, publish, remote_path, reserve_output, safe_join, suffix, temporary_file
 from .reports import write_reports, REPORT_LOCK
 from .journal import Journal, PHASES
 from .partials import Partials, strong_etag
@@ -99,6 +99,9 @@ class Control:
     def event(self, group, message, path="", level="info"):
         if self.journal:
             self.journal.event(group, message, path, level)
+
+    def requires_connection(self):
+        return not getattr(self,'local_only',False) and getattr(self,'operation','download') not in ('pack','manifest','journal') and getattr(self,'phase','') != 'packing'
 
     def check(self):
         if self.space_check and not self.paused:
@@ -287,6 +290,7 @@ class Engine:
             if operation not in ('pack','manifest','journal') and not self.api.credentials.connected:
                 raise ValueError("Подключите Диск перед продолжением")
             control = Control()
+            control.operation = operation
             control.journal = Journal(self, job_id, self.journal_interval)
             job = self.store.job(job_id)
             if job["settings"].get("_invalid"):
@@ -356,7 +360,7 @@ class Engine:
             if action == "resume" and live and live.is_alive() and control.paused:
                 if limits and any(limits.get(k, job["settings"].get(k, 0 if k == "speed_limit_mib" else None)) != job["settings"].get(k, attempt_count(job["settings"]) if k == "attempts" else 0 if k == "speed_limit_mib" else None) for k in ("workers", "attempts", "timeout", "total_timeout", "speed_limit_mib")):
                     raise ValueError("Для изменения ограничений остановите задание и продолжите с новыми параметрами")
-                if not self.api.credentials.connected and getattr(control, "phase", "downloading") != "packing":
+                if not self.api.credentials.connected and control.requires_connection():
                     raise ValueError("Для продолжения загрузки подключите Яндекс.Диск: вставьте ключ доступа вверху страницы. Скачанные файлы сохранены.")
                 if limits and limits.get("missing_policy", job["settings"].get("missing_policy", "originals")) != job["settings"].get("missing_policy", "originals"):
                     raise ValueError("Чтобы изменить учёт превью, нажмите «Остановить», дождитесь остановки и затем «Продолжить».")
@@ -455,6 +459,7 @@ class Engine:
         control = self.controls.get(job_id)
         status.update(control.snapshot() if control else {"active": [], "speed": 0})
         status["live"] = live
+        status['requires_connection'] = not (live and control and not control.requires_connection())
         if not live or control and control.paused:
             status["speed"] = 0
         finishing = status["phase"] in ("completed", "completed_with_errors", "stopped", "failed", "ready")
@@ -1436,6 +1441,7 @@ class Engine:
             attempt += 1
 
     def pack(self, job_id, control, manual=False):
+        control.local_only = True
         job = self.store.job(job_id)
         summary = self.store.summary(job_id)
         final_phase = "stopped" if manual and (not job["scan_complete"] or summary["cancelled"] or summary["processed"] < summary["files"] or job["phase"] in ("stopped", "interrupted", "failed")) else ("completed_with_errors" if summary["errors"] or summary["scan_errors"] else "completed")
@@ -1445,26 +1451,27 @@ class Engine:
         self.phase(job_id, control, "preparing")
         control.progress(job["settings"]["paths"][0], 0, None, "Создание отчётов", unit="objects")
         control.check()
-        with REPORT_LOCK:
-            reports = write_reports(self.store, job_id, control.check, final_phase=final_phase)
-            reports.append(write_changes(self.store, job_id, control.check))
-            with control.lock:
-                control.active.clear()
-            if not manual and not job["settings"].get("create_zip", True):
-                self.store.update_job(job_id, phase=final_phase, generation=job["generation"] + 1)
-                control.event("archive", "Файлы и отчёты сохранены; создание ZIP выключено", level="success")
-                return
-            total = summary["saved_bytes"] + sum(os.path.getsize(safe_join(job["root"], r)) for r in reports)
-            generation = job["generation"] + 1
-            archive_rel = reserve_output(self.store, job, f"result-{generation}.zip")
-            archive = safe_join(job["root"], archive_rel)
-            temp = temporary_file(job["root"], self.store, 'zip')
-            with control.lock:
-                control.temporary.add(temp)
-            self.store.update_job(job_id, zip_total=total, zip_done=0, zip_path=None, zip_bytes=0)
-            self.phase(job_id, control, "packing")
+        temp = None
         pending_zip, last_flush = 0, time.monotonic()
         try:
+            with REPORT_LOCK:
+                reports = write_reports(self.store, job_id, control.check, final_phase=final_phase)
+                reports.append(write_changes(self.store, job_id, control.check))
+                with control.lock:
+                    control.active.clear()
+                if not manual and not job["settings"].get("create_zip", True):
+                    self.store.update_job(job_id, phase=final_phase, generation=job["generation"] + 1)
+                    control.event("archive", "Файлы и отчёты сохранены; создание ZIP выключено", level="success")
+                    return
+                total = summary["saved_bytes"] + sum(os.path.getsize(safe_join(job["root"], r)) for r in reports)
+                generation = job["generation"] + 1
+                archive_rel = reserve_output(self.store, job, f"result-{generation}.zip")
+                archive = safe_join(job["root"], archive_rel)
+                temp = temporary_file(job["root"], self.store, 'zip')
+                with control.lock:
+                    control.temporary.add(temp)
+                self.store.update_job(job_id, zip_total=total, zip_done=0)
+                self.phase(job_id, control, "packing")
             with zipfile.ZipFile(temp, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as output:
                 for row in self.store.rows("SELECT local FROM entries WHERE job=? AND kind='dir' AND local!='' ORDER BY local", (job_id,)):
                     control.check()
@@ -1502,15 +1509,24 @@ class Engine:
                         raise APIError("Локальный результат изменён: архив не подтверждён")
                     with control.lock:
                         control.active.pop(relative, None)
+            with open(temp,'r+b') as stream:
+                os.fsync(stream.fileno())
+            control.check()
             publish(temp, archive)
             self.store.update_job(job_id, phase=final_phase, zip_path=archive_rel, zip_bytes=os.path.getsize(archive), generation=generation)
             control.event("archive", "Отчёты и ZIP сохранены: " + archive_rel, level="success")
         finally:
-            if pending_zip:
-                with self.store.db() as db:
-                    db.execute("UPDATE jobs SET zip_done=zip_done+? WHERE id=?", (pending_zip, job_id))
-            if os.path.exists(temp):
-                os.unlink(temp)
-            with control.lock:
-                control.temporary.discard(temp)
-                control.temporary_sizes.pop(temp, None)
+            try:
+                if pending_zip:
+                    with self.store.db() as db:
+                        db.execute("UPDATE jobs SET zip_done=zip_done+? WHERE id=?", (pending_zip, job_id))
+            finally:
+                try:
+                    if temp and os.path.exists(temp):
+                        os.unlink(temp)
+                finally:
+                    if temp:
+                        forget_temporary(self.store,job['root'],temp)
+                        with control.lock:
+                            control.temporary.discard(temp)
+                            control.temporary_sizes.pop(temp, None)
