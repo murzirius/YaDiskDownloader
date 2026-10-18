@@ -14,7 +14,7 @@ def recover_publications(store, checkpoint=lambda: None, progress=lambda path: N
             target=safe_join(row['root'],row['local'])
             if os.path.isfile(target) and os.stat(target).st_nlink==1 and digest_file(target, checkpoint)==row['sha256']:
                 with store.db() as db:
-                    db.execute('INSERT OR REPLACE INTO service_outputs VALUES(?,?,?,?)',tuple(row))
+                    db.execute('INSERT OR REPLACE INTO service_outputs VALUES(?,?,?,?)',tuple(row[key] for key in ('root','kind','local','sha256')))
                     db.execute('DELETE FROM pending_service_outputs WHERE root=? AND kind=?',(row['root'],row['kind']))
         except (OSError,ValueError):
             continue

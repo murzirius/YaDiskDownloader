@@ -83,7 +83,7 @@ def _write_reports(store, job_id, checkpoint, final_phase):
     fields = ["record_type", "source_path", "local_path", "status", "error", "original_attempt", "preview_attempt", "fallback_to_preview", "results", "original_attempts", "preview_attempts"]
     paths = []
     for fmt in job["settings"]["reports"]:
-        relative, replace = location(store, job, 'report:' + fmt, 'report.' + fmt)
+        relative, replace = location(store, job, 'report:' + fmt, 'report.' + fmt, checkpoint)
         final = safe_join(job["root"], relative)
         temp = temporary_file(job["root"], store, 'report')
         try:
@@ -121,7 +121,7 @@ def _write_reports(store, job_id, checkpoint, final_phase):
                     out.write("</tbody></table></html>")
                 out.flush()
                 os.fsync(out.fileno())
-            finish(store, job, 'report:' + fmt, relative, temp, replace)
+            finish(store, job, 'report:' + fmt, relative, temp, replace, checkpoint)
         finally:
             if os.path.exists(temp):
                 os.unlink(temp)

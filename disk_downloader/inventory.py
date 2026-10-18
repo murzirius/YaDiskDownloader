@@ -80,7 +80,7 @@ def write_changes(store, job_id, checkpoint=lambda: None):
     job = store.job(job_id)
     compare(store, job_id, checkpoint)
     from .service_outputs import location, finish
-    relative, replacing = location(store, job, 'changes', 'changes.html')
+    relative, replacing = location(store, job, 'changes', 'changes.html', checkpoint)
     temp = temporary_file(job["root"], store, 'changes')
     template = Path(__file__).with_name("templates").joinpath("changes.html").read_text(encoding="utf-8")
     style = Path(__file__).with_name("templates").joinpath("journal.html").read_text(encoding="utf-8").split("<style>", 1)[1].split("</style>", 1)[0]
@@ -99,7 +99,7 @@ def write_changes(store, job_id, checkpoint=lambda: None):
             stream.write("]}" + after)
             stream.flush()
             os.fsync(stream.fileno())
-        finish(store, job, 'changes', relative, temp, replacing)
+        finish(store, job, 'changes', relative, temp, replacing, checkpoint)
         current = store.job(job_id)["settings"]
         current["changes_local"] = relative
         store.update_job(job_id, settings=json.dumps(current, ensure_ascii=False))

@@ -33,7 +33,12 @@ class StatusCache:
                 result['statistics_pending'] = True
             if token not in self.pending and len(self.pending) < 2 and time.monotonic() >= due:
                 self.pending.add(token)
-                threading.Thread(target=self.refresh, args=(key, token), name='disk-statistics', daemon=True).start()
+                try:
+                    threading.Thread(target=self.refresh, args=(key, token), name='disk-statistics', daemon=True).start()
+                except RuntimeError:
+                    self.pending.discard(token)
+                    result['statistics_error'] = 'На ПК не удалось запустить подсчёт. Закройте лишние программы; приложение повторит попытку.'
+                    self.items[key] = {'value':None,'due':time.monotonic()+5,'error':result['statistics_error']}
         result.update(job)
         control = self.engine.controls.get(key)
         thread = self.engine.threads.get(key)

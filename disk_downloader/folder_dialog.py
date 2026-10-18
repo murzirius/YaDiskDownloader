@@ -101,8 +101,11 @@ class FolderPicker:
             self.result = {"busy": True, "path": "", "error": "", "request_id": uuid.uuid4().hex}
             result = dict(self.result)
             self.thread = threading.Thread(target=self.run, args=(initial,), name="disk-folder-dialog", daemon=True)
-            self.thread.start()
-        return result
+            try:
+                self.thread.start()
+            except RuntimeError:
+                self.result.update(busy=False,error='На ПК не удалось открыть выбор папки. Закройте лишние программы и повторите или вставьте путь вручную.')
+            return dict(self.result)
 
     def run(self, initial):
         try:

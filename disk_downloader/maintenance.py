@@ -64,12 +64,13 @@ class Maintenance:
                 raise ValueError('Выберите существующую папку загрузки')
             previous={'job':job,'store':self.store,'id':job_id} if job else find_import(self.store,root)
             if not previous: raise ValueError('В папке нет сохранённой описи загрузки')
-            self.cancel.clear(); self.engine.maintenance_busy=True
+            self.cancel.clear()
             self.scope = dict(previous['job']['settings'])
             with self.store.db() as db:
                 db.execute('DELETE FROM verification_results')
             with self.lock:
                 self.result={'busy':True,'run':uuid.uuid4().hex,'root':root,'processed':0,'total':0,'items':[],'counts':{},'error':'','complete':False,'problems':0,'current':'','checked_bytes':0}
+            self.engine.maintenance_busy=True
             self.thread=threading.Thread(target=self.verify,args=(root,previous),name='disk-verify',daemon=True)
             try:
                 self.thread.start()

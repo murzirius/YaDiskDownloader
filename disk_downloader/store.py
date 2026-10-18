@@ -8,9 +8,12 @@ from pathlib import Path
 from .file_types import file_type, preview_type, selected_type
 from .exclusions import excluded
 from .api import validate_resource
-from .limits import normalize_saved_workers
+from .limits import MAX_WORKERS, normalize_saved_workers
 from .sqlite_support import journal_mode
 from .sqlite_writes import gate_for, WriteConnection
+from .paths import remote_path
+from .exclusions import validate as validate_exclusions
+from .rate_limit import validate as validate_speed
 
 
 SCHEMA = """
@@ -266,6 +269,23 @@ class Store:
                 raise ValueError()
             if any(isinstance(settings[key], bool) or not isinstance(settings[key], int) or not low <= settings[key] <= high for key,low,high in (('attempts',1,9),('timeout',5,3600),('total_timeout',0,86400))):
                 raise ValueError()
+            workers = settings['workers']
+            if isinstance(workers,bool) or not isinstance(workers,int) or not 1 <= workers <= MAX_WORKERS:
+                raise ValueError()
+            for path in settings['paths']:
+                remote_path(path)
+            validate_exclusions(settings['exclusions'])
+            validate_speed(settings.get('speed_limit_mib',0))
+            for key in ('create_zip','auto_pause','resume_parts','adaptive_workers'):
+                if key in settings and not isinstance(settings[key],bool):
+                    raise ValueError()
+            fullness = settings.get('max_disk_percent',95)
+            if isinstance(fullness,bool) or not isinstance(fullness,(int,float)) or not 1 <= fullness <= 99.9:
+                raise ValueError()
+            if '_inherit_source' in settings:
+                source = settings['_inherit_source']
+                if not isinstance(source,dict) or set(source) not in ({'job'},{'manifest'}) or not isinstance(next(iter(source.values())),str) or not next(iter(source.values())):
+                    raise ValueError()
         except (ValueError, TypeError):
             result["settings"] = {"_invalid": True, "mode": "fallback", "preview_size": "XXXL", "reports": ["json"], "file_types": ["photos", "videos", "music", "files"], "paths": [], "whole_disk": False, "destination": result["root"], "workers": 8, "attempts": 1, "retries": 0, "timeout": 20, "total_timeout": 20}
             result['error'] = "Настройки этого задания повреждены или неполны. Скачанные файлы сохранены. Выберите «Дозагрузить недостающее» и укажите прежнюю папку; создавать другие задания можно."

@@ -74,7 +74,11 @@ class Installer:
                 raise ValueError('Некорректный размер обновления')
             download_url(asset['browser_download_url'],release['repository'],True)
             self.prepared=None; self.result={'state':'downloading','bytes':0,'total':asset['size'],'message':'Скачивание обновления'}
-            threading.Thread(target=self.fetch,args=(release,asset),name='disk-update-download',daemon=True).start()
+            try:
+                threading.Thread(target=self.fetch,args=(release,asset),name='disk-update-download',daemon=True).start()
+            except RuntimeError:
+                self.result.update(state='error',message='На ПК не удалось начать скачивание обновления. Закройте лишние программы и повторите.')
+                raise ValueError(self.result['message']) from None
         return self.snapshot()
 
     def fetch(self, release, asset):

@@ -645,7 +645,7 @@ class Engine:
             self.phase(job_id, control, "preparing")
             self.prepare_paths(job_id, control, prime=operation == "scan" or getattr(control, "reuse_scanned", False))
             if operation == "scan":
-                save_import(self.store, job_id)
+                save_import(self.store, job_id, control.check)
                 saved_scan = True
                 self.store.update_job(job_id, phase="ready")
                 return
@@ -1039,7 +1039,7 @@ class Engine:
                     control.check()
                     sha.update(chunk)
                     md5.update(chunk)
-            if meta.get("sha256") and sha.hexdigest() != meta["sha256"] or meta.get("md5") and md5.hexdigest() != meta["md5"]:
+            if meta.get("sha256") and sha.hexdigest() != meta["sha256"].lower() or meta.get("md5") and md5.hexdigest() != meta["md5"].lower():
                 return False
             if before != file_signature(filename, ""):
                 return False
@@ -1351,16 +1351,19 @@ class Engine:
                             keep = False
                             raise APIError("Неизвестный формат изображения превью")
                         proposed = entry["local"] + ".preview." + extensions[fmt]
-                    identity = entry["path"] if kind == "original" else entry["path"] + "@preview"
+                    # Synthetic names cannot collide with a real disk:/ path.
+                    identity = entry["path"] if kind == "original" else "@preview:" + entry["path"]
                     relative = self.allocate(job["id"], identity, proposed)
+                    base_relative = relative
                     target = safe_join(job["root"], relative)
                     os.makedirs(os.path.dirname(target), exist_ok=True)
                     counter = 0
                     while os.path.exists(target):
                         counter += 1
-                        parent, _, name = relative.rpartition("/")
+                        parent, _, name = base_relative.rpartition("/")
                         name = suffix(name, digest(fingerprint(meta) + kind + str(counter)))
-                        relative = self.allocate(job["id"], identity + "@version" + str(counter), (parent + "/" if parent else "") + name)
+                        version_identity = "@version:" + kind + ":" + entry['path'] + ":" + fingerprint(meta) + ":" + str(counter)
+                        relative = self.allocate(job["id"], version_identity, (parent + "/" if parent else "") + name)
                         target = safe_join(job["root"], relative)
                     deadline.check()
                     with self.store.db() as db:

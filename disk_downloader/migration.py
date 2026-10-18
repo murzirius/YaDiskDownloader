@@ -91,6 +91,7 @@ def migrate(target, sources):
                             if not isinstance(settings, dict) or not Path(job["root"]).is_absolute():
                                 raise ValueError("Некорректное старое задание")
                             db.execute('INSERT INTO jobs (' + ','.join(columns) + ') VALUES(' + ','.join('?' for _ in columns) + ')', tuple(job[key] for key in columns))
+                            db.execute('INSERT OR IGNORE INTO journal_jobs VALUES(?,?)', (job['id'],job['root']))
                             imported.append(job["id"])
                         for table in TABLES:
                             if table not in tables:
@@ -113,6 +114,6 @@ def migrate(target, sources):
                         db.execute("UPDATE entries SET status='pending' WHERE status='running'")
                         db.execute("INSERT OR REPLACE INTO preferences VALUES(?,?)", ("migration:" + str(filename), stamp))
                     total += len(imported)
-        except (OSError, sqlite3.Error, ValueError, KeyError):
+        except (OSError, sqlite3.Error, ValueError, KeyError, IndexError, TypeError):
             failures += 1
     return {"jobs": total, "failed_sources": failures}

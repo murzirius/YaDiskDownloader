@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import re
 import threading
 import time
@@ -70,12 +71,18 @@ class Updates:
             if self.busy or not force and (not self.settings()["automatic"] or self.last_check and time.monotonic() - self.last_check < 3600):
                 return
             self.busy = True
-        threading.Thread(target=self.check, name="disk-updates", daemon=True).start()
+        try:
+            threading.Thread(target=self.check, name="disk-updates", daemon=True).start()
+        except RuntimeError:
+            with self.lock:
+                self.busy = False
+                self.result['message'] = 'На ПК не удалось начать проверку обновлений. Закройте лишние программы и повторите.'
 
     def check(self):
-        repo = self.settings()["repository"]
-        result = {"current": __version__, "repository": repo, "available": False}
+        result = {"current": __version__, "repository": DEFAULT_REPOSITORY, "available": False}
         try:
+            repo = self.settings()["repository"]
+            result['repository'] = repo
             with Deadline(8) as deadline, requests.Session() as session:
                 session.trust_env = False
                 session.mount("https://", DeadlineAdapter(deadline))
@@ -111,6 +118,8 @@ class Updates:
                                     result['asset'] = {key:asset.get(key) for key in ('name','size','digest','browser_download_url')}
                                     break
                         result["message"] = "Доступна новая версия " + tag if result["available"] else "Новая версия не требуется" if latest else "Найден релиз " + tag + "; сравните версии вручную"
+        except sqlite3.Error:
+            result['message'] = 'Приложение на ПК не смогло прочитать настройки обновлений из истории. Проверьте доступ к папке состояния и повторите проверку.'
         except (APIError, requests.RequestException, OSError, ValueError, TypeError, AttributeError):
             result["message"] = "Не удалось проверить обновления. Проверьте соединение и попробуйте позже."
         finally:
