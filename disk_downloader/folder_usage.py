@@ -1,8 +1,9 @@
 import os
+import sqlite3
 import threading
 import time
 from pathlib import Path
-from .paths import native
+from .paths import native, safe_join
 
 
 class FolderUsage:
@@ -11,7 +12,17 @@ class FolderUsage:
         self.lock = threading.Lock()
         self.folders = {}
 
-    def snapshot(self, root, force=False, active=False):
+    def for_job(self, store, job_id, root, force=False, active=False):
+        # Inventory contains media only. Never discover files by walking logs,
+        # reports, temporary folders or unrelated content during a job refresh.
+        def files():
+            if not os.path.isdir(native(root)):
+                raise OSError('Папка загрузки недоступна')
+            for row in store.rows('SELECT DISTINCT local FROM artifacts WHERE job=?', (job_id,)):
+                yield safe_join(root, row['local'])
+        return self.snapshot(root, force=force, active=active, inventory=(job_id, files))
+
+    def snapshot(self, root, force=False, active=False, inventory=None):
         try:
             root = os.fspath(root)
         except TypeError:
@@ -21,6 +32,11 @@ class FolderUsage:
         root = str(Path(root).absolute())
         with self.lock:
             item = self.folders.setdefault(root, {"bytes": None, "updated": None, "scanning": False, "due": 0, "error":"", "checked":0, 'generation':0,'dirty':False})
+            scope = inventory[0] if inventory else None
+            if item.get('scope') != scope:
+                item.update(scope=scope, bytes=None, checked=0, dirty=True)
+                item['generation'] += 1
+            item['inventory'] = inventory[1] if inventory else None
             if force:
                 item['generation']=item.get('generation',0)+1
                 item['dirty']=True
@@ -28,7 +44,7 @@ class FolderUsage:
             if not item["scanning"] and sum(value['scanning'] for value in self.folders.values()) < 2 and (item.get('dirty') or not item['checked'] or time.monotonic() >= due):
                 item["scanning"] = True
                 try:
-                    threading.Thread(target=self.scan, args=(root,item.get('generation',0)), daemon=True, name="disk-folder-usage").start()
+                    threading.Thread(target=self.scan, args=(root,item.get('generation',0),item['inventory']), daemon=True, name="disk-folder-usage").start()
                 except RuntimeError:
                     item.update(scanning=False,error='На ПК не удалось начать подсчёт размера папки. Повторите обновление объёма позже.')
             while len(self.folders)>64:
@@ -37,12 +53,21 @@ class FolderUsage:
                 del self.folders[victim]
             return dict(item,scanning=item['scanning'] or item.get('dirty',False))
 
-    def scan(self, root, generation=None):
+    def scan(self, root, generation=None, inventory=None):
         if generation is None:
             with self.lock: generation=self.folders[root].get('generation',0)
         total = 0
         error = ''
-        queue = [native(root)]
+        if inventory:
+            try:
+                for filename in inventory():
+                    try:
+                        total += os.stat(filename, follow_symlinks=False).st_size
+                    except FileNotFoundError:
+                        continue
+            except (OSError, ValueError, sqlite3.Error):
+                error = 'Часть скачанных файлов недоступна. Проверьте подключение диска и доступ к папке.'
+        queue = [] if inventory else [native(root)]
         while queue:
             directory = queue.pop()
             try:
@@ -62,4 +87,7 @@ class FolderUsage:
                 error = 'Папка на ПК недоступна. Проверьте подключение диска и права доступа.'
         with self.lock:
             item=self.folders[root]
-            item.update(bytes=None if error else total, updated=time.time(), due=time.monotonic()+self.interval, checked=time.monotonic(), scanning=False, error=error,dirty=item.get('generation',0)!=generation)
+            stale = item.get('generation',0) != generation
+            item.update(scanning=False, dirty=stale)
+            if not stale:
+                item.update(bytes=None if error else total, updated=time.time(), due=time.monotonic()+self.interval, checked=time.monotonic(), error=error)

@@ -100,7 +100,7 @@ class DuplicateReview:
                 except Exception:pass
             try:
                 self.engine.status_cache.invalidate()
-                self.engine.folder_usage.snapshot(self.store.job(job_id)['root'],force=True)
+                self.engine.folder_usage.for_job(self.store, job_id, self.store.job(job_id)['root'],force=True)
             finally:
                 with self.lock:self.result.update(busy=False,current='')
                 with self.engine.lock:self.engine.maintenance_busy=False

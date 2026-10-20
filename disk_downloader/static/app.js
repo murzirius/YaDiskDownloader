@@ -362,7 +362,7 @@ $('recheck-service').onclick=()=>safely(async()=>{$('recheck-service').disabled=
 $('reload-page').onclick=()=>location.reload();
 $('open-job-folder').onclick=()=>safely(()=>api('/api/jobs/'+state.job+'/open-folder',{}));
 
-async function chooseFolder(initial=''){if(typeof chooseFolderInApp==='function')return chooseFolderInApp(initial);return chooseNativeFolder(initial);}
+async function chooseFolder(initial=''){return chooseNativeFolder(initial);}
 async function chooseNativeFolder(initial=''){
   if(state.folderSelection)return state.folderSelection;
   state.folderSelection=(async()=>{

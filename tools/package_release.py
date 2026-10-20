@@ -8,7 +8,7 @@ from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[1]
 VERSION=re.search(r'__version__\s*=\s*"([0-9.]+)"',(ROOT/'disk_downloader/__init__.py').read_text(encoding='utf-8')).group(1)
-ROOT_FILES=('README.md','LICENSE','.gitignore','run.py','build_windows.py','start.cmd','start.ps1','START-CMD.txt','requirements.txt','requirements-dev.txt','requirements-build.txt','requirements-bootstrap.txt')
+ROOT_FILES=('README.md','LICENSE','.gitignore','run.py','build_windows.py','windows.manifest','start.cmd','start.ps1','START-CMD.txt','requirements.txt','requirements-dev.txt','requirements-build.txt','requirements-bootstrap.txt')
 
 
 def source_files():

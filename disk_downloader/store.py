@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS partials (
 );
 CREATE TABLE IF NOT EXISTS partial_ownership (job TEXT,local TEXT,PRIMARY KEY(job,local));
 CREATE TABLE IF NOT EXISTS service_outputs (root TEXT,kind TEXT,local TEXT,sha256 TEXT,PRIMARY KEY(root,kind));
+CREATE TABLE IF NOT EXISTS service_output_signatures (root TEXT,kind TEXT,local TEXT,signature TEXT,PRIMARY KEY(root,kind));
 CREATE TABLE IF NOT EXISTS temporary_files (root TEXT,local TEXT,purpose TEXT,created REAL,PRIMARY KEY(root,local));
 CREATE TABLE IF NOT EXISTS duplicate_candidates (job TEXT,local TEXT,canonical TEXT,type TEXT,size INTEGER,sha256 TEXT,PRIMARY KEY(job,local));
 CREATE TABLE IF NOT EXISTS duplicate_moves (job TEXT,local TEXT,quarantine TEXT,sha256 TEXT,size INTEGER,PRIMARY KEY(job,local));

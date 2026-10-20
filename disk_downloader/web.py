@@ -553,7 +553,7 @@ def create_app(state_dir=None, api=None, port=8766):
     @app.post('/api/jobs/<job_id>/refresh-usage')
     def refresh_folder_usage(job_id):
         job=store.job(job_id)
-        engine.folder_usage.snapshot(job['root'],force=True)
+        engine.folder_usage.for_job(store, job_id, job['root'],force=True)
         engine.status_cache.invalidate()
         return jsonify(ok=True)
 

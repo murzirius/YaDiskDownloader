@@ -36,12 +36,36 @@ def native_tray_window(pids):
     matches = []
     def visit(hwnd, _):
         _, pid = win32process.GetWindowThreadProcessId(hwnd)
-        if pid in pids and win32gui.GetClassName(hwnd).startswith('YaDiskDownloader'):
+        if pid in pids and win32gui.GetClassName(hwnd).startswith('YaDiskDownloader') and win32gui.GetClassName(hwnd) != 'YaDiskDownloaderDesktop':
             matches.append(hwnd)
     win32gui.EnumWindows(visit, None)
     # pystray 0.19.5 creates icon window first and menu helper second. EnumWindows
     # lists them in reverse Z order; only the icon is registered in its dispatcher.
     return matches[-1] if len(matches) == 2 else None
+
+
+def native_status_window(pids):
+    import ctypes
+    import win32gui
+    import win32process
+    matches = []
+    def visit(hwnd, _):
+        if win32process.GetWindowThreadProcessId(hwnd)[1] in pids and win32gui.GetClassName(hwnd) == 'YaDiskDownloaderDesktop':
+            matches.append(hwnd)
+    win32gui.EnumWindows(visit, None)
+    if len(matches) != 1:return None
+    hwnd = matches[0]
+    controls = []
+    win32gui.EnumChildWindows(hwnd, lambda child, _: controls.append((win32gui.GetClassName(child), win32gui.GetWindowText(child))), None)
+    assert not any(kind in ('Edit', 'ComboBox') for kind, _ in controls), controls
+    assert {text for kind, text in controls if kind == 'Button'} == {'Открыть в браузере', 'Свернуть', 'Выход'}, controls
+    if not any('Прервано' in text for _, text in controls):return None
+    user = ctypes.WinDLL('user32')
+    user.GetWindowDpiAwarenessContext.argtypes = (ctypes.c_void_p,)
+    user.GetWindowDpiAwarenessContext.restype = ctypes.c_void_p
+    user.AreDpiAwarenessContextsEqual.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+    assert user.AreDpiAwarenessContextsEqual(user.GetWindowDpiAwarenessContext(hwnd), ctypes.c_void_p(-4)), 'Mini window is bitmap-scaled instead of PerMonitorV2'
+    return hwnd
 
 
 def seed_interrupted_history(directory):
@@ -66,7 +90,7 @@ def run(executable, output):
         raise RuntimeError('Windows only')
     executable = executable.resolve(strict=True)
     results = []
-    for exit_mode in ('web', 'native_tray'):
+    for exit_mode in ('web', 'native_tray', 'native_window'):
         with tempfile.TemporaryDirectory(prefix='yadisk-exe-smoke-') as directory:
             root = seed_interrupted_history(directory)
             with socket.socket() as probe:
@@ -75,7 +99,9 @@ def run(executable, output):
             base = f'http://127.0.0.1:{port}'
             env = {key:value for key,value in os.environ.items() if not key.startswith('PYTHON')}
             env['PATH'] = str(Path(os.environ['SystemRoot'])/'System32')
-            process = subprocess.Popen([str(executable),'--no-browser','--port',str(port),'--state-dir',str(Path(directory)/'state')], cwd=directory, env=env)
+            command = [str(executable),'--no-browser','--port',str(port),'--state-dir',str(Path(directory)/'state')]
+            if exit_mode == 'native_window':command.append('--window')
+            process = subprocess.Popen(command, cwd=directory, env=env)
             session = requests.Session()
             session.trust_env = False
             owned_pids = []
@@ -123,9 +149,13 @@ def run(executable, output):
                 if exit_mode == 'web':
                     quit_response = session.post(base+'/api/exit',json={},headers=headers,timeout=5)
                     quit_response.raise_for_status()
-                else:
+                elif exit_mode == 'native_tray':
                     import win32gui
                     win32gui.PostMessage(hwnd,0x0010,0,0)  # WM_CLOSE -> Tray.exit
+                else:
+                    import win32gui
+                    window = wait_until(lambda:native_status_window(owned_pids),10,'Mini status window is missing')
+                    win32gui.PostMessage(window,0x0010,0,0)
                 process.wait(timeout=20)
                 assert process.returncode == 0
                 with socket.socket() as probe:

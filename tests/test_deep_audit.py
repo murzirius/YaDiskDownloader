@@ -107,8 +107,10 @@ def test_failed_verification_setup_does_not_lock_all_jobs(system,monkeypatch):
     @contextmanager
     def failing():
         nonlocal calls
-        calls+=1
-        if calls==2:raise sqlite3.OperationalError('disk full during setup')
+        # Inject into setup, not the independent background usage reader.
+        if threading.current_thread() is threading.main_thread():
+            calls+=1
+            if calls==2:raise sqlite3.OperationalError('disk full during setup')
         with original() as db:yield db
     monkeypatch.setattr(engine.store,'db',failing)
     with pytest.raises(sqlite3.OperationalError):Maintenance(engine).start({'job':job_id})

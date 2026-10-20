@@ -493,13 +493,21 @@ class Engine:
         status["partial_bytes"] = 0
         service_bytes = 0
         counted_outputs = set()
-        for row in self.store.rows("SELECT local FROM names WHERE job=? AND identity LIKE '@output:%'", (job_id,)):
+        # Use recorded output sizes; do not stat thousands of old report names.
+        from .service_outputs import root_key
+        for row in self.store.rows('SELECT s.local,s.signature FROM service_output_signatures s JOIN names n ON n.job=? AND n.identity=\'@output:\'||s.local AND n.local=s.local WHERE s.root=?', (job_id, root_key(status['root']))):
             try:
-                service_bytes += os.path.getsize(safe_join(status["root"], row["local"]))
-                counted_outputs.add(row["local"])
-            except (OSError, PathError):
+                service_bytes += max(0, int(json.loads(row['signature'])[2]))
+                counted_outputs.add(row['local'])
+            except (ValueError, TypeError, IndexError):
                 pass
-        if status["zip_path"] and status["zip_path"] not in counted_outputs:
+        for name in ('manifest_local', 'changes_local'):
+            if status['settings'].get(name) and status['settings'][name] not in counted_outputs:
+                try:
+                    service_bytes += os.path.getsize(safe_join(status['root'], status['settings'][name]))
+                except (OSError, PathError):
+                    pass
+        if status["zip_path"]:
             try:
                 service_bytes += os.path.getsize(safe_join(status["root"], status["zip_path"]))
             except (OSError, PathError):
@@ -526,7 +534,7 @@ class Engine:
             except (OSError, PathError):
                 pass
         status["local_bytes"] = status["saved_bytes"] + service_bytes
-        usage = self.folder_usage.snapshot(status["root"], active=live and not (control and control.paused))
+        usage = self.folder_usage.for_job(self.store, job_id, status["root"], active=live and not (control and control.paused))
         status["folder_bytes"] = usage['bytes'] if usage['bytes'] is not None else None if usage.get('error') else status['local_bytes']
         status['folder_bytes_error'] = usage.get('error','')
         status["folder_bytes_scanning"] = usage["scanning"]
@@ -699,10 +707,9 @@ class Engine:
                 control.active.clear()
                 control.finished = time.monotonic()
 
-            # One final sweep includes the last media file, reports and manifest.
-            # Idle history polling does not need to rescan the entire folder.
+            # Refresh only downloaded media, never walk service output folders.
             if not self.shutting_down and operation != 'scan':
-                self.folder_usage.snapshot(self.store.job(job_id)['root'],force=True)
+                self.folder_usage.for_job(self.store, job_id, self.store.job(job_id)['root'], force=True)
 
     def scan(self, job_id, control):
         job = self.store.job(job_id)

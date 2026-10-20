@@ -2,8 +2,10 @@
 import os
 import threading
 import uuid
+from .windows_dpi import native_thread
 
 
+@native_thread()
 def choose_directory(initial=""):
     if os.name != "nt":
         try:
@@ -44,7 +46,9 @@ def choose_directory(initial=""):
                              c.byref(GUID("d57c7288-d4ad-4768-be02-9d969532d960")), c.byref(dialog))
         method(dialog, 9, w.DWORD)(dialog, 0x20 | 0x40 | 0x800 | 0x8 | 0x2000000)
         method(dialog, 17, w.LPCWSTR)(dialog, "Папка для результатов Яндекс.Диска")
-        if initial and os.path.isdir(initial):
+        # A disconnected NAS can block path lookup before Windows even shows
+        # the dialog. For UNC paths let the dialog open at its remembered place.
+        if initial and not initial.startswith(('\\\\', '//')) and os.path.isdir(initial):
             shell = c.OleDLL("shell32")
             shell.SHCreateItemFromParsingName.argtypes = [w.LPCWSTR, c.c_void_p, c.POINTER(GUID), c.POINTER(c.c_void_p)]
             initial_item = c.c_void_p()
