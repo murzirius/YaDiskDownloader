@@ -17,6 +17,16 @@ def check(output):
     def inspect(window):
         user=window.user;gdi=window.gdi
         user.ShowWindow(window.hwnd,0)
+        # Synthetic DPI can request a window larger than the CI desktop.
+        # An overlapped window is clamped by Windows before layout is checked.
+        # Isolate this geometry test from the host monitor using a hidden popup;
+        # retain the production controls, scaling handler and every assertion.
+        user.GetWindowLongPtrW.argtypes=(w.HWND,ctypes.c_int)
+        user.GetWindowLongPtrW.restype=ctypes.c_ssize_t
+        user.SetWindowLongPtrW.argtypes=(w.HWND,ctypes.c_int,ctypes.c_ssize_t)
+        user.SetWindowLongPtrW.restype=ctypes.c_ssize_t
+        style=user.GetWindowLongPtrW(window.hwnd,-16)
+        user.SetWindowLongPtrW(window.hwnd,-16,(style&~0x00cf0000)|0x80000000)
         user.GetClientRect.argtypes=(w.HWND,ctypes.POINTER(w.RECT))
         user.GetWindowRect.argtypes=(w.HWND,ctypes.POINTER(w.RECT))
         user.ClientToScreen.argtypes=(w.HWND,ctypes.POINTER(w.POINT))
@@ -25,7 +35,7 @@ def check(output):
         user.GetGuiResources.argtypes=(w.HANDLE,w.DWORD)
         process=kernel.GetCurrentProcess()
         before=user.GetGuiResources(process,0)
-        for dpi in (96,144,192,144,96)*4:
+        for dpi in (96,144,192,144,96)*4+(384,96):
             rectangle=w.RECT(0,0,round(616*dpi/96),round(459*dpi/96))
             user.SendMessageW(window.hwnd,0x02e0,dpi|(dpi<<16),ctypes.addressof(rectangle))
             assert window.dpi==dpi
