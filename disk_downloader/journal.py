@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .paths import forget_temporary, PathError, publish, replace_owned, reserve_output, safe_join, temporary_file
+from .paths import forget_temporary, safe_join, temporary_file
 from .service_outputs import location, finish
 
 
@@ -141,13 +141,19 @@ class Journal:
                 temp = temporary_file(job["root"], self.store, 'journal')
                 with open(temp, "w", encoding="utf-8", newline="\n") as stream:
                     stream.write(marker + "\n" + before + '{"summary":' + encoded(summary) + ',"events":[')
-                    first = True
-                    for row in self.store.rows("SELECT e.time,e.category,e.level,e.message,e.path FROM journal_events e LEFT JOIN jobs j ON j.id=e.job LEFT JOIN journal_jobs jj ON jj.job=e.job WHERE COALESCE(j.root,jj.root)=? AND e.id<=? ORDER BY e.id", (job['root'], ceiling)):
+                    first, batch = True, []
+                    query = """SELECT time,category,level,message,path FROM journal_events
+                        WHERE job IN (SELECT id FROM jobs WHERE root=? UNION
+                          SELECT job FROM journal_jobs jj WHERE root=? AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.id=jj.job))
+                        AND id<=? ORDER BY id"""
+                    for row in self.store.rows(query, (job['root'], job['root'], ceiling)):
                         checkpoint()
-                        if not first:
-                            stream.write(",\n")
-                        stream.write(encoded(dict(row)))
-                        first = False
+                        batch.append(dict(row))
+                        if len(batch) == 200:
+                            stream.write(('' if first else ',') + encoded(batch)[1:-1])
+                            first, batch = False, []
+                    if batch:
+                        stream.write(('' if first else ',') + encoded(batch)[1:-1])
                     stream.write("]}" + after)
                     stream.flush()
                     os.fsync(stream.fileno())

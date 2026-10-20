@@ -72,6 +72,8 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: python tools/package_release.py --check-tag
+      - name: Check native layout at 100, 150 and 200 percent
+        run: python tools/check_desktop_dpi.py --output desktop-dpi-results.json
       - run: python build_windows.py --output dist/windows --work build/windows
       - name: Smoke actual EXE, UI, patched SQLite, tray and full shutdown
         run: python tools/smoke_windows_exe.py --exe dist/windows/YaDiskDownloader.exe --output smoke-results.json
@@ -80,7 +82,9 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: windows-exe-smoke
-          path: smoke-results.json
+          path: |
+            smoke-results.json
+            desktop-dpi-results.json
           if-no-files-found: ignore
       - run: python -m pip download --no-deps --dest dist/windows/third_party pystray==0.19.5
       - run: python tools/package_release.py --exe dist/windows/YaDiskDownloader.exe --output dist/release

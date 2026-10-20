@@ -141,7 +141,15 @@ def create_app(state_dir=None, api=None, port=8766):
         import sqlite3
         from . import __build__
         from .desktop import status as desktop_status
-        return jsonify(sqlite=sqlite3.sqlite_version, safe_sqlite_wal=safe_wal(), version=__version__, build=__build__, frozen=frozen(), tray=tray.status() if tray else {"visible": False, "error": ""}, desktop=desktop_status(), can_exit=bool(app.extensions.get("quit_app")), migration=app.extensions.get("migration", {"jobs": 0, "failed_sources": 0}))
+        from .single_instance import state_key
+        return jsonify(application='YaDiskDownloader', state_key=state_key(state), sqlite=sqlite3.sqlite_version, safe_sqlite_wal=safe_wal(), version=__version__, build=__build__, frozen=frozen(), tray=tray.status() if tray else {"visible": False, "error": ""}, desktop=desktop_status(), can_exit=bool(app.extensions.get("quit_app")), migration=app.extensions.get("migration", {"jobs": 0, "failed_sources": 0}))
+
+    @app.post('/api/activate')
+    def activate_instance():
+        activate = app.extensions.get('activate_window')
+        if not activate:raise ValueError('Приложение на ПК ещё запускается. Подождите немного и повторите открытие.')
+        activate()
+        return jsonify(ok=True)
 
     @app.post("/api/exit")
     def exit_app():
@@ -428,7 +436,6 @@ def create_app(state_dir=None, api=None, port=8766):
     def thumbnail():
         if not thumbnail_slots.acquire(blocking=False):
             return "", 429
-        response = connection = None
         try:
             _, epoch = credentials.snapshot()
             def check():

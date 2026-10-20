@@ -5,7 +5,7 @@ import os
 import threading
 from itertools import groupby
 
-from .paths import forget_temporary, publish, reserve_output, safe_join, temporary_file
+from .paths import forget_temporary, safe_join, temporary_file
 from .service_outputs import location, finish, root_key
 
 REPORT_LOCK = threading.RLock()
@@ -79,12 +79,11 @@ def _write_reports(store, job_id, checkpoint, final_phase):
     summary = context(store, job_id)
     if final_phase:
         summary["phase"] = final_phase
-    generation = job["generation"] + 1
     fields = ["record_type", "source_path", "local_path", "status", "error", "original_attempt", "preview_attempt", "fallback_to_preview", "results", "original_attempts", "preview_attempts"]
     paths = []
     for fmt in job["settings"]["reports"]:
         relative, replace = location(store, job, 'report:' + fmt, 'report.' + fmt, checkpoint)
-        final = safe_join(job["root"], relative)
+        safe_join(job["root"], relative)
         temp = temporary_file(job["root"], store, 'report')
         try:
             with open(temp, "w", encoding="utf-8-sig" if fmt == "csv" else "utf-8", newline="") as out:

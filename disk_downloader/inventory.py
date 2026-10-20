@@ -5,7 +5,7 @@ from pathlib import Path
 from .exclusions import excluded
 from .file_types import selected_type
 from .journal import encoded
-from .paths import forget_temporary, publish, reserve_output, safe_join, temporary_file
+from .paths import forget_temporary, temporary_file
 
 
 LABELS = {"new": "Новые", "changed": "Изменённые", "unchanged": "Без изменений", "removed": "Больше нет в источнике", "excluded": "Исключены из выбора", "unknown": "Не удалось проверить"}

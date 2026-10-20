@@ -16,7 +16,6 @@ import requests
 from .api import Deadline, DeadlineAdapter
 from .runtime import frozen
 from .service_outputs import digest_file
-from .updates import version
 
 
 def download_url(url, repo, first=False):

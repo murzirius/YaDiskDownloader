@@ -10,6 +10,7 @@ import zipfile
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
+from contextlib import contextmanager
 
 import requests
 from PIL import Image
@@ -17,7 +18,7 @@ from PIL import Image
 from .api import APIError, Deadline, NetworkError, PausedRequest, PREVIEW_MAX_BYTES, SIZES, Suspended, attempt_count, retry_delay, validate_resource
 from .import_state import find_import, inherit, save_import
 from .file_types import FILE_TYPES, file_type, preview_type, selected_type
-from .estimation import RemainingTime
+from .estimation import RemainingTime, VerificationTime
 from .paths import file_signature, forget_temporary, PathError, component, digest, native, normalize_selection, parent_path, publish, remote_path, reserve_output, safe_join, suffix, temporary_file
 from .reports import write_reports, REPORT_LOCK
 from .journal import Journal, PHASES
@@ -28,6 +29,7 @@ from .inventory import compare, write_changes
 from .network import NetworkWait
 from .limits import MAX_WORKERS
 from .status_cache import StatusCache
+from .destination import DestinationGuard, StorageRetry
 
 
 def now():
@@ -94,11 +96,17 @@ class Control:
         self.adaptive = None
         self.selected_paths = None
         self.rate_limiter = rate_limit.RateLimiter(0)
+        self.verification_time = VerificationTime(self.active_clock)
         self.verification = None
         self.verification_cached = 0
         self.verification_hashed = 0
         self.duplicate_locks = [threading.RLock() for _ in range(64)]
         self.duplicate_cleanup_lock = threading.RLock()
+        self.destination = None
+        self.storage_check = None
+        self.last_progress = self.started
+        self.pause_acknowledged = False
+        self.expected_waiters = 0
 
     def event(self, group, message, path="", level="info"):
         if self.journal:
@@ -112,14 +120,43 @@ class Control:
             self.space_check()
         with self.condition:
             while self.paused and not self.stopped:
+                self.pause_acknowledged = True
                 self.condition.wait(0.2)
             if self.stopped:
                 raise Suspended("Задание остановлено")
+
+    def storage_error(self, error):
+        if isinstance(error, OSError) and not isinstance(error, requests.RequestException) and self.storage_check:
+            if self.storage_check():
+                self.check()
+                return True
+        return False
+
+    def health(self):
+        if self.finished is not None:return {'warning':'','seconds_without_progress':0}
+        age = max(0, time.monotonic()-self.last_progress)
+        warning = ''
+        if self.paused and not self.pause_acknowledged:
+            warning = 'Пауза запрошена. Приложение ждёт завершения текущего чтения или записи на устройстве.'
+        elif not self.paused and not self.stopped and not self.expected_waiters and not self.network.offline.is_set() and age >= 120:
+            warning = 'Давно нет прогресса. Возможно, накопитель или Яндекс.Диск не отвечает. Можно запросить паузу или остановку; новую копию задания до остановки запускать нельзя.'
+        return {'warning':warning, 'seconds_without_progress':int(age) if warning else 0}
+
+    @contextmanager
+    def expected_wait(self):
+        with self.lock:self.expected_waiters += 1
+        try:
+            yield
+        finally:
+            with self.lock:
+                self.expected_waiters -= 1
+                self.last_progress = time.monotonic()
 
     def pause(self):
         with self.condition:
             if not self.paused:
                 self.paused = True
+                self.pause_acknowledged = False
                 self.pause_started = time.monotonic()
         self.network.pause_requests()
 
@@ -129,6 +166,8 @@ class Control:
                 self.elapsed_before += time.monotonic() - self.pause_started
                 self.pause_started = None
             self.paused = False
+            self.pause_acknowledged = False
+            self.last_progress = time.monotonic()
             self.condition.notify_all()
 
     def stop(self):
@@ -139,12 +178,18 @@ class Control:
 
     def progress(self, path, done, size, action, **details):
         with self.lock:
-            self.active[path] = {"path": path, "done": done, "size": size, "action": action, **details}
+            value = {"path": path, "done": done, "size": size, "action": action, **details}
+            if self.active.get(path) != value:
+                self.last_progress = time.monotonic()
+            self.active[path] = value
 
     def snapshot(self):
         with self.lock:
             elapsed = (self.finished or self.pause_started or time.monotonic()) - self.started - self.elapsed_before - self.network.elapsed
-            return {"active": list(self.active.values()), "speed": self.transferred / max(0.1, elapsed), 'verification':dict(self.verification) if self.verification else None}
+            verification = dict(self.verification) if self.verification and getattr(self,'phase','preparing')=='preparing' else None
+            if verification:
+                verification['eta_seconds'] = self.verification_time.estimate(verification['checked'], verification['total'])
+            return {"active": list(self.active.values()), "speed": self.transferred / max(0.1, elapsed), 'verification':verification, 'health':self.health()}
 
     def active_clock(self):
         with self.condition:
@@ -278,7 +323,7 @@ class Engine:
             self.launch(job_id, "scan")
         except Exception:
             with self.store.db() as db:
-                for table in ("entries", "names", "artifacts", "partials", "partial_ownership", "baseline", "changes", "verification_cache", "scan_errors", "journal_events"):
+                for table in ("entries", "names", "artifacts", "partials", "partial_ownership", "baseline", "changes", "verification_cache", "scan_errors", "journal_events", "journal_jobs"):
                     db.execute("DELETE FROM " + table + " WHERE job=?", (job_id,))
                 db.execute("DELETE FROM jobs WHERE id=?", (job_id,))
             self.controls.pop(job_id, None)
@@ -291,7 +336,7 @@ class Engine:
             raise
         return job_id
 
-    def launch(self, job_id, operation="download", paths=None):
+    def launch(self, job_id, operation="download", paths=None, selection=None):
         with self.lock:
             if self.shutting_down:
                 raise ValueError("Приложение завершается")
@@ -301,6 +346,7 @@ class Engine:
                 raise ValueError("Подключите Диск перед продолжением")
             control = Control()
             control.operation = operation
+            control.selection = selection
             control.journal = Journal(self, job_id, self.journal_interval)
             job = self.store.job(job_id)
             if job["settings"].get("_invalid"):
@@ -311,6 +357,8 @@ class Engine:
             control.adaptive = None
             control.rate_limiter = rate_limit.RateLimiter(job["settings"].get("speed_limit_mib", 0), control.active_clock)
             control.space_check = lambda: self.check_space(job_id, control)
+            control.storage_check = lambda: self.check_space(job_id, control, force=True)
+            control.destination = DestinationGuard(job['root'])
             control.selected_paths = tuple(paths) if paths else None
             control.reuse_scanned = operation == "download" and not paths and (job["settings"].get("operation") == "missing" or job["phase"] in ("paused", "stopped", "interrupted", "failed") or job["generation"] > 0)
             if operation == 'download' and not paths:
@@ -319,7 +367,16 @@ class Engine:
             self.controls[job_id] = control
             thread = threading.Thread(target=self.run, args=(job_id, operation, control), daemon=True)
             self.threads[job_id] = thread
-            thread.start()
+            try:
+                thread.start()
+            except RuntimeError:
+                self.controls.pop(job_id,None)
+                self.threads.pop(job_id,None)
+                with self.store.db() as db:
+                    if selection:db.execute('DELETE FROM run_selection WHERE run=?',(selection,))
+                    db.execute("UPDATE job_queue SET state='waiting',error='' WHERE job=? AND state='running'",(job_id,))
+                    db.execute("UPDATE jobs SET phase='interrupted',error=? WHERE id=?",('Приложение на ПК не смогло начать работу. Закройте лишние программы и нажмите «Продолжить».',job_id))
+                raise ValueError('Приложение на ПК не смогло начать работу. Закройте лишние программы и повторите запуск задания.') from None
 
     def action(self, job_id, action, limits=None):
         if action in ('stop', 'pause'):
@@ -339,7 +396,7 @@ class Engine:
                 action = 'resume'
             if job["settings"].get("_invalid") and action not in ("stop",):
                 raise ValueError("Настройки задания повреждены. Создайте дозагрузку в прежнюю папку.")
-            if action in ("start", "resume", "retry", "retry_selected", "pack", "save_manifest", "refresh_journal"):
+            if action in ("start", "resume", "retry", "retry_failed", "retry_selected", "pack", "save_manifest", "refresh_journal"):
                 own = self.threads.get(job_id)
                 if not (action == "resume" and own and own.is_alive() and self.controls[job_id].paused):
                     self.ensure_idle()
@@ -389,7 +446,7 @@ class Engine:
                 control.resume()
                 control.event("system", "Работа продолжена после паузы")
                 return
-            if action in ("start", "resume", "retry", "retry_selected"):
+            if action in ("start", "resume", "retry", "retry_failed", "retry_selected"):
                 if live and live.is_alive():
                     raise ValueError("Операция ещё выполняется")
                 if action == "retry_selected":
@@ -406,8 +463,15 @@ class Engine:
                     validated = self.validate_settings({**job["settings"], **{k: limits[k] for k in keys if k in limits}})
                     job["settings"].update({k: validated[k] for k in (*keys, "retries")})
                     self.store.update_job(job_id, settings=json.dumps(job["settings"], ensure_ascii=False))
+                selection = None
                 with self.store.db() as db:
-                    if action == "retry_selected":
+                    if action == 'retry_failed':
+                        selection = uuid.uuid4().hex
+                        db.execute("INSERT INTO run_selection SELECT ?,path FROM entries WHERE job=? AND kind='file' AND status IN ('error','partial','no_preview','cancelled')", (selection,job_id))
+                        if not db.execute('SELECT 1 FROM run_selection WHERE run=?',(selection,)).fetchone():
+                            raise ValueError('Файлов с ошибками нет. Для продолжения незавершённого задания нажмите «Продолжить».')
+                        db.execute("UPDATE entries SET status='pending',error='' WHERE job=? AND path IN (SELECT path FROM run_selection WHERE run=?)",(job_id,selection))
+                    elif action == "retry_selected":
                         paths = (limits or {}).get("paths")
                         if not isinstance(paths, list) or not paths or len(paths) > 1000 or any(not isinstance(p, str) for p in paths):
                             raise ValueError("Выберите от 1 до 1000 файлов для повтора")
@@ -428,7 +492,7 @@ class Engine:
                             db.execute("UPDATE entries SET status='pending' WHERE job=? AND kind='file' AND NOT (status='existing' AND (original_status='existing_verified' OR (?='any_result' AND preview_status='existing_verified')))", (job_id, job["settings"].get("missing_policy", "originals")))
                         else:
                             db.execute("UPDATE entries SET status='pending' WHERE job=? AND kind='file'", (job_id,))
-                self.launch(job_id, "scan" if scan_only else "download", paths=paths if action == "retry_selected" else None)
+                self.launch(job_id, "scan" if scan_only else "download", paths=paths if action == "retry_selected" else None, selection=selection)
                 return
             if action == "pack":
                 self.launch(job_id, "pack")
@@ -579,6 +643,7 @@ class Engine:
 
     def phase(self, job_id, control, phase):
         control.phase = phase
+        control.last_progress = time.monotonic()
         if phase in ("downloading", "packing"):
             control.remaining_time.start(phase, 0 if phase == "packing" else control.transferred, self.store.summary(job_id)["processed"])
         self.store.update_job(job_id, phase="paused" if control.paused else phase)
@@ -586,13 +651,31 @@ class Engine:
 
     def check_space(self, job_id, control, force=False):
         with control.space_lock:
+            if control.stopped:raise Suspended('Задание остановлено')
+            if control.paused and not force:return True
             if not force and time.monotonic() < control.next_space_check:
                 return bool(control.pause_reason)
+            refresh = force or control.next_space_check == 0
             control.next_space_check = time.monotonic() + 0.5
             job = self.store.job(job_id)
+            if control.destination:
+                usage, error = control.destination.check(lambda: control.stopped, force=refresh)
+                if control.stopped:
+                    raise Suspended('Задание остановлено')
+                if error or usage is None:
+                    reason = error or 'Папка загрузки недоступна. Подключите накопитель и нажмите «Продолжить».'
+                    changed = control.pause_reason != reason
+                    control.pause_reason = reason
+                    control.pause()
+                    if changed:
+                        self.store.update_job(job_id,phase='paused',pause_reason=reason)
+                        control.event('system',reason,level='warning')
+                    return True
+            else:
+                usage = shutil.disk_usage(job['root'])
+            control.next_space_check = time.monotonic()+.5
             if not job["settings"].get("auto_pause", True):
                 return False
-            usage = shutil.disk_usage(job["root"])
             occupied = (usage.total - usage.free) * 100 / max(1, usage.total)
             threshold = job["settings"].get("max_disk_percent", 95)
             if occupied >= threshold or usage.free < 8 * 1024 * 1024:
@@ -621,12 +704,19 @@ class Engine:
                     control.active.clear()
                     control.finished = time.monotonic()
 
+        finally:
+            if getattr(control,'selection',None):
+                try:
+                    with self.store.db() as db:db.execute('DELETE FROM run_selection WHERE run=?',(control.selection,))
+                except sqlite3.Error:pass
+
     def _run(self, job_id, operation, control):
         saved_scan = False
         try:
             previous_job = self.store.job(job_id)
             self.store.update_job(job_id, error="", ended=None, pause_reason="")
             job = self.store.job(job_id)
+            control.check()
             if job['settings'].get('_inherit_source'):
                 self.phase(job_id, control, 'preparing')
                 source = job['settings']['_inherit_source']
@@ -697,7 +787,7 @@ class Engine:
             try:
                 if not saved_scan and not self.store.job(job_id)['settings'].get('_inherit_source'):
                     save_import(self.store, job_id)
-            except (OSError, sqlite3.Error, ValueError) as exc:
+            except (OSError, sqlite3.Error, ValueError):
                 warning = 'Не удалось обновить опись в папке на ПК. Файлы и история сохранены в приложении. Проверьте доступ к папке и свободное место; затем повторите сохранение описи.'
                 control.journal.error = warning
                 self.store.update_job(job_id, error=warning)
@@ -876,6 +966,9 @@ class Engine:
                 if control.selected_paths:
                     condition += " AND path IN (" + ",".join("?" for _ in control.selected_paths) + ")"
                     parameters += control.selected_paths
+                if getattr(control,'selection',None):
+                    condition += ' AND path IN (SELECT path FROM run_selection WHERE run=?)'
+                    parameters += (control.selection,)
                 active = set()
                 while True:
                     control.check()
@@ -956,10 +1049,17 @@ class Engine:
         """Finish local verification before any download workers are started."""
         control = control or Control()
         job_id = job["id"]
+        selection = getattr(control,'selection',None)
+        scope = ' AND path IN (SELECT path FROM run_selection WHERE run=?)' if selection else ''
+        scope_args = (selection,) if selection else ()
         with self.store.db() as db:
-            total = db.execute("SELECT COUNT(*) FROM entries WHERE job=? AND kind='file' AND status!='filtered'", (job_id,)).fetchone()[0]
+            total = db.execute("SELECT COUNT(*) FROM entries WHERE job=? AND kind='file' AND status!='filtered'"+scope, (job_id,*scope_args)).fetchone()[0]
         checked = found = 0
         originals = previews = 0
+        with control.lock:
+            control.verification_time.reset()
+            control.verification_time.estimate(0, total)
+            control.verification = {'checked':0,'total':total,'originals':0,'previews':0,'missing':0,'complete':not total,'cached':0,'hashed':0}
         cursor = ""
         updates, remove_previews = [], []
         def flush():
@@ -974,16 +1074,16 @@ class Engine:
         while True:
             control.check()
             with self.store.db() as db:
-                rows = db.execute("SELECT * FROM entries WHERE job=? AND kind='file' AND status!='filtered' AND path>? ORDER BY path LIMIT 200", (job_id, cursor)).fetchall()
+                rows = db.execute("SELECT * FROM entries WHERE job=? AND kind='file' AND status!='filtered' AND path>?"+scope+" ORDER BY path LIMIT 200", (job_id, cursor,*scope_args)).fetchall()
             if not rows:
                 break
             with self.store.db() as db:
-                artifacts = db.execute('SELECT a.*,v.signature FROM artifacts a LEFT JOIN verification_cache v ON v.job=a.job AND v.local=a.local WHERE a.job=? AND a.path>=? AND a.path<=?', (job_id,rows[0]['path'],rows[-1]['path'])).fetchall()
+                artifacts = db.execute('SELECT a.*,v.signature FROM artifacts a LEFT JOIN verification_cache v ON v.job=a.job AND v.local=a.local WHERE a.job=? AND a.path>=? AND a.path<=?'+(' AND a.path IN (SELECT path FROM run_selection WHERE run=?)' if selection else ''), (job_id,rows[0]['path'],rows[-1]['path'],*scope_args)).fetchall()
             control.verification_records = {(row['path'],row['type']):dict(row) for row in artifacts}
             for row in rows:
                 control.check()
                 entry = dict(row)
-                control.progress(entry["path"], checked, total, "Проверка скачанной папки", unit="objects")
+                control.progress(entry["path"], checked, total, "Проверка скачанной папки", unit="files")
                 meta = json.loads(entry["meta"])
                 original = preview = False
                 try:
@@ -1035,8 +1135,9 @@ class Engine:
                 previews += bool(preview and not original)
                 with control.lock:
                     control.active.clear()
+                    control.verification_time.estimate(checked,total)
                     control.verification = {'checked':checked,'total':total,'originals':originals,'previews':previews,'missing':checked-found,'complete':checked==total,'cached':control.verification_cached,'hashed':control.verification_hashed}
-                control.progress(entry["path"], checked, total, "Проверка скачанной папки", unit="objects")
+                control.progress(entry["path"], checked, total, "Проверка скачанной папки", unit="files")
             cursor = rows[-1]["path"]
             flush()
         control.event("cache", f"Папка проверена: {checked} файлов, уже есть результат у {found}. Сначала будут скачаны файлы без результата.")
@@ -1100,6 +1201,13 @@ class Engine:
         return sha.hexdigest(), md5.hexdigest()
 
     def reusable(self, job, entry, kind, meta, control):
+        while True:
+            try:
+                return self._reusable(job, entry, kind, meta, control)
+            except StorageRetry:
+                control.check()
+
+    def _reusable(self, job, entry, kind, meta, control):
         records = getattr(control,'verification_records',None)
         if records is not None:
             artifact = records.get((entry['path'],kind))
@@ -1113,7 +1221,7 @@ class Engine:
             if not os.path.isfile(filename) or meta.get("size") is not None and os.path.getsize(filename) != meta["size"]:
                 return False
             before = file_signature(filename, "")
-            sha, md5 = hashlib.sha256(), hashlib.md5()
+            sha, md5 = hashlib.sha256(), hashlib.md5(usedforsecurity=False)
             with open(filename, "rb") as stream:
                 while chunk := stream.read(1024 * 1024):
                     control.check()
@@ -1168,17 +1276,28 @@ class Engine:
                 if valid and not cached and signature[-1] is not None:
                     with self.store.db() as db:
                         db.execute("INSERT OR REPLACE INTO verification_cache VALUES(?,?,?)", (job["id"], artifact["local"], encoded))
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            if control.storage_error(exc):
+                raise StorageRetry() from exc
             valid = False
         if valid:
             return True
+        # Confirm the destination before invalidating a previously saved copy.
+        # Missing NAS files are not evidence that the downloaded copy is gone.
+        if control.destination and self.check_space(job['id'], control, force=True):
+            control.check()
+            raise StorageRetry()
         with self.store.db() as db:
             db.execute("DELETE FROM artifacts WHERE job=? AND path=? AND type=?", (job["id"], entry["path"], kind))
         return False
 
     def process(self, job_id, entry, control):
         with self.store.session():
-            return self._process(job_id, entry, control)
+            while True:
+                try:
+                    return self._process(job_id, entry, control)
+                except StorageRetry:
+                    control.check()
 
     def _process(self, job_id, entry, control):
         job = self.store.job(job_id)
@@ -1243,9 +1362,11 @@ class Engine:
                     label = "Оригинал" if kind == "original" else "Превью"
                     result = (" уже скачан, проверка пройдена" if kind == "original" else " уже скачано, проверка пройдена") if was_reused else (" скачан и проверен" if kind == "original" else " скачано и проверено")
                     control.event("cache" if was_reused else kind, label + result + (" · сохранено вместо недоступного оригинала" if fallback else ""), path, "success")
-                except Suspended:
+                except (Suspended, StorageRetry):
                     raise
                 except Exception as exc:
+                    if control.storage_error(exc):
+                        raise StorageRetry() from exc
                     outcome = "unavailable" if isinstance(exc, APIError) and exc.status == 404 and kind == "preview" else "failed"
                     errors.append(("Оригинал: " if kind == "original" else "Превью: ") + safe_error(exc))
                     if isinstance(exc, (PathError, sqlite3.Error)) or isinstance(exc, OSError) and not isinstance(exc, requests.RequestException):
@@ -1268,6 +1389,9 @@ class Engine:
                 control.event("errors", "; ".join(errors if not completed else other_errors), path, "error")
             self.store.update_entry(job_id, path, status=status, error="; ".join(errors if not completed else other_errors), original_status=original_status, preview_status=preview_status, fallback=int(fallback))
             finalized = True
+        except StorageRetry:
+            self.store.update_entry(job_id, path, status='pending')
+            raise
         except Suspended:
             self.store.update_entry(job_id, path, status="pending", original_status=original_status, preview_status=preview_status)
             control.stop()
@@ -1285,6 +1409,9 @@ class Engine:
             finalized = True
             control.event("errors", "Ошибка обработки файла: " + safe_error(exc), path, "error")
         except Exception as exc:
+            if control.storage_error(exc):
+                self.store.update_entry(job_id,path,status='pending')
+                raise StorageRetry() from exc
             self.store.update_entry(job_id, path, status="error", error=safe_error(exc), original_status=original_status, preview_status=preview_status)
             finalized = True
             control.event("errors", "Ошибка обработки файла: " + safe_error(exc), path, "error")
@@ -1318,7 +1445,7 @@ class Engine:
                 with open(temp, "wb"):
                     pass
                 size = offset = 0
-                sha, md5 = hashlib.sha256(), hashlib.md5()
+                sha, md5 = hashlib.sha256(), hashlib.md5(usedforsecurity=False)
             with control.lock:
                 control.temporary.add(temp)
                 control.temporary_sizes[temp] = size
@@ -1360,7 +1487,7 @@ class Engine:
                             if offset:
                                 control.event(kind, "Сервер не подтвердил продолжение; загрузка начата заново", entry["path"], "warning")
                             offset = size = 0
-                            sha, md5 = hashlib.sha256(), hashlib.md5()
+                            sha, md5 = hashlib.sha256(), hashlib.md5(usedforsecurity=False)
                             total = expected
                         else:
                             raise APIError(f"Ошибка загрузки HTTP {response.status_code}", response.status_code)

@@ -4,14 +4,16 @@ import os
 from PIL import Image, ImageDraw
 
 
-def image():
-    icon = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+def image(size=64):
+    # Draw at four times the target resolution for crisp small and high-DPI icons.
+    scale=size*4/64
+    icon = Image.new('RGBA',(size*4,size*4),(0,0,0,0))
     draw = ImageDraw.Draw(icon)
-    draw.rounded_rectangle((3, 3, 61, 61), radius=14, fill="#1c1f24", outline="#a8c3e1", width=3)
-    draw.line((32, 14, 32, 39), fill="#a8c3e1", width=6)
-    draw.line((21, 30, 32, 41, 43, 30), fill="#a8c3e1", width=5)
-    draw.line((18, 49, 46, 49), fill="#e2e5ea", width=4)
-    return icon
+    points=lambda values:tuple(round(value*scale) for value in values)
+    draw.rounded_rectangle(points((3,3,61,61)),radius=round(14*scale),fill='#1c1f24',outline='#a8c3e1',width=round(3*scale))
+    for values,width in (((32,14,32,39),6),((21,30,32,41,43,30),5),((18,49,46,49),4)):
+        draw.line(points(values),fill='#e2e5ea' if width==4 else '#a8c3e1',width=round(width*scale))
+    return icon.resize((size,size),Image.Resampling.LANCZOS)
 
 
 class Tray:
@@ -106,7 +108,18 @@ class Tray:
                 # across ticks. No read transaction is held between polls.
                 with self.engine.store.db() as db:
                     previous_version = None
+                    enabled = True
+                    warned_health = None
                     while not self.notification_stop.wait(1):
+                        if previous_version is not None:
+                            active = self.active()
+                            warning = active[1].health()['warning'] if active else ''
+                            key = (active[0],warning) if active and warning else None
+                            if key and key != warned_health and enabled and self.icon and self.icon.visible:
+                                self.icon.notify(warning,'YaDiskDownloader')
+                                warned_health = key
+                            elif not key or not enabled:
+                                warned_health = None
                         version = db.execute('PRAGMA data_version').fetchone()[0]
                         if version == previous_version:
                             continue
@@ -124,7 +137,7 @@ class Tray:
                             text = None
                             if job['phase'] == 'completed': text = 'Загрузка завершена. Откройте приложение через значок в трее.'
                             elif job['phase'] == 'completed_with_errors': text = 'Загрузка завершена с замечаниями. Проверьте результат в приложении.'
-                            elif job['phase'] == 'paused' and job['pause_reason']: text = 'Загрузка на паузе: проверьте свободное место на диске.'
+                            elif job['phase'] == 'paused' and job['pause_reason']: text = job['pause_reason']
                             elif job['phase'] == 'failed': text = 'Задание требует внимания. Откройте приложение через значок в трее.'
                             if text: self.icon.notify(text, 'YaDiskDownloader')
                         self.seen = current

@@ -75,9 +75,12 @@ CREATE TABLE IF NOT EXISTS temporary_files (root TEXT,local TEXT,purpose TEXT,cr
 CREATE TABLE IF NOT EXISTS duplicate_candidates (job TEXT,local TEXT,canonical TEXT,type TEXT,size INTEGER,sha256 TEXT,PRIMARY KEY(job,local));
 CREATE TABLE IF NOT EXISTS duplicate_moves (job TEXT,local TEXT,quarantine TEXT,sha256 TEXT,size INTEGER,PRIMARY KEY(job,local));
 CREATE TABLE IF NOT EXISTS pending_publications (job TEXT,path TEXT,type TEXT,temp TEXT,local TEXT,size INTEGER,sha256 TEXT,fingerprint TEXT,preview_size TEXT,PRIMARY KEY(job,path,type));
+CREATE TABLE IF NOT EXISTS run_selection (run TEXT,path TEXT,PRIMARY KEY(run,path));
 CREATE TABLE IF NOT EXISTS job_queue (job TEXT PRIMARY KEY,position INTEGER,action TEXT,state TEXT DEFAULT 'waiting',error TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS report_records (root TEXT,path TEXT,kind TEXT,data TEXT,PRIMARY KEY(root,path,kind));
 CREATE TABLE IF NOT EXISTS journal_jobs (job TEXT PRIMARY KEY,root TEXT);
+CREATE INDEX IF NOT EXISTS jobs_root ON jobs(root,id);
+CREATE INDEX IF NOT EXISTS journal_root ON journal_jobs(root,job);
 CREATE TABLE IF NOT EXISTS pending_service_outputs (root TEXT,kind TEXT,local TEXT,sha256 TEXT,PRIMARY KEY(root,kind));
 """
 
@@ -90,12 +93,14 @@ class Store:
         self.write_gate = gate_for(self.filename)
         self._sessions = threading.local()
         Path(filename).parent.mkdir(parents=True, exist_ok=True)
-        from .backups import before_upgrade
+        from .backups import before_upgrade, recovery_source
         before_upgrade(Path(filename))
-        with closing(sqlite3.connect(self.filename, timeout=30)) as setup:
+        connection = recovery_source(filename, timeout=30) if Path(filename).is_file() else sqlite3.connect(self.filename, timeout=30)
+        with closing(connection) as setup:
             setup.execute("PRAGMA journal_mode=" + mode)
         with self.db() as db:
             db.executescript(SCHEMA)
+            db.execute('DELETE FROM run_selection')
             # Older versions allowed just one remote reference per local file.
             # Migrate transactionally; the upgrade backup retains the old schema.
             unique_local = any(row[2] and [r[2] for r in db.execute('PRAGMA index_info("'+row[1]+'")')] == ['job','local'] for row in db.execute('PRAGMA index_list(artifacts)').fetchall())

@@ -1,6 +1,7 @@
 import math
 import threading
 import time
+from contextlib import nullcontext
 
 
 def validate(value):
@@ -19,6 +20,11 @@ class RateLimiter:
     def consume(self, size, checkpoint):
         if not self.rate:
             return
+        control = getattr(checkpoint,'__self__',None)
+        with control.expected_wait() if hasattr(control,'expected_wait') else nullcontext():
+            return self._consume(size,checkpoint)
+
+    def _consume(self, size, checkpoint):
         with self.lock:
             self.next = max(self.next, self.clock()) + size / self.rate
             until = self.next

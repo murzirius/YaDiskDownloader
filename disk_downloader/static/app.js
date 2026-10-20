@@ -202,6 +202,10 @@ async function pollJob(){
     if(history){
       if(history.size==null){$('progress').removeAttribute('value');$('percentage').textContent='Подсчитываем записи истории…';}
       else{const value=history.size?Math.min(100,history.done*100/history.size):100;$('progress').value=value;$('percentage').textContent=value.toLocaleString('ru-RU',{maximumFractionDigits:1})+'% истории';}
+    }else if(job.verification&&['preparing','paused'].includes(job.phase)){
+      const check=job.verification;
+      $('progress').value=check.total?Math.min(100,check.checked*100/check.total):100;
+      $('percentage').textContent='Проверено файлов: '+check.checked+' / '+check.total;
     }else if(job.statistics_pending||job.phase==='scanning'||!job.scan_complete&&!packing){
       $('progress').removeAttribute('value');
       $('percentage').textContent=job.statistics_pending?'Получаем статистику…':'Ищем файлы…';

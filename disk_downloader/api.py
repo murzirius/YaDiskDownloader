@@ -425,11 +425,15 @@ class DiskAPI:
             candidate.clear()
 
     def wait(self, delay, checkpoint):
-        until = time.monotonic() + delay
-        while time.monotonic() < until:
+        control = getattr(checkpoint, 'control', None) or getattr(checkpoint, '__self__', None)
+        if isinstance(control, Deadline):control = getattr(control.checkpoint, '__self__', None)
+        context = control.expected_wait() if delay and hasattr(control, 'expected_wait') else nullcontext()
+        with context:
+            until = time.monotonic() + delay
+            while time.monotonic() < until:
+                checkpoint()
+                time.sleep(min(0.2, max(0, until - time.monotonic())))
             checkpoint()
-            time.sleep(min(0.2, max(0, until - time.monotonic())))
-        checkpoint()
 
     def _open(self, url, params, auth, timeout, checkpoint, epoch, extra_headers=None):
         self.credentials.check(epoch)
@@ -521,6 +525,7 @@ class DiskAPI:
         budget = None
         delay = 0
         control = getattr(checkpoint, "__self__", None)
+        check.control = control
         network = getattr(control, "network", None)
         owner = settings.get("_deadline")
         attempt = 0

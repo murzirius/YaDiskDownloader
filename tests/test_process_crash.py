@@ -2,6 +2,8 @@ import json
 import subprocess
 import sys
 import time
+import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -11,9 +13,11 @@ from disk_downloader.store import Store
 from disk_downloader.recovery import recover_publications
 
 
-@pytest.mark.parametrize('phase',['scan','download','publish','reports','zip'])
+@pytest.mark.parametrize('phase',['scan','download','publish','reports','zip','publish_existing_backup'])
 def test_abrupt_process_termination_preserves_confirmed_results(tmp_path,phase):
-    process=subprocess.Popen([sys.executable,str(Path(__file__).with_name('crash_worker.py')),str(tmp_path),phase],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    existing_backup=phase=='publish_existing_backup'
+    phase='publish' if existing_backup else phase
+    process=subprocess.Popen([sys.executable,str(Path(__file__).with_name('crash_worker.py')),str(tmp_path),phase]+(['existing-backup'] if existing_backup else []),stdout=subprocess.PIPE,stderr=subprocess.PIPE)
     try:
         due=time.monotonic()+test_timeout(30)
         while time.monotonic()<due and not (tmp_path/'reached').is_file():
@@ -24,6 +28,17 @@ def test_abrupt_process_termination_preserves_confirmed_results(tmp_path,phase):
         process.terminate();process.wait(timeout=5)
         job_id=(tmp_path/'job').read_text(encoding='ascii')
         store=Store(tmp_path/'state/jobs.sqlite3')
+        from disk_downloader import __version__
+        backup=tmp_path/'state/backups'/('before-'+__version__+'.sqlite3')
+        with closing(sqlite3.connect(backup)) as saved:
+            assert saved.execute('PRAGMA integrity_check').fetchone()[0]=='ok'
+            assert saved.execute('SELECT COUNT(*) FROM jobs WHERE id=?',(job_id,)).fetchone()[0]==(0 if existing_backup else 1)
+            if not existing_backup and phase=='publish':
+                # The crash is after rename but before the artifact commit.
+                # Recovery must retain the pending publication in the backup.
+                assert saved.execute('SELECT COUNT(*) FROM pending_publications WHERE job=?',(job_id,)).fetchone()[0]==1
+            if not existing_backup and phase in ('reports','zip'):
+                assert saved.execute('SELECT COUNT(*) FROM artifacts WHERE job=?',(job_id,)).fetchone()[0]==1
         job=store.job(job_id)
         assert job['phase']=='interrupted'
         assert not list(store.rows("SELECT * FROM entries WHERE status='running'"))

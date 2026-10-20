@@ -29,7 +29,7 @@ def status():
     return {'enabled':_window is not None,'ready':bool(_window and _window.app),'closing':bool(_window and _window.closing)}
 
 
-def launch(main):
+def launch(main, inspect_window=None):
     import ctypes
     from ctypes import wintypes as w
     from .windows_dpi import enable
@@ -54,6 +54,7 @@ def launch(main):
             self.user.SetTimer.argtypes=(w.HWND,ctypes.c_size_t,w.UINT,ctypes.c_void_p)
             self.kernel.GetModuleHandleW.argtypes=(w.LPCWSTR,);self.kernel.GetModuleHandleW.restype=w.HMODULE
             self.messages=queue.Queue();self.app=None;self.url=None;self.shutdown=None;self.closing=False
+            self.exit_code=0
             self.snapshot_busy=False;self.job=None;self.jobs=[];self.tick=0;self.controls={};self.positions={}
             self.user.GetDpiForSystem.restype=w.UINT
             self.user.GetDpiForWindow.argtypes=(w.HWND,);self.user.GetDpiForWindow.restype=w.UINT
@@ -63,7 +64,8 @@ def launch(main):
             self.instance=self.kernel.GetModuleHandleW(None)
             self.user.LoadImageW.argtypes=(w.HINSTANCE,ctypes.c_void_p,w.UINT,ctypes.c_int,ctypes.c_int,w.UINT)
             self.user.LoadImageW.restype=w.HANDLE
-            self.icon=self.user.LoadImageW(self.instance,ctypes.c_void_p(1),1,self.px(32),self.px(32),0x8000)
+            self.small_icon=None
+            self.icon=self.user.LoadImageW(self.instance,ctypes.c_void_p(1),1,self.px(32),self.px(32),0)
             self.gdi=ctypes.WinDLL('gdi32')
             self.gdi.CreateFontW.argtypes=(ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.c_int,w.DWORD,w.DWORD,w.DWORD,w.DWORD,w.DWORD,w.DWORD,w.DWORD,w.DWORD,w.LPCWSTR)
             self.gdi.CreateFontW.restype=w.HANDLE
@@ -91,7 +93,7 @@ def launch(main):
             self.callback=ctypes.WINFUNCTYPE(ctypes.c_ssize_t,w.HWND,w.UINT,w.WPARAM,w.LPARAM)(self.wndproc)
             class WNDCLASS(ctypes.Structure):
                 _fields_=[('style',w.UINT),('proc',ctypes.c_void_p),('cls_extra',ctypes.c_int),('wnd_extra',ctypes.c_int),('instance',w.HINSTANCE),('icon',w.HICON),('cursor',w.HANDLE),('background',w.HBRUSH),('menu',w.LPCWSTR),('name',w.LPCWSTR)]
-            self.wc=WNDCLASS(0,ctypes.cast(self.callback,ctypes.c_void_p),0,0,self.instance,self.icon,None,self.background,None,'YaDiskDownloaderDesktop')
+            self.wc=WNDCLASS(0,ctypes.cast(self.callback,ctypes.c_void_p),0,0,self.instance,None,None,self.background,None,'YaDiskDownloaderDesktop')
             self.user.RegisterClassW.argtypes=(ctypes.POINTER(WNDCLASS),)
             if not self.user.RegisterClassW(ctypes.byref(self.wc)):raise ctypes.WinError(ctypes.get_last_error())
             self.hwnd=self.user.CreateWindowExW(0,self.wc.name,'YaDiskDownloader — состояние',0x02CA0000,160,100,self.px(616),self.px(459),None,None,self.instance,None)
@@ -105,7 +107,7 @@ def launch(main):
             self.control('STATIC','YaDiskDownloader',28,22,544,38,1)
             self.user.SendMessageW(self.controls[1],0x0030,self.heading_font,1)
             self.control('STATIC','СОСТОЯНИЕ ПРИЛОЖЕНИЯ',29,66,542,20,20)
-            self.control('STATIC','ЗАПУСК',44,120,512,22,10)
+            self.control('STATIC','ЗАПУСК',44,120,512,22,10,0x4000)
             self.control('STATIC','Подготавливаем приложение…',44,151,512,48,2)
             self.control('msctls_progress32','',44,212,512,8,3)
             self.control('STATIC','История и файлы остаются на устройстве.',44,240,512,42,5)
@@ -136,6 +138,14 @@ def launch(main):
                 for font in old_fonts:
                     self.gdi.DeleteObject(font);self.paint_resources.remove(font)
                 self.paint_resources.extend((self.font,self.heading_font,self.label_font))
+            icons=(self.icon,self.small_icon)
+            self.icon=self.user.LoadImageW(self.instance,ctypes.c_void_p(1),1,self.px(32),self.px(32),0)
+            self.small_icon=self.user.LoadImageW(self.instance,ctypes.c_void_p(1),1,self.px(16),self.px(16),0)
+            self.user.SendMessageW(self.hwnd,0x0080,1,self.icon or 0)
+            self.user.SendMessageW(self.hwnd,0x0080,0,self.small_icon or 0)
+            self.user.DestroyIcon.argtypes=(w.HICON,)
+            for icon in icons:
+                if icon:self.user.DestroyIcon(icon)
             for key,position in self.positions.items():
                 self.user.MoveWindow(self.controls[key],*(self.px(v) for v in position),True)
             self.user.InvalidateRect(self.hwnd,None,True)
@@ -250,10 +260,10 @@ def launch(main):
                         counts='Уточняем число файлов…' if job.get('statistics_pending') else f"Файлов обработано: {job.get('processed',0)} / {job.get('files',0)}. Оригиналы: {job.get('originals',0)}. Превью: {job.get('previews',0)}."
                         current=action[0] if action else {}
                         percent=int(job.get('percent') or 0)
-                        if current.get('unit') in ('records','objects') and current.get('size') is not None:
-                            counts=f"{'Записей истории' if current['unit']=='records' else 'Объектов'}: {current['done']} / {current['size']}"
+                        if current.get('unit') in ('records','objects','files') and current.get('size') is not None:
+                            counts=f"{'Записей истории' if current['unit']=='records' else 'Файлов' if current['unit']=='files' else 'Объектов'}: {current['done']} / {current['size']}"
                             percent=int(min(100,current['done']*100/max(1,current['size'])))
-                        self.text(5,job.get('pause_reason') or job.get('error') or job.get('network_warning') or counts)
+                        self.text(5,job.get('pause_reason') or job.get('health',{}).get('warning') or job.get('error') or job.get('network_warning') or counts)
                         self.user.SendMessageW(self.controls[3],0x0402,percent,0)
                     else:
                         self.text(5,'Заданий пока нет. Начните загрузку в браузере.')
@@ -297,10 +307,16 @@ def launch(main):
                 if hasattr(self,'controls'):self.text(5,'Приложение на устройстве не выполнило команду. Откройте интерфейс в браузере.')
             return self.user.DefWindowProcW(hwnd,message,wp,lp)
     window=Window();_window=window
+    if inspect_window:
+        # Native layout regression checks run on the owning UI thread.
+        inspect_window(window)
     # The native window is already visible before importing Flask/SQLite or migrating.
     def startup():
-        try:main();window.messages.put(('finished',None))
+        try:
+            window.exit_code=int(main() or 0)
+            window.messages.put(('finished',None))
         except BaseException:
+            window.exit_code=1
             if not window.closing:window.messages.put(('failed','Проверьте доступ к папке состояния, свободное место и отсутствие второй копии приложения.'))
     worker=threading.Thread(target=startup,name='disk-desktop-server',daemon=True);worker.start()
     msg=w.MSG()
@@ -315,7 +331,9 @@ def launch(main):
     if worker.is_alive():os._exit(0)
     window.gdi.DeleteObject.argtypes=(w.HANDLE,)
     for resource in window.paint_resources:window.gdi.DeleteObject(resource)
+    for icon in (window.icon,window.small_icon):
+        if icon:window.user.DestroyIcon(icon)
     window.user.UnregisterClassW.argtypes=(w.LPCWSTR,w.HINSTANCE)
     window.user.UnregisterClassW(window.wc.name,window.instance)
     _window=None
-    return 0
+    return window.exit_code

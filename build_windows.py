@@ -38,7 +38,7 @@ def main():
     work.mkdir(parents=True, exist_ok=True)
     from disk_downloader.tray import image
     icon = work / "app.ico"
-    image().save(icon, sizes=[(16, 16), (32, 32), (48, 48), (64, 64)])
+    image(256).save(icon, sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])
     command = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--onefile", "--windowed", "--noupx", "--manifest", str(root / "windows.manifest"), "--name", "YaDiskDownloader", "--icon", str(icon), "--distpath", str(output), "--workpath", str(work / "cache"), "--specpath", str(work), "--hidden-import", "pystray._win32", "--add-data", str(root / "disk_downloader" / "templates") + ";disk_downloader/templates", "--add-data", str(root / "disk_downloader" / "static") + ";disk_downloader/static", str(root / "run.py")]
     subprocess.run(command, cwd=root, check=True)
     notices(output)

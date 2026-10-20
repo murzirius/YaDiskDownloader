@@ -1,6 +1,4 @@
-import json
 import threading
-from pathlib import Path
 
 
 class Management:
@@ -124,7 +122,7 @@ class Management:
     def history_action(self, job_id, data):
         with self.engine.lock:
             if self.engine.maintenance_busy:raise ValueError('Дождитесь завершения проверки или очистки файлов перед изменением истории.')
-            job = self.store.job(job_id)
+            self.store.job(job_id)
             thread = self.engine.threads.get(job_id)
             if thread and thread.is_alive(): raise ValueError('Операция недоступна для активного задания')
             with self.store.db() as db:

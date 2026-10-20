@@ -14,6 +14,9 @@ from disk_downloader.store import Store
 folder=Path(sys.argv[1]);phase=sys.argv[2]
 api=FakeAPI();api.file('disk:/one.bin',data=b'x'*(8*1024*1024),preview=False)
 store=Store(folder/'state/jobs.sqlite3');engine=Engine(store,api)
+if 'existing-backup' in sys.argv[3:]:
+    from disk_downloader.backups import before_upgrade
+    before_upgrade(Path(store.filename))
 base_media=api.media
 def fast_media(*args,**kwargs):
     response,session=base_media(*args,**kwargs)

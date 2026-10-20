@@ -4,7 +4,6 @@ import re
 import sqlite3
 import threading
 import time
-import json
 import uuid
 from contextlib import closing
 from pathlib import Path
@@ -12,7 +11,7 @@ from pathlib import Path
 from .backups import readonly
 from .import_state import find_import
 from .paths import safe_join, file_signature
-from .service_outputs import root_key, digest_file
+from .service_outputs import root_key
 
 
 def recycle(path):
@@ -29,12 +28,16 @@ class Maintenance:
         self.lock=threading.Lock(); self.cancel=threading.Event()
         self.result={'busy':False,'processed':0,'total':0,'items':[],'counts':{}}
         self.thread=None
+        from .estimation import VerificationTime
+        import time
+        self.eta = VerificationTime(time.monotonic)
 
     def snapshot(self, offset=0):
         if not isinstance(offset, int) or not 0 <= offset <= 10000000:
             raise ValueError('Некорректная страница проверки')
         with self.lock:
             result = dict(self.result, items=[], counts=dict(self.result['counts']))
+            result['eta_seconds'] = self.eta.estimate(result['processed'],result['total']) if result['busy'] else None
         run = result.get('run')
         if run:
             with self.store.db() as db:
@@ -65,6 +68,7 @@ class Maintenance:
             previous={'job':job,'store':self.store,'id':job_id} if job else find_import(self.store,root)
             if not previous: raise ValueError('В папке нет сохранённой описи загрузки')
             self.cancel.clear()
+            self.eta.reset()
             self.scope = dict(previous['job']['settings'])
             with self.store.db() as db:
                 db.execute('DELETE FROM verification_results')
@@ -82,6 +86,12 @@ class Maintenance:
 
     def verify(self, root, previous):
         try:
+            from .destination import DestinationGuard
+            destination=DestinationGuard(root)
+            _,error=destination.check(stopped=self.cancel.is_set)
+            if error:
+                with self.lock:self.result['error']=error
+                return
             database=previous['store'].filename if previous.get('store') else previous['file']
             with closing(readonly(database)) as db:
                 db.row_factory=sqlite3.Row
@@ -104,6 +114,10 @@ class Maintenance:
                 pending = []
                 for row in rows:
                     if self.cancel.is_set(): break
+                    _,error=destination.check(stopped=self.cancel.is_set)
+                    if error:
+                        with self.lock:self.result['error']=error
+                        return
                     status='ok'
                     try:
                         with self.lock: self.result['current']=row['path']
@@ -126,8 +140,14 @@ class Maintenance:
                             elif sha.hexdigest()!=row['sha256'].lower(): status='damaged'
                     except FileNotFoundError: status='missing' if row['recorded'] else 'not_downloaded'
                     except (OSError,ValueError): status='unavailable'
+                    if status in ('missing','unavailable'):
+                        _,error=destination.check(stopped=self.cancel.is_set,force=True)
+                        if error:
+                            with self.lock:self.result['error']=error
+                            return
                     with self.lock:
                         self.result['processed']+=1
+                        self.eta.estimate(self.result['processed'],total)
                         self.result['counts'][status]=self.result['counts'].get(status,0)+1
                         if status!='ok':
                             self.result['problems'] += 1
@@ -143,6 +163,10 @@ class Maintenance:
                     self.result['complete'] = not self.cancel.is_set() and self.result['processed'] == total
         except (OSError,ValueError,sqlite3.Error):
             with self.lock: self.result['error']='Приложение на ПК не смогло проверить опись или папку. Проверьте доступ к диску и запустите проверку снова.'
+        except Exception as error:
+            recorder=getattr(self.engine,'request_errors',None)
+            if recorder:recorder.record('verification','local_files',error)
+            with self.lock:self.result['error']='В приложении на ПК произошла ошибка проверки файлов. Отправьте диагностику через «Сообщить об ошибке» и повторите проверку.'
         finally:
             with self.lock:
                 self.result['busy']=False; self.result['cancelled']=self.cancel.is_set()

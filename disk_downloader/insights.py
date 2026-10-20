@@ -1,5 +1,4 @@
 """Bounded task queries and non-blocking destination checks."""
-import json
 import shutil
 import tempfile
 import threading

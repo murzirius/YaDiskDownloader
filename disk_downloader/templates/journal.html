@@ -12,13 +12,29 @@
 'use strict';
 const data=JSON.parse(document.getElementById('journal-data').textContent),summary=data.summary,events=data.events.reverse(),labels={info:'Информация',success:'Готово',warning:'Замечание',error:'Ошибка'},size=50;
 const $=id=>document.getElementById(id),number=value=>value.toLocaleString('ru-RU');
-let group='all',page=0,filtered=[];
+let group='all',page=0,filtered=null,filterVersion=0;
 function element(tag,text,className){const node=document.createElement(tag);if(text!==undefined)node.textContent=text;if(className)node.className=className;return node;}
 function bytes(value){const units=['Б','КиБ','МиБ','ГиБ','ТиБ'];let unit=0;while(value>=1024&&unit<units.length-1){value/=1024;unit++;}return value.toLocaleString('ru-RU',{maximumFractionDigits:1})+' '+units[unit];}
 $('updated').textContent='Сохранено '+new Date(summary.updated).toLocaleString('ru-RU');$('phase').textContent=summary.phase;$('processed').textContent=number(summary.processed)+' / '+number(summary.files);$('saved').textContent=bytes(summary.saved_bytes);$('total').textContent=number(events.length);$('root').textContent=summary.root;$('job').textContent=summary.id;
 const counts={};for(const event of events)counts[event.category]=(counts[event.category]||0)+1;
 for(const [key,title] of Object.entries({all:'Все события',...summary.groups})){const button=element('button');button.type='button';button.dataset.group=key;button.append(element('span',title),element('span',number(key==='all'?events.length:counts[key]||0),'count'));button.setAttribute('aria-pressed',String(key===group));button.onclick=()=>{group=key;page=0;for(const item of $('groups').children)item.setAttribute('aria-pressed',String(item===button));$('heading').textContent=title;filter();};$('groups').append(button);}
-function filter(){const query=$('search').value.trim().toLocaleLowerCase('ru-RU'),level=$('level').value;filtered=events.filter(event=>(group==='all'||event.category===group)&&(level==='all'||event.level===level)&&(!query||(event.message+' '+event.path).toLocaleLowerCase('ru-RU').includes(query)));page=0;render();}
-function render(){const start=page*size;$('rows').replaceChildren();for(const event of filtered.slice(start,start+size)){const row=element('tr'),date=new Date(event.time),when=element('td');when.append(element('time',date.toLocaleTimeString('ru-RU')),element('time',date.toLocaleDateString('ru-RU')));const level=element('td');level.append(element('span',labels[event.level]||labels.info,'badge '+event.level),element('span',summary.groups[event.category]||event.category,'group-name'));const detail=element('td');detail.append(element('div',event.message));if(event.path)detail.append(element('div',event.path,'path'));row.append(when,level,detail);$('rows').append(row);}$('empty').hidden=filtered.length>0;$('prev').disabled=page===0;$('next').disabled=start+size>=filtered.length;$('page').textContent=filtered.length?number(start+1)+'–'+number(Math.min(start+size,filtered.length))+' из '+number(filtered.length):'0 событий';}
+async function filter(){
+  const version=++filterVersion,query=$('search').value.trim().toLowerCase(),level=$('level').value;
+  page=0;
+  if(group==='all'&&level==='all'&&!query){filtered=null;render();return;}
+  $('rows').setAttribute('aria-busy','true');$('page').textContent='Ищем…';$('prev').disabled=$('next').disabled=true;
+  const indexes=[];
+  for(let start=0;start<events.length;start+=1000){
+    if(version!==filterVersion)return;
+    for(let index=start;index<Math.min(events.length,start+1000);index++){
+      const event=events[index];
+      if((group==='all'||event.category===group)&&(level==='all'||event.level===level)&&(!query||(event.message+' '+event.path).toLowerCase().includes(query)))indexes.push(index);
+    }
+    if(start+1000<events.length)await new Promise(resolve=>setTimeout(resolve,0));
+  }
+  if(version!==filterVersion)return;
+  filtered=indexes;render();
+}
+function render(){const start=page*size,total=filtered===null?events.length:filtered.length;$('rows').setAttribute('aria-busy','false');$('rows').replaceChildren();for(let index=start;index<Math.min(start+size,total);index++){const event=events[filtered===null?index:filtered[index]];const row=element('tr'),date=new Date(event.time),when=element('td');when.append(element('time',date.toLocaleTimeString('ru-RU')),element('time',date.toLocaleDateString('ru-RU')));const level=element('td');level.append(element('span',labels[event.level]||labels.info,'badge '+event.level),element('span',summary.groups[event.category]||event.category,'group-name'));const detail=element('td');detail.append(element('div',event.message));if(event.path)detail.append(element('div',event.path,'path'));row.append(when,level,detail);$('rows').append(row);}$('empty').hidden=total>0;$('prev').disabled=page===0;$('next').disabled=start+size>=total;$('page').textContent=total?number(start+1)+'–'+number(Math.min(start+size,total))+' из '+number(total):'0 событий';}
 let searchTimer;$('search').oninput=()=>{clearTimeout(searchTimer);searchTimer=setTimeout(filter,160);};$('level').onchange=filter;$('prev').onclick=()=>{page--;render();};$('next').onclick=()=>{page++;render();};filter();
 </script></body></html>

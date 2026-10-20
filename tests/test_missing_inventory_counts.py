@@ -14,7 +14,7 @@ def test_missing_preflight_counts_inventory_once_and_distinguishes_local_copies(
     assert ready['phase'] == 'ready'
     assert ready['files'] == 80 and ready['existing'] == 55
     check = engine.controls[job_id].snapshot()['verification']
-    assert check == {'checked':80, 'total':80, 'originals':55, 'previews':0, 'missing':25, 'complete':True,'cached':55,'hashed':0}
+    assert check == {'checked':80, 'total':80, 'originals':55, 'previews':0, 'missing':25, 'complete':True,'cached':55,'hashed':0,'eta_seconds':0}
     assert api.media_calls == []
     engine.action(job_id, 'start')
     completed = wait_job(engine, job_id)

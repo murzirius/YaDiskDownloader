@@ -15,7 +15,7 @@ def valid_partial(row):
 
 
 def digest_prefix(filename, size, checkpoint):
-    sha, md5 = hashlib.sha256(), hashlib.md5()
+    sha, md5 = hashlib.sha256(), hashlib.md5(usedforsecurity=False)
     with open(filename, "rb") as stream:
         remaining = size
         while remaining:
@@ -104,14 +104,18 @@ class Partials:
                 with open(filename, "r+b") as stream:
                     stream.truncate(row["size"])
                 return row, filename, sha, md5
-            except (OSError, ValueError):
+            except (OSError, ValueError) as exc:
+                control = getattr(checkpoint, '__self__', None)
+                if control and getattr(control, 'storage_error', lambda error: False)(exc):
+                    from .destination import StorageRetry
+                    raise StorageRetry() from exc
                 self.discard(job, path, kind, checkpoint=checkpoint)
         filename = temporary_file(job["root"], self.store, 'partial')
         row = {"job": job["id"], "path": path, "type": kind, "local": Path(filename).name, "fingerprint": stamp, "size": 0, "sha256": hashlib.sha256().hexdigest(), "etag": "", "total": None}
         with self.store.db() as db:
             db.execute("INSERT INTO partials VALUES(?,?,?,?,?,?,?,?,?)", tuple(row.values()))
             db.execute("INSERT INTO partial_ownership VALUES(?,?)", (job["id"], row["local"]))
-        return row, filename, hashlib.sha256(), hashlib.md5()
+        return row, filename, hashlib.sha256(), hashlib.md5(usedforsecurity=False)
 
     def save(self, job, path, kind, size, sha, etag, total):
         with self.store.db() as db:

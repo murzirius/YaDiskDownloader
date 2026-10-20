@@ -241,7 +241,7 @@ renderExperience=function(job){
   if(lastJobId!==job.id){lastJobId=job.id;verifySelect.value=job.settings.verification_mode||'fast';duplicateCheck.checked=!!job.settings.deduplicate;lastMovement=Date.now();}
   const movement=JSON.stringify([job.phase,job.processed,job.verification?.checked,job.active.map(file=>[file.path,file.done,file.size])]);
   if(movement!==movementKey){movementKey=movement;lastMovement=Date.now();}
-  const message=job.network_waiting?job.network_warning:job.pause_reason||job.error||({'ready':'Проверьте план ниже и нажмите «Начать скачивание».','paused':'Работа на паузе. Нажмите «Продолжить», когда будете готовы.','scanning':'Получаем список с Яндекс.Диска. Скачивание ещё не началось.','preparing':'Проверяем скачанные файлы и готовим план. Журналы и отчёты не перечитываются как контент.','downloading':'Сохраняем выбранные файлы. Можно поставить на паузу или остановить с сохранением прогресса.','packing':'Скачивание окончено. Собираем ZIP из сохранённых результатов.'}[job.phase]||phases[job.phase]);
+  const message=job.network_waiting?job.network_warning:job.pause_reason||job.health?.warning||job.error||({'ready':'Проверьте план ниже и нажмите «Начать скачивание».','paused':'Работа на паузе. Нажмите «Продолжить», когда будете готовы.','scanning':'Получаем список с Яндекс.Диска. Скачивание ещё не началось.','preparing':'Проверяем скачанные файлы и готовим план. Журналы и отчёты не перечитываются как контент.','downloading':'Сохраняем выбранные файлы. Можно поставить на паузу или остановить с сохранением прогресса.','packing':'Скачивание окончено. Собираем ZIP из сохранённых результатов.'}[job.phase]||phases[job.phase]);
   const stage=JSON.stringify([job.id,message,job.verification?.cached,job.verification?.hashed]);
   if(stage!==stageKey){stageKey=stage;taskStage.replaceChildren(node('strong',message));if(job.verification)taskStage.append(node('p','Без повторного чтения: '+(job.verification.cached||0)+' · Проверено по содержимому: '+(job.verification.hashed||0),'hint'));}
   groupedProblems.hidden=!(job.errors||job.scan_errors||job.error);
@@ -250,11 +250,5 @@ renderExperience=function(job){
     const open=toolButton('Открыть результаты',async()=>api('/api/jobs/'+job.id+'/open-folder',{}));open.dataset.resultFolder='true';resultActions.prepend(open);
   }
 };
-setInterval(()=>{
-  if(document.hidden||!state.jobStatus?.live||!['preparing','scanning'].includes(state.jobStatus.phase))return;
-  const elapsed=Math.floor((Date.now()-lastMovement)/1000);let waiting=$('task-waiting');
-  if(elapsed<15){waiting?.remove();return;}
-  if(!waiting){waiting=node('p',undefined,'hint');waiting.id='task-waiting';taskStage.append(waiting);}
-  waiting.textContent='Последнее изменение прогресса '+elapsed+' с назад. Диск или сетевая папка могут отвечать медленно. Можно поставить работу на паузу или остановить её кнопками задания.';
-},2000);
+
 $('apply-profile').addEventListener('click',()=>{const profile=profiles.find(item=>item.name===$('profile-list').value);if(profile&&!profile.error)verifySelect.value=profile.settings.verification_mode||'fast';renderExclusionChoices();});

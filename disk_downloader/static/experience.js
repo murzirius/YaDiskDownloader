@@ -119,12 +119,24 @@ function renderExperience(job){
   const check=job.verification;
   verificationSummary.hidden=!check||!['preparing','paused'].includes(job.phase);
   if(!verificationSummary.hidden){
-    const text='Проверено на устройстве: '+check.checked+' / '+check.total+'\nОригиналы: '+check.originals+' · Превью: '+check.previews+' · Без копии: '+check.missing;
+    const text='Проверено на устройстве: '+check.checked+' / '+check.total+' · Осталось: '+Math.max(0,check.total-check.checked)+'\nОригиналы: '+check.originals+' · Превью: '+check.previews+' · Без копии: '+check.missing+'\nДо конца проверки: '+(job.phase==='paused'?'На паузе':check.eta_seconds==null?'Уточняем…':remainingTime(check.eta_seconds));
     if(verificationSummary.textContent!==text)verificationSummary.textContent=text;
   }
-  const key=JSON.stringify([job.id,job.phase,job.error,job.live,job.network_waiting,job.errors,job.scan_errors,state.connected]);
+  const key=JSON.stringify([job.id,job.phase,job.error,job.live,job.network_waiting,job.errors,job.scan_errors,job.completeness?.preview_only,job.completeness?.no_result,job.counts?.partial,job.missing_previews,state.connected]);
   if(key===resultActionsKey)return;resultActionsKey=key;resultActions.replaceChildren();
+  $('retry-job').hidden=true;
   if(job.live)return;
+  if(job.errors||job.scan_errors||job.counts?.partial||job.missing_previews){
+    const retry=toolButton(job.scan_errors?'Повторить обход и дозагрузку':job.errors?'Повторить ошибки':'Повторить отсутствующие копии',async()=>action(job.scan_errors?'retry':'retry_failed'));
+    retry.disabled=!state.connected;resultActions.append(retry);
+  }
+  if(job.completeness?.preview_only||job.completeness?.no_result){
+    resultActions.append(toolButton(job.completeness?.preview_only?'Получить оригиналы вместо превью':'Скачать файлы без копии',async()=>{
+      applyDownloadSettings({...job.settings,operation:'missing',destination:job.root,missing_policy:'originals'});
+      openWorkspace('missing');showPanel('settings');
+      notice('Прежняя папка выбрана. Нажмите «Проверить список и объём», затем начните скачивание. Сначала загрузятся файлы без копий, затем оригиналы вместо превью.');
+    }));
+  }
   if(job.error?.includes('опись'))resultActions.append(toolButton('Сохранить опись ещё раз',async()=>{await api('/api/jobs/'+job.id+'/action',{action:'save_manifest'});await pollJob();}));
   if(job.errors||job.scan_errors||job.error){
     resultActions.append(toolButton('Показать проблемы',async()=>{$('errors-detail').open=true;$('errors-detail').scrollIntoView({behavior:'smooth',block:'nearest'});await loadErrors();}),toolButton('Собрать диагностику',async()=>{$('open-service').click();}));

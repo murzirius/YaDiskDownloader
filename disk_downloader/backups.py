@@ -4,6 +4,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 import uuid
 from contextlib import closing
 from datetime import datetime, timezone
@@ -17,6 +18,25 @@ LOCK = threading.RLock()
 
 def readonly(path):
     return sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True, timeout=5)
+
+
+def recovery_source(path, timeout=5):
+    # A killed Windows process can briefly retain filesystem handles while
+    # SQLite recovers its WAL. Retry only this specific truncate I/O failure;
+    # never skip recovery, discard journals, or bypass the verified backup.
+    for attempt in range(4):
+        source = sqlite3.connect(Path(path).resolve().as_uri() + '?mode=rw', uri=True, timeout=timeout)
+        try:
+            source.execute('SELECT count(*) FROM sqlite_master').fetchone()
+            return source
+        except sqlite3.Error as error:
+            source.close()
+            if os.name != 'nt' or getattr(error, 'sqlite_errorcode', None) != sqlite3.SQLITE_IOERR_TRUNCATE or attempt == 3:
+                raise
+            time.sleep(.1 * 2**attempt)
+        except BaseException:
+            source.close()
+            raise
 
 
 def snapshot(source, destination):
@@ -39,7 +59,10 @@ def before_upgrade(filename):
         folder.mkdir(exist_ok=True)
         temporary = folder / ('.backup-' + uuid.uuid4().hex)
         try:
-            with closing(readonly(filename)) as source:
+            # Crash recovery may need to repair/truncate WAL or a hot journal.
+            # Open the existing local database writable before taking the
+            # pre-migration snapshot; mode=rw must never create a missing file.
+            with closing(recovery_source(filename)) as source:
                 snapshot(source, temporary)
             os.replace(temporary, target)
             automatic=[file for file in folder.glob('before-*.sqlite3') if not file.is_symlink() and re.fullmatch(r'before-\d+\.\d+\.\d+\.sqlite3',file.name)]
@@ -128,7 +151,7 @@ class Backups:
                 for table in own:
                     target.execute('DELETE FROM "' + table + '"')
                 for table in own:
-                    if table not in tables or table in ('duplicate_candidates', 'duplicate_moves', 'verification_cache', 'verification_results', 'partial_ownership', 'pending_publications', 'service_outputs', 'service_output_signatures', 'pending_service_outputs', 'temporary_files'):
+                    if table not in tables or table in ('run_selection', 'duplicate_candidates', 'duplicate_moves', 'verification_cache', 'verification_results', 'partial_ownership', 'pending_publications', 'service_outputs', 'service_output_signatures', 'pending_service_outputs', 'temporary_files'):
                         continue
                     available = {r[1] for r in source.execute('PRAGMA table_info("' + table + '")')}
                     columns = [r[1] for r in target.execute('PRAGMA table_info("' + table + '")') if r[1] in available]

@@ -70,6 +70,7 @@ def main():
     if not 1024 <= args.port <= 65535:
         parser.error("Порт должен быть от 1024 до 65535")
     desktop.progress('Проверяем порт и папку состояния…',25)
+    state = Path(args.state_dir) if args.state_dir else state_folder()
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         if os.name == "nt":
@@ -79,9 +80,10 @@ def main():
         listener.bind(("127.0.0.1", args.port))
     except OSError:
         listener.close()
+        from disk_downloader.single_instance import activate_existing
+        if activate_existing(state,args.port):return 0
         message(f"Порт {args.port} занят. Если приложение уже запущено, откройте его через значок в трее. Для отдельного запуска выберите --port.")
         return 1
-    state = Path(args.state_dir) if args.state_dir else state_folder()
     try:
         state_lock = lock_state(state)
     except OSError:
@@ -118,6 +120,10 @@ def main():
         with ack.open('x', encoding='utf-8') as stream:
             json.dump({'version':__version__}, stream)
             stream.flush(); os.fsync(stream.fileno())
+    def activate():
+        if not desktop.show():
+            threading.Thread(target=webbrowser.open,args=(url,),daemon=True,name='disk-open-browser').start()
+    app.extensions['activate_window'] = activate
     desktop.ready(app,url,shutdown)
     try:
         server.run()

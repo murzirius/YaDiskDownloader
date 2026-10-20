@@ -2,6 +2,32 @@ import math
 from collections import deque
 
 
+class VerificationTime:
+    """Local file throughput only; pauses and long unreadable files hide ETA."""
+    def __init__(self, clock):
+        self.clock = clock
+        self.samples = deque(maxlen=128)
+
+    def reset(self):
+        self.samples.clear()
+
+    def estimate(self, checked, total):
+        current = self.clock()
+        if not self.samples or checked < self.samples[-1][1]:
+            self.samples.clear()
+            self.samples.append((current, checked))
+        if checked != self.samples[-1][1] and current-self.samples[-1][0] >= .25:
+            self.samples.append((current, checked))
+        while len(self.samples)>2 and self.samples[1][0] < current-30:
+            self.samples.popleft()
+        elapsed = self.samples[-1][0]-self.samples[0][0]
+        moved = self.samples[-1][1]-self.samples[0][1]
+        if checked >= total:return 0
+        if len(self.samples)<3 or elapsed<2 or moved<10 or current-self.samples[-1][0]>10:
+            return None
+        return math.ceil((total-checked)*elapsed/moved)
+
+
 class RemainingTime:
     """Estimate useful work, keeping byte transfer and file attempts separate.
 

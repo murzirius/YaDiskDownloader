@@ -155,6 +155,19 @@ def run(executable, output):
                 else:
                     import win32gui
                     window = wait_until(lambda:native_status_window(owned_pids),10,'Mini status window is missing')
+                    win32gui.ShowWindow(window,6)
+                    duplicate = subprocess.Popen(command, cwd=directory, env=env)
+                    try:
+                        duplicate.wait(timeout=20)
+                        assert duplicate.returncode == 0, 'Repeated launch did not activate the existing instance'
+                        assert process.poll() is None
+                        wait_until(lambda:not win32gui.IsIconic(window),5,'Existing mini window was not restored')
+                        after = session.get(base+'/api/status',headers=headers,timeout=3).json()
+                        assert after['instance_id']==state['instance_id'] and after['active_job'] is None
+                    finally:
+                        if duplicate.poll() is None:
+                            subprocess.run(['taskkill','/PID',str(duplicate.pid),'/T','/F'],capture_output=True)
+                            duplicate.wait(timeout=10)
                     win32gui.PostMessage(window,0x0010,0,0)
                 process.wait(timeout=20)
                 assert process.returncode == 0

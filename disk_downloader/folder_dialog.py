@@ -103,7 +103,6 @@ class FolderPicker:
             if self.result["busy"]:
                 return dict(self.result)
             self.result = {"busy": True, "path": "", "error": "", "request_id": uuid.uuid4().hex}
-            result = dict(self.result)
             self.thread = threading.Thread(target=self.run, args=(initial,), name="disk-folder-dialog", daemon=True)
             try:
                 self.thread.start()
