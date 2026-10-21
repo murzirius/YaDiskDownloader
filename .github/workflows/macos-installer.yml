@@ -1,0 +1,59 @@
+name: macOS application and installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'native/macos_launcher.m'
+      - 'tools/build_macos_app.py'
+      - 'tools/smoke_macos_app.py'
+      - 'tests/test_macos_package.py'
+      - 'docs/macos.md'
+      - '.github/workflows/macos-installer.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-installer-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  installer:
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - run: python -m pip install -r requirements-build.txt -r requirements-dev.txt
+      - run: python -m pytest -q tests/test_macos_package.py
+      - run: python build_posix.py --output dist/native --work build/native
+      - run: python tools/smoke_cli.py --exe dist/native/yadisk --output native-cli-smoke.json
+      - run: python tools/build_macos_app.py --binary dist/native/yadisk --output dist/macos
+      - name: Mount, install, launch and quit actual application
+        shell: bash
+        run: |
+          images=(dist/macos/*.dmg)
+          test "${#images[@]}" -eq 1
+          python tools/smoke_macos_app.py --dmg "${images[0]}" --output macos-app-smoke.json
+      - name: Save installer and actual application checks
+        if: success()
+        uses: actions/upload-artifact@v6
+        with:
+          name: macOS-installer-${{ matrix.os }}
+          path: |
+            dist/macos/*.dmg
+            macos-app-smoke.json
+            native-cli-smoke.json
+          if-no-files-found: error
