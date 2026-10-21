@@ -161,6 +161,11 @@ class Deadline:
                     sock.shutdown(socket.SHUT_RDWR)
                 except OSError:
                     pass
+                # Darwin can leave a concurrent poll/read asleep if its fd is
+                # closed here immediately after shutdown. A buffered reader
+                # owns that I/O reference and will release it on response.close.
+                if sys.platform == 'darwin' and getattr(sock, '_io_refs', 0):
+                    continue
                 try:
                     descriptor = sock.detach()
                     if descriptor != -1:

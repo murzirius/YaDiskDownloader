@@ -272,3 +272,22 @@ def test_real_parallel_http_disconnect_resumes_without_old_socket_timeout(system
         release_old_socket.set()
         server.shutdown()
         server.server_close()
+
+
+
+def test_darwin_abort_keeps_buffered_reader_descriptor_until_owner_closes(monkeypatch):
+    import socket
+    from disk_downloader import api
+    monkeypatch.setattr(api.sys,'platform','darwin')
+    left,right=socket.socketpair()
+    reader=left.makefile('rb')
+    descriptor=left.fileno()
+    deadline=Deadline(10)
+    deadline.attach(sock=left)
+    try:
+        deadline.abort()
+        assert left.fileno()==descriptor
+        assert left.getsockopt(socket.SOL_SOCKET,socket.SO_TYPE)==socket.SOCK_STREAM
+    finally:
+        reader.close();left.close();right.close()
+    assert left.fileno()==-1
