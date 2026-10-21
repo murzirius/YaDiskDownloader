@@ -147,7 +147,7 @@ def test_folder_button_immediately_uses_native_dialog():
     js = Path('disk_downloader/static/app.js').read_text(encoding='utf8')
     function = re.search(r'async function chooseFolder\(.*?\}\n', js).group(0)
     script = "const assert=require('node:assert/strict');let initial; async function chooseNativeFolder(value){initial=value;return 'chosen';} function chooseFolderInApp(){throw Error('Intermediate dialog opened');}\n" + function + "\nchooseFolder('start').then(value=>{assert.equal(value,'chosen');assert.equal(initial,'start');});"
-    subprocess.run([node, '-e', script], check=True, timeout=10)
+    subprocess.run([node, '-e', script], check=True, timeout=test_timeout(10))
 
 
 @pytest.mark.skipif(os.name != 'nt', reason='Windows DPI context')

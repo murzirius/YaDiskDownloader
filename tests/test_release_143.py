@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import run_job, wait_job
+from conftest import run_job, wait_job, test_timeout
 from disk_downloader.engine import Control
 from disk_downloader.import_state import find_import, inherit
 from disk_downloader.store import Store
@@ -158,7 +158,7 @@ assert.ok(!rows.some(row=>String(row[1]).includes('запис')));
 rows.length=0;job.active[0].size=null;renderJobCounters(job);
 assert.equal(rows[0][1],'Готовим проверку…');
 """
-    subprocess.run([node,'-e',fixture+function+assertions],check=True,timeout=10)
+    subprocess.run([node,'-e',fixture+function+assertions],check=True,timeout=test_timeout(10))
 
 
 @pytest.mark.skipif(__import__('os').name!='nt',reason='Windows device path URI encoding')

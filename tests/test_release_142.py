@@ -159,7 +159,7 @@ def test_large_journal_search_yields_and_discards_stale_search():
     import subprocess
     node=shutil.which('node')
     if not node:pytest.skip('Node.js unavailable')
-    subprocess.run([node,'tests/journal_filter_worker.cjs'],check=True,timeout=15)
+    subprocess.run([node,'tests/journal_filter_worker.cjs'],check=True,timeout=test_timeout(15))
 
 
 def test_expected_source_wait_does_not_trigger_stall_warning(monkeypatch):
