@@ -43,6 +43,9 @@ jobs:
       - run: python -m pip install -r requirements-dev.txt
       - name: Record tested revision and runtime
         run: python -c "import os, sys, sqlite3; from disk_downloader import __version__; from disk_downloader.sqlite_support import require_safe, journal_mode; require_safe() if sys.platform != 'darwin' else None; print('Journal:', journal_mode()); from disk_downloader.limits import MAX_WORKERS; print('Commit:', os.environ.get('GITHUB_SHA')); print('Application:', __version__); print('Workers:', MAX_WORKERS); print('Python:', sys.version); print('SQLite:', sqlite3.sqlite_version)"
+      - name: Check parallel socket recovery independently on macOS
+        if: runner.os == 'macOS'
+        run: python -m pytest -q tests/test_network_recovery.py::test_real_parallel_http_disconnect_resumes_without_old_socket_timeout -o faulthandler_timeout=60
       - run: python -m pytest -q --durations=15 --junitxml=test-results.xml -o faulthandler_timeout=180
       - name: Save test results
         if: always()

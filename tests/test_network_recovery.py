@@ -162,7 +162,8 @@ def test_other_stream_deadline_is_aborted_when_connection_is_lost():
         assert not deadline.expired.is_set()
 
 
-def test_real_parallel_http_disconnect_resumes_without_old_socket_timeout(system, monkeypatch):
+@pytest.mark.parametrize('_repeat',range(3))
+def test_real_parallel_http_disconnect_resumes_without_old_socket_timeout(system, monkeypatch, _repeat):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from urllib.parse import parse_qs, urlsplit
     from disk_downloader import api as api_module
@@ -249,8 +250,17 @@ def test_real_parallel_http_disconnect_resumes_without_old_socket_timeout(system
         gate.next_probe = 0
         recovered = time.monotonic()
         online.set()
-        for event in resumed_requests.values():
-            assert event.wait(max(0, 3 - (time.monotonic() - recovered)))
+        for path, event in resumed_requests.items():
+            if not event.wait(max(0, 3 - (time.monotonic() - recovered))):
+                # Include blocked thread locations before teardown releases the
+                # deliberately stalled server connection. No real data is used.
+                import faulthandler
+                faulthandler.dump_traceback()
+                states=[{'finished':d.finished.is_set(),'aborted':d.network_aborted.is_set(),
+                         'expired':d.expired.is_set(),'sockets':[sock.fileno() for sock in d.sockets]}
+                        for d in tuple(gate.requests)]
+                pytest.fail(f'Recovery request missing: {path}; calls={calls}; '
+                            f'offline={gate.offline.is_set()}; requests={states}')
         assert time.monotonic() - recovered < 3
         done = wait_job(engine, job_id)
         assert done["errors"] == 0 and done["originals"] == 2 and done["phase"] == "completed"
