@@ -48,6 +48,8 @@ CREATE TABLE IF NOT EXISTS scan_errors (
  job TEXT NOT NULL, path TEXT NOT NULL, error TEXT NOT NULL,
  PRIMARY KEY(job,path)
 );
+CREATE TABLE IF NOT EXISTS scan_pages(job TEXT,path TEXT,signature TEXT,PRIMARY KEY(job,path));
+CREATE TABLE IF NOT EXISTS skipped_sources(job TEXT,path TEXT,reason TEXT,PRIMARY KEY(job,path));
 CREATE TABLE IF NOT EXISTS verification_cache (
  job TEXT NOT NULL, local TEXT NOT NULL, signature TEXT NOT NULL,
  PRIMARY KEY(job,local)
@@ -92,7 +94,7 @@ class Store:
         self.filename = str(filename)
         self.write_gate = gate_for(self.filename)
         self._sessions = threading.local()
-        Path(filename).parent.mkdir(parents=True, exist_ok=True)
+        Path(filename).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         from .backups import before_upgrade, recovery_source
         before_upgrade(Path(filename))
         connection = recovery_source(filename, timeout=30) if Path(filename).is_file() else sqlite3.connect(self.filename, timeout=30)
@@ -116,6 +118,9 @@ class Store:
                 if name not in columns:
                     db.execute(f"ALTER TABLE entries ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0")
             db.execute("CREATE INDEX IF NOT EXISTS queue_priority ON entries(job,kind,status,priority,path)")
+            if 'user_priority' not in columns:
+                db.execute('ALTER TABLE entries ADD COLUMN user_priority INTEGER NOT NULL DEFAULT 1')
+            db.execute('CREATE INDEX IF NOT EXISTS queue_user_priority ON entries(job,kind,status,priority,user_priority,path)')
             job_columns = {row[1] for row in db.execute('PRAGMA table_info(jobs)')}
             for name, declaration in (("title", "TEXT NOT NULL DEFAULT ''"), ("archived", "INTEGER NOT NULL DEFAULT 0")):
                 if name not in job_columns:
@@ -298,7 +303,11 @@ class Store:
                 remote_path(path)
             validate_exclusions(settings['exclusions'])
             validate_speed(settings.get('speed_limit_mib',0))
-            for key in ('create_zip','auto_pause','resume_parts','adaptive_workers'):
+            from .selection_rules import validate as validate_selection
+            from .work_policy import validate as validate_policy
+            validate_selection(settings)
+            validate_policy(settings)
+            for key in ('create_zip','auto_pause','resume_parts','adaptive_workers','deduplicate','prevent_sleep'):
                 if key in settings and not isinstance(settings[key],bool):
                     raise ValueError()
             fullness = settings.get('max_disk_percent',95)
@@ -324,10 +333,16 @@ class Store:
     def insert_entry(self, db, job_id, meta, settings=None):
         validate_resource(meta)
         if settings is not None and excluded(meta["path"], settings):
+            db.execute('INSERT OR REPLACE INTO skipped_sources VALUES(?,?,?)',(job_id,meta['path'],'Исключено правилом папки или имени'))
             return
         if meta["type"] == "file" and settings is not None and not selected_type(meta, settings):
+            db.execute('INSERT OR REPLACE INTO skipped_sources VALUES(?,?,?)',(job_id,meta['path'],'Не входит в выбранные типы или период дат'))
             return
-        safe = {k: meta[k] for k in ("path", "name", "type", "size", "md5", "sha256", "modified", "resource_id", "mime_type", "media_type") if k in meta}
+        safe = {k: meta[k] for k in ("path", "name", "type", "size", "md5", "sha256", "modified", "created", "resource_id", "mime_type", "media_type") if k in meta}
+        from .selection_rules import taken
+        value = taken(meta)
+        if isinstance(value,str) and len(value)<=100:
+            safe['taken'] = value
         safe["file_type"] = file_type(meta)
         safe["has_preview"] = preview_type(meta) and bool(meta.get("preview") or meta.get("has_preview"))
         db.execute("INSERT OR IGNORE INTO entries(job,path,kind,meta) VALUES(?,?,?,?)", (job_id, meta["path"], meta["type"], json.dumps(safe, ensure_ascii=False)))

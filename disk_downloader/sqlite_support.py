@@ -48,7 +48,7 @@ def require_safe():
 
 
 def journal_mode():
-    if getattr(sys, 'frozen', False):
+    if getattr(sys, 'frozen', False) and sys.platform == 'win32':
         require_safe()
-    # Legacy source/CMD runtimes use the rollback journal. FULL remains enabled.
+    # Source/CMD and Unix runtimes with older SQLite use rollback journals. FULL remains enabled.
     return 'WAL' if safe_wal() else 'DELETE'

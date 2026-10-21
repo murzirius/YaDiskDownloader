@@ -4,7 +4,7 @@ import os
 
 
 def state_key(folder):
-    return hashlib.sha256(os.path.normcase(os.path.abspath(folder)).encode('utf8')).hexdigest()
+    return hashlib.sha256(os.path.normcase(os.path.realpath(folder)).encode('utf8')).hexdigest()
 
 
 def activate_existing(folder, port):

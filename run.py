@@ -25,7 +25,7 @@ def message(text):
 
 
 def lock_state(folder):
-    folder.mkdir(parents=True, exist_ok=True)
+    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
     stream = (folder / "server.lock").open("a+b")
     try:
         if stream.tell() == 0:
@@ -58,6 +58,7 @@ def main():
     parser.add_argument('--window',action='store_true',help='Показать мини-окно состояния Windows')
     parser.add_argument('--no-window',action='store_true',help='Запустить без мини-окна')
     parser.add_argument("--state-dir")
+    parser.add_argument('--serve', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--apply-update')
     parser.add_argument('--update-ack')
     args = parser.parse_args()
@@ -100,6 +101,9 @@ def main():
     if sys.stdout:
         message(f"Приложение доступно: {url}")
     shutdown = Shutdown(app, server, state_lock)
+    if os.name != 'nt' and threading.current_thread() is threading.main_thread():
+        import signal
+        signal.signal(signal.SIGTERM, lambda *_: shutdown())
     app.extensions["quit_app"] = shutdown
     app.extensions['management'].start()
     desktop.progress('Запускаем локальный сервер и управление…',85)
@@ -140,6 +144,10 @@ def main():
 
 if __name__ == "__main__":
     try:
+        from disk_downloader.cli import COMMANDS
+        if any(argument in COMMANDS for argument in sys.argv[1:2]):
+            from disk_downloader.cli import main as cli_main
+            sys.exit(cli_main())
         window = os.name=='nt' and '--no-window' not in sys.argv and '--apply-update' not in sys.argv and ('--window' in sys.argv or frozen() and '--no-browser' not in sys.argv)
         sys.exit(desktop.launch(main) if window else main())
     except Exception:

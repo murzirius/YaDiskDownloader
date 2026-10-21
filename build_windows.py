@@ -12,7 +12,10 @@ def notices(output):
     if python_license.exists():
         texts.append("\n===== Python " + sys.version.split()[0] + " =====\n" + python_license.read_text(encoding="utf-8", errors="replace"))
     for name in packages:
-        distribution = metadata.distribution(name)
+        try:
+            distribution = metadata.distribution(name)
+        except metadata.PackageNotFoundError:
+            continue
         texts.append("\n===== " + name + " " + distribution.version + " =====\n")
         for file in distribution.files or []:
             if file.name.lower().startswith(("license", "copying", "notice")):
@@ -41,6 +44,12 @@ def main():
     image(256).save(icon, sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])
     command = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--onefile", "--windowed", "--noupx", "--manifest", str(root / "windows.manifest"), "--name", "YaDiskDownloader", "--icon", str(icon), "--distpath", str(output), "--workpath", str(work / "cache"), "--specpath", str(work), "--hidden-import", "pystray._win32", "--add-data", str(root / "disk_downloader" / "templates") + ";disk_downloader/templates", "--add-data", str(root / "disk_downloader" / "static") + ";disk_downloader/static", str(root / "run.py")]
     subprocess.run(command, cwd=root, check=True)
+    cli_command = list(command)
+    cli_command[cli_command.index('--windowed')] = '--console'
+    cli_command[cli_command.index('--name')+1] = 'YaDiskDownloader-CLI'
+    cli_command[-1] = str(root/'run_cli.py')
+    cli_command += ['--hidden-import','run']
+    subprocess.run(cli_command, cwd=root, check=True)
     notices(output)
 
 

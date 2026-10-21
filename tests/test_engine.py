@@ -34,8 +34,8 @@ def test_pagination_more_than_1000_and_overlap(system):
     assert job["files"] == 1107
     assert job["folders"] == 3
     assert job["settings"]["paths"] == ["disk:/Фото"]
-    offsets = [offset for path, offset, limit in api.metadata_calls if path == "disk:/Фото/2024" and limit == 200]
-    assert offsets == [0, 200, 400, 600, 800, 1000]
+    offsets = [offset for path, offset, limit in api.metadata_calls if path == "disk:/Фото/2024" and limit == 1000]
+    assert offsets == [0, 1000]
     assert len(entries(engine, job_id)) == 1107
     assert Path(job["root"], "Фото", "2024", "Пустая").is_dir()
     assert job["percent"] == 0

@@ -7,6 +7,8 @@ from pathlib import Path
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0,str(Path(__file__).resolve().parent))
+import disk_downloader.scanner as _scan
+_scan.PAGE_SIZE=200
 from conftest import FakeAPI, Response, wait_job
 from disk_downloader.engine import Engine
 from disk_downloader.store import Store

@@ -16,7 +16,9 @@ from .service_outputs import root_key
 
 def recycle(path):
     if os.name != 'nt':
-        raise ValueError('Очистка через корзину поддерживается в Windows')
+        from send2trash import send2trash
+        send2trash(str(Path(path).absolute()))
+        return
     # Force modern IFileOperation with RECYCLEONDELETE; never use the legacy fallback.
     from send2trash.win.modern import send2trash
     send2trash(str(Path(path).absolute()))

@@ -34,23 +34,37 @@ def download_plan(store, job_id):
 
 def files(store, job_id, query='', state='all', offset=0):
     store.job(job_id)
-    if not isinstance(query,str) or len(query)>200 or state not in ('all','original','preview','missing','problems'):
+    if not isinstance(query,str) or len(query)>200 or state not in ('all','original','preview','missing','problems','skipped'):
         raise ValueError('Укажите имя файла и допустимый фильтр результатов.')
     if not isinstance(offset,int) or not 0<=offset<=10000000:
         raise ValueError('Некорректная страница списка файлов.')
     condition = {
-        'all':'1', 'original':"EXISTS(SELECT 1 FROM artifacts a WHERE a.job=e.job AND a.path=e.path AND a.type='original')",
+        'all':'1', 'skipped':"e.status IN ('existing','filtered')", 'original':"EXISTS(SELECT 1 FROM artifacts a WHERE a.job=e.job AND a.path=e.path AND a.type='original')",
         'preview':"EXISTS(SELECT 1 FROM artifacts a WHERE a.job=e.job AND a.path=e.path AND a.type='preview')",
         'missing':"NOT EXISTS(SELECT 1 FROM artifacts a WHERE a.job=e.job AND a.path=e.path)",
         'problems':"(e.error!='' OR e.status IN ('error','no_preview'))"}[state]
     pattern='%'+query.casefold().replace('!','!!').replace('%','!%').replace('_','!_')+'%'
     with store.db() as db:
-        rows=db.execute("""SELECT e.path,e.status,e.error,e.original_status,e.preview_status,
+        sql="""SELECT e.path,e.status,e.error,e.original_status,e.preview_status,'' AS reason,
           (SELECT local FROM artifacts a WHERE a.job=e.job AND a.path=e.path AND a.type='original') AS original,
           (SELECT local FROM artifacts a WHERE a.job=e.job AND a.path=e.path AND a.type='preview') AS preview
-          FROM entries e WHERE e.job=? AND e.kind='file' AND e.status!='filtered'
-          AND unicode_fold(e.path) LIKE ? ESCAPE '!' AND """+condition+' ORDER BY e.path LIMIT 101 OFFSET ?', (job_id,pattern,offset)).fetchall()
-    return {'items':[dict(row) for row in rows[:100]],'has_more':len(rows)>100,'offset':offset}
+          FROM entries e WHERE e.job=? AND e.kind='file'
+          AND unicode_fold(e.path) LIKE ? ESCAPE '!' AND """+condition
+        parameters=(job_id,pattern)
+        if state in ('all','skipped'):
+            sql+=" UNION ALL SELECT path,'excluded','','not_requested','not_requested',reason,NULL,NULL FROM skipped_sources WHERE job=? AND unicode_fold(path) LIKE ? ESCAPE '!'"
+            parameters+=(job_id,pattern)
+        rows=db.execute(sql+' ORDER BY path LIMIT 101 OFFSET ?',(*parameters,offset)).fetchall()
+        items=[]
+        for row in rows[:100]:
+            item=dict(row)
+            if not item['reason']:
+                item['reason']={'existing':'Готовая копия проверена — повторное скачивание не требуется','filtered':'Не входит в выбранные условия','pending':'Ждёт обработки','running':'Обрабатывается','done':'Скачан и проверен','partial':'Сохранена доступная копия','cancelled':'Работа остановлена','error':'Не удалось сохранить результат','no_preview':'Нет доступного превью'}.get(item['status'],item['status'])
+                local=item.get('original') or item.get('preview')
+                if local and db.execute('SELECT 1 FROM artifacts WHERE job=? AND local=? AND path!=? LIMIT 1',(job_id,local,item['path'])).fetchone():
+                    item['reason']='Используется проверенная общая копия точного дубликата'
+            items.append(item)
+    return {'items':items,'has_more':len(rows)>100,'offset':offset}
 
 
 def problems(store, job_id):

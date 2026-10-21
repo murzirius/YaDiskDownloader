@@ -4,6 +4,7 @@ import re
 import sqlite3
 import tempfile
 import time
+import unicodedata
 from functools import lru_cache
 from pathlib import Path
 
@@ -32,17 +33,17 @@ def digest(value):
 
 
 def component(name, identity):
-    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).rstrip(" .")
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", unicodedata.normalize('NFC',name)).rstrip(" .")
     reserved = re.fullmatch(r"(?i)(CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])", cleaned.split(".")[0])
     changed = cleaned != name or reserved or cleaned in ("", ".", "..")
     if reserved:
         cleaned = "_" + cleaned
     cleaned = cleaned or "unnamed"
-    if len(cleaned.encode("utf-16-le")) > 240:
+    if len(cleaned.encode("utf-16-le")) > 240 or len(cleaned.encode('utf-8')) > 240:
         stem, ext = os.path.splitext(cleaned)
         ext = ext[:20]
         stem = stem[:75]
-        while len((stem + ext).encode("utf-16-le")) > 190:
+        while len((stem + ext).encode("utf-16-le")) > 190 or len((stem+ext).encode('utf-8')) > 190:
             stem = stem[:-1]
         cleaned = stem + ext
         changed = True

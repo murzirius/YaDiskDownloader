@@ -45,6 +45,8 @@ class Shutdown:
         if duplicate_review:duplicate_review.cancel()
         recovery = self.app.extensions.get('recovery')
         if recovery: recovery.cancel.set()
+        folder_stats = self.app.extensions.get('folder_stats')
+        if folder_stats: folder_stats.cancel.set()
         for control in tuple(engine.controls.values()):
             self.attempt(control.stop)
         tray = self.app.extensions.get('tray')

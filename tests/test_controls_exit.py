@@ -145,3 +145,8 @@ def test_real_process_exits_and_releases_port_and_state(tmp_path, mode):
         if process.poll() is None:
             process.kill()
             process.wait(5)
+
+
+@pytest.fixture(autouse=True)
+def short_scan_pages(monkeypatch):
+    monkeypatch.setattr('disk_downloader.scanner.PAGE_SIZE',200)

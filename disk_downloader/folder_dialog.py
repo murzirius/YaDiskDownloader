@@ -5,20 +5,33 @@ import uuid
 from .windows_dpi import native_thread
 
 
+def check_hresult(value, action):
+    if value & 0x80000000:
+        raise OSError(f'Windows не смогла {action} (HRESULT 0x{value & 0xffffffff:08X}). Введите путь вручную.')
+
+
 @native_thread()
 def choose_directory(initial=""):
     if os.name != "nt":
+        import shutil
+        import subprocess
+        import sys
+        command = None
+        if sys.platform == 'darwin':
+            command = ['osascript', '-e', 'POSIX path of (choose folder with prompt "Папка для результатов Яндекс.Диска")']
+        elif os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY'):
+            if shutil.which('zenity'):
+                command = ['zenity', '--file-selection', '--directory', '--title=Папка для результатов Яндекс.Диска']
+            elif shutil.which('kdialog'):
+                command = ['kdialog', '--getexistingdirectory', initial or os.path.expanduser('~')]
+        if command is None:
+            raise OSError('Системный выбор папки недоступен. Введите полный путь вручную; в Linux можно установить zenity или kdialog.')
         try:
-            import tkinter
-            from tkinter import filedialog
-            root = tkinter.Tk()
-            root.withdraw()
-            try:
-                return filedialog.askdirectory(parent=root, initialdir=initial or None, title="Папка для результатов Яндекс.Диска")
-            finally:
-                root.destroy()
-        except ImportError as exc:
-            raise OSError("В системе нет диалога выбора папки. Введите путь в поле вручную.") from exc
+            from .runtime import external_environment
+            result = subprocess.run(command, capture_output=True, text=True, timeout=120, env=external_environment())
+        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            raise OSError('Окно выбора папки не ответило. Введите полный путь вручную.') from exc
+        return result.stdout.strip() if result.returncode == 0 else ''
     import ctypes as c
     from ctypes import wintypes as w
 
@@ -40,12 +53,14 @@ def choose_directory(initial=""):
         table = c.cast(obj, c.POINTER(c.POINTER(c.c_void_p))).contents
         return c.WINFUNCTYPE(c.c_long, c.c_void_p, *arguments)(table[index])
 
-    ole.CoInitializeEx(None, 6)  # Dedicated worker is always an STA.
+    check_hresult(ole.CoInitializeEx(None, 6), 'подготовить выбор папки')
     try:
-        ole.CoCreateInstance(c.byref(GUID("dc1c5a9c-e88a-4dde-a5a1-60f82a20aef7")), None, 1,
-                             c.byref(GUID("d57c7288-d4ad-4768-be02-9d969532d960")), c.byref(dialog))
-        method(dialog, 9, w.DWORD)(dialog, 0x20 | 0x40 | 0x800 | 0x8 | 0x2000000)
-        method(dialog, 17, w.LPCWSTR)(dialog, "Папка для результатов Яндекс.Диска")
+        check_hresult(ole.CoCreateInstance(c.byref(GUID("dc1c5a9c-e88a-4dde-a5a1-60f82a20aef7")), None, 1,
+                             c.byref(GUID("d57c7288-d4ad-4768-be02-9d969532d960")), c.byref(dialog)), 'создать окно выбора папки')
+        if not dialog:
+            raise OSError('Windows не создала окно выбора папки. Введите путь вручную.')
+        check_hresult(method(dialog, 9, w.DWORD)(dialog, 0x20 | 0x40 | 0x800 | 0x8 | 0x2000000), 'настроить выбор папки')
+        check_hresult(method(dialog, 17, w.LPCWSTR)(dialog, "Папка для результатов Яндекс.Диска"), 'настроить заголовок окна')
         # A disconnected NAS can block path lookup before Windows even shows
         # the dialog. For UNC paths let the dialog open at its remembered place.
         if initial and not initial.startswith(('\\\\', '//')) and os.path.isdir(initial):
@@ -53,8 +68,9 @@ def choose_directory(initial=""):
             shell.SHCreateItemFromParsingName.argtypes = [w.LPCWSTR, c.c_void_p, c.POINTER(GUID), c.POINTER(c.c_void_p)]
             initial_item = c.c_void_p()
             try:
-                shell.SHCreateItemFromParsingName(initial, None, c.byref(GUID("43826d1e-e718-42ee-bc55-a1e261c37bfe")), c.byref(initial_item))
-                method(dialog, 12, c.c_void_p)(dialog, initial_item)
+                check_hresult(shell.SHCreateItemFromParsingName(initial, None, c.byref(GUID("43826d1e-e718-42ee-bc55-a1e261c37bfe")), c.byref(initial_item)), 'открыть начальную папку')
+                if initial_item:
+                    method(dialog, 12, c.c_void_p)(dialog, initial_item)
             except OSError:
                 pass
             finally:

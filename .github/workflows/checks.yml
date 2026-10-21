@@ -1,4 +1,4 @@
-name: Checks and Windows release
+name: Checks and native builds
 on:
   push:
     branches: [main, master]
@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-15]
         python: ['3.11', '3.14']
     runs-on: ${{ matrix.os }}
     steps:
@@ -42,7 +42,7 @@ jobs:
       - run: python -m pip install -r requirements-bootstrap.txt
       - run: python -m pip install -r requirements-dev.txt
       - name: Record tested revision and runtime
-        run: python -c "import os, sys, sqlite3; from disk_downloader import __version__; from disk_downloader.sqlite_support import require_safe; require_safe(); from disk_downloader.limits import MAX_WORKERS; print('Commit:', os.environ.get('GITHUB_SHA')); print('Application:', __version__); print('Workers:', MAX_WORKERS); print('Python:', sys.version); print('SQLite:', sqlite3.sqlite_version)"
+        run: python -c "import os, sys, sqlite3; from disk_downloader import __version__; from disk_downloader.sqlite_support import require_safe, journal_mode; require_safe() if sys.platform != 'darwin' else None; print('Journal:', journal_mode()); from disk_downloader.limits import MAX_WORKERS; print('Commit:', os.environ.get('GITHUB_SHA')); print('Application:', __version__); print('Workers:', MAX_WORKERS); print('Python:', sys.version); print('SQLite:', sqlite3.sqlite_version)"
       - run: python -m pytest -q --durations=15 --junitxml=test-results.xml -o faulthandler_timeout=180
       - name: Save test results
         if: always()
@@ -55,7 +55,7 @@ jobs:
 
   windows_exe:
     timeout-minutes: 30
-    needs: tests
+    needs: [tests, native_cli, dependencies]
     runs-on: windows-latest
     permissions:
       contents: write
@@ -66,7 +66,7 @@ jobs:
           python-version: '3.14'
       - run: python tools/prepare_sqlite_windows.py
       - run: python -m pip install -r requirements-bootstrap.txt
-      - run: python -m pip install -r requirements-build.txt
+      - run: python -m pip install -r requirements-build.txt -r requirements-dev.txt
       - name: Validate release tag
         if: startsWith(github.ref, 'refs/tags/v')
         env:
@@ -77,6 +77,8 @@ jobs:
       - run: python build_windows.py --output dist/windows --work build/windows
       - name: Smoke actual EXE, UI, patched SQLite, tray and full shutdown
         run: python tools/smoke_windows_exe.py --exe dist/windows/YaDiskDownloader.exe --output smoke-results.json
+      - name: Smoke actual Windows console application
+        run: python tools/smoke_cli.py --exe dist/windows/YaDiskDownloader-CLI.exe --output cli-smoke-results.json
       - name: Check background SQLite diagnostics in actual EXE
         run: python tools/check_exe_database_errors.py --exe dist/windows/YaDiskDownloader.exe --output database-error-results.json
       - name: Recover unreadable application history in actual EXE
@@ -90,6 +92,7 @@ jobs:
           name: windows-exe-smoke
           path: |
             smoke-results.json
+            cli-smoke-results.json
             desktop-dpi-results.json
             database-error-results.json
             history-recovery-application.json
@@ -124,3 +127,43 @@ jobs:
           }
           gh release upload $env:RELEASE_TAG $windowsArchive $cmdArchive --clobber
           exit $LASTEXITCODE
+
+  native_cli:
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - run: python -m pip install -r requirements-build.txt -r requirements-dev.txt
+      - run: python build_posix.py --output dist/native --work build/native
+      - run: python tools/smoke_cli.py --exe dist/native/yadisk --output native-smoke.json
+      - run: python tools/package_native.py --binary dist/native/yadisk --output dist/native-package
+      - name: Save native build and actual binary checks
+        uses: actions/upload-artifact@v6
+        with:
+          name: native-${{ matrix.os }}
+          path: |
+            dist/native-package/
+            native-smoke.json
+          if-no-files-found: error
+
+  dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - run: python -m pip install pip-audit
+      - run: python -m pip_audit -r requirements.txt --format json --output dependency-audit.json
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: dependency-audit
+          path: dependency-audit.json

@@ -3,10 +3,162 @@
 // Theme files contain named colours only; executable CSS and URLs are rejected.
 const themeKeys=['bg','panel','input','line','text','muted','accent'];
 const baseThemes=[
-  {name:'Тёмная',colors:{bg:'#15171b',panel:'#1c1f24',input:'#22262d',line:'#434b59',text:'#e2e5ea',muted:'#a6afbe',accent:'#a8c3e1'}},
-  {name:'Светлая',colors:{bg:'#f2f5fa',panel:'#ffffff',input:'#edf1f7',line:'#bdc8d7',text:'#182537',muted:'#4e6078',accent:'#245c95'}},
-  {name:'Лес',colors:{bg:'#101c19',panel:'#172822',input:'#20362d',line:'#426555',text:'#e0f2e8',muted:'#a1c4b0',accent:'#8dd6af'}},
-  {name:'Слива',colors:{bg:'#211a2b',panel:'#2d243a',input:'#3a2e49',line:'#6f5c86',text:'#f0e8fa',muted:'#c0abd2',accent:'#d5aff0'}}
+  {
+    "name": "Тёмная",
+    "colors": {
+      "bg": "#15171b",
+      "panel": "#1c1f24",
+      "input": "#22262d",
+      "line": "#434b59",
+      "text": "#e2e5ea",
+      "muted": "#a6afbe",
+      "accent": "#a8c3e1"
+    }
+  },
+  {
+    "name": "Светлая",
+    "colors": {
+      "bg": "#f2f5fa",
+      "panel": "#ffffff",
+      "input": "#edf1f7",
+      "line": "#bdc8d7",
+      "text": "#182537",
+      "muted": "#4e6078",
+      "accent": "#245c95"
+    }
+  },
+  {
+    "name": "Really Black",
+    "colors": {
+      "bg": "#000000",
+      "panel": "#0c0c0c",
+      "input": "#171717",
+      "line": "#484848",
+      "text": "#f5f5f5",
+      "muted": "#b8b8b8",
+      "accent": "#93c5fd"
+    }
+  },
+  {
+    "name": "Dracula",
+    "colors": {
+      "bg": "#282a36",
+      "panel": "#30323f",
+      "input": "#363848",
+      "line": "#62677f",
+      "text": "#f8f8f2",
+      "muted": "#b7bed6",
+      "accent": "#bd93f9"
+    }
+  },
+  {
+    "name": "Nord",
+    "colors": {
+      "bg": "#2e3440",
+      "panel": "#3b4252",
+      "input": "#434c5e",
+      "line": "#69778d",
+      "text": "#eceff4",
+      "muted": "#d8dee9",
+      "accent": "#88c0d0"
+    }
+  },
+  {
+    "name": "Catppuccin Mocha",
+    "colors": {
+      "bg": "#1e1e2e",
+      "panel": "#242436",
+      "input": "#313244",
+      "line": "#585b70",
+      "text": "#cdd6f4",
+      "muted": "#bac2de",
+      "accent": "#cba6f7"
+    }
+  },
+  {
+    "name": "Catppuccin Latte",
+    "colors": {
+      "bg": "#eff1f5",
+      "panel": "#ffffff",
+      "input": "#e6e9ef",
+      "line": "#9ca0b0",
+      "text": "#4c4f69",
+      "muted": "#5c5f77",
+      "accent": "#8839ef"
+    }
+  },
+  {
+    "name": "Tokyo Night",
+    "colors": {
+      "bg": "#1a1b26",
+      "panel": "#202230",
+      "input": "#292e42",
+      "line": "#565f89",
+      "text": "#c0caf5",
+      "muted": "#a9b1d6",
+      "accent": "#7aa2f7"
+    }
+  },
+  {
+    "name": "Everforest",
+    "colors": {
+      "bg": "#2d353b",
+      "panel": "#343f44",
+      "input": "#3d484d",
+      "line": "#687a73",
+      "text": "#d3c6aa",
+      "muted": "#b2b9a5",
+      "accent": "#a7c080"
+    }
+  },
+  {
+    "name": "Solarized Dark",
+    "colors": {
+      "bg": "#002b36",
+      "panel": "#073642",
+      "input": "#0a3c48",
+      "line": "#586e75",
+      "text": "#eee8d5",
+      "muted": "#93a1a1",
+      "accent": "#2aa198"
+    }
+  },
+  {
+    "name": "Solarized Light",
+    "colors": {
+      "bg": "#fdf6e3",
+      "panel": "#fffbed",
+      "input": "#eee8d5",
+      "line": "#93a1a1",
+      "text": "#073642",
+      "muted": "#586e75",
+      "accent": "#006f86"
+    }
+  },
+  {
+    "name": "Gruvbox",
+    "colors": {
+      "bg": "#282828",
+      "panel": "#32302f",
+      "input": "#3c3836",
+      "line": "#7c6f64",
+      "text": "#ebdbb2",
+      "muted": "#bdae93",
+      "accent": "#fabd2f"
+    }
+  },
+  {
+    "name": "High Contrast",
+    "colors": {
+      "bg": "#000000",
+      "panel": "#080808",
+      "input": "#151515",
+      "line": "#ffffff",
+      "text": "#ffffff",
+      "muted": "#e2e2e2",
+      "accent": "#ffea00"
+    }
+  }
 ];
 let installedThemes=[],currentTheme=baseThemes[0];
 function validateTheme(value){
@@ -151,7 +303,7 @@ async function showPlan(job){
 const fileDialog=node('dialog',undefined,'tools-dialog');fileDialog.id='job-files-dialog';
 const fileSearch=node('input');fileSearch.type='search';fileSearch.placeholder='Имя или путь файла';fileSearch.setAttribute('aria-label','Поиск в задании');
 const fileFilter=node('select');fileFilter.setAttribute('aria-label','Состояние файла');
-for(const [value,title] of [['all','Все файлы'],['original','Есть оригинал'],['preview','Есть превью'],['missing','Нет сохранённой копии'],['problems','Есть ошибка']])fileFilter.append(new Option(title,value));
+for(const [value,title] of [['all','Все файлы'],['original','Есть оригинал'],['preview','Есть превью'],['missing','Нет сохранённой копии'],['problems','Есть ошибка'],['skipped','Пропущенные и исключённые']])fileFilter.append(new Option(title,value));
 const fileRows=node('div'),filePage=node('p',undefined,'hint'),fileBack=node('button','Назад'),fileNext=node('button','Дальше'),fileClose=node('button','Закрыть');
 let fileJob=null,fileOffset=0,fileRevision=0,fileTimer;
 fileClose.onclick=()=>fileDialog.close();
@@ -162,10 +314,11 @@ async function loadTaskFiles(){
   fileRows.replaceChildren();
   for(const file of result.items){
     const row=node('div',undefined,'tool-row');row.append(node('strong',file.path),node('p',file.original?'Оригинал сохранён'+(file.preview?' · Превью сохранено':''):file.preview?'Сохранено только превью':'Сохранённой копии пока нет'));
+    if(file.reason)row.append(node('p',file.reason,'hint'));
     if(file.error)row.append(node('p',file.error));
     const actions=node('div',undefined,'actions');
     if(file.original||file.preview)actions.append(toolButton('Показать в папке',async()=>api('/api/jobs/'+id+'/open-file-folder',{path:file.path})));
-    const retry=toolButton('Повторить файл',async()=>{await api('/api/jobs/'+id+'/action',{action:'retry_selected',paths:[file.path],limits:state.job===id?runtimeLimits():undefined});fileDialog.close();await openJob(id);});retry.disabled=!state.connected||state.jobStatus?.live||state.jobStatus?.phase==='ready';actions.append(retry);row.append(actions);fileRows.append(row);
+    const retry=toolButton('Повторить файл',async()=>{await api('/api/jobs/'+id+'/action',{action:'retry_selected',paths:[file.path],limits:state.job===id?runtimeLimits():undefined});fileDialog.close();await openJob(id);});retry.disabled=file.status==='excluded'||!state.connected||state.jobStatus?.live||state.jobStatus?.phase==='ready';actions.append(retry);row.append(actions);fileRows.append(row);
   }
   if(!result.items.length)fileRows.append(node('p','По этим условиям файлов нет.'));
   fileBack.disabled=offset===0;fileNext.disabled=!result.has_more;filePage.textContent=result.items.length?'Файлы '+(offset+1)+'–'+(offset+result.items.length):'Нет результатов';
@@ -242,7 +395,7 @@ renderExperience=function(job){
   const movement=JSON.stringify([job.phase,job.processed,job.verification?.checked,job.active.map(file=>[file.path,file.done,file.size])]);
   if(movement!==movementKey){movementKey=movement;lastMovement=Date.now();}
   const message=job.network_waiting?job.network_warning:job.pause_reason||job.health?.warning||job.error||({'ready':'Проверьте план ниже и нажмите «Начать скачивание».','paused':'Работа на паузе. Нажмите «Продолжить», когда будете готовы.','scanning':'Получаем список с Яндекс.Диска. Скачивание ещё не началось.','preparing':'Проверяем скачанные файлы и готовим план. Журналы и отчёты не перечитываются как контент.','downloading':'Сохраняем выбранные файлы. Можно поставить на паузу или остановить с сохранением прогресса.','packing':'Скачивание окончено. Собираем ZIP из сохранённых результатов.'}[job.phase]||phases[job.phase]);
-  const stage=JSON.stringify([job.id,message,job.verification?.cached,job.verification?.hashed]);
+  const stage=JSON.stringify([job.id,message,job.queue_state,job.verification?.cached,job.verification?.hashed]);
   if(stage!==stageKey){stageKey=stage;taskStage.replaceChildren(node('strong',message));if(job.verification)taskStage.append(node('p','Без повторного чтения: '+(job.verification.cached||0)+' · Проверено по содержимому: '+(job.verification.hashed||0),'hint'));}
   groupedProblems.hidden=!(job.errors||job.scan_errors||job.error);
   safely(async()=>{try{await showPlan(job);}catch(error){planKey='';throw error;}});

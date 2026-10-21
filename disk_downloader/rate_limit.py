@@ -16,6 +16,14 @@ class RateLimiter:
         self.clock = clock
         self.rate = mib * 1024 * 1024
         self.next = clock()
+        self.revision = 0
+
+    def configure(self, mib):
+        mib = validate(mib)
+        with self.lock:
+            self.rate = mib*1024*1024
+            self.next = self.clock()
+            self.revision += 1
 
     def consume(self, size, checkpoint):
         if not self.rate:
@@ -25,12 +33,19 @@ class RateLimiter:
             return self._consume(size,checkpoint)
 
     def _consume(self, size, checkpoint):
-        with self.lock:
-            self.next = max(self.next, self.clock()) + size / self.rate
-            until = self.next
         while True:
-            checkpoint()
-            delay = until - self.clock()
-            if delay <= 0:
-                return
-            time.sleep(min(0.1, delay))
+            with self.lock:
+                if not self.rate:
+                    return
+                self.next = max(self.next, self.clock()) + size / self.rate
+                until, revision = self.next, self.revision
+            while True:
+                checkpoint()
+                with self.lock:
+                    changed = revision != self.revision
+                if changed:
+                    break
+                delay = until - self.clock()
+                if delay <= 0:
+                    return
+                time.sleep(min(0.1, delay))

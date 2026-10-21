@@ -8,6 +8,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import run
 from disk_downloader import web,lifecycle
+import disk_downloader.scanner as _scan
+_scan.PAGE_SIZE=200
 from conftest import FakeAPI
 from disk_downloader.engine import Control
 from disk_downloader.tray import Tray

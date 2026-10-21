@@ -115,3 +115,8 @@ def test_publish_never_overwrites(tmp_path):
     final = tmp_path / "other.bin"
     publish(temp, final)
     assert final.read_bytes() == b"new" and not temp.exists()
+
+
+@pytest.fixture(autouse=True)
+def short_scan_pages(monkeypatch):
+    monkeypatch.setattr('disk_downloader.scanner.PAGE_SIZE',200)

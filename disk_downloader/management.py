@@ -1,4 +1,6 @@
 import threading
+import time
+from datetime import datetime
 
 
 class Management:
@@ -9,6 +11,7 @@ class Management:
         self.thread = None
         # Restart never starts queued downloads before an explicit connection.
         self.armed = False
+        self.next_due = 0
 
     def paused(self):
         with self.store.db() as db:
@@ -18,11 +21,12 @@ class Management:
     def queue_snapshot(self):
         return {'paused': self.paused() or not self.armed, 'waiting_for_connection': not self.engine.api.credentials.connected,
                 'needs_confirmation': not self.armed,
-                'items': [dict(r) for r in self.store.rows('SELECT q.*,j.title,j.phase FROM job_queue q JOIN jobs j ON j.id=q.job ORDER BY position')]}
+                'items': [dict(r) for r in self.store.rows("SELECT q.*,j.title,j.phase,CASE WHEN json_valid(j.settings) THEN json_extract(j.settings,'$.run_at') END AS run_at FROM job_queue q JOIN jobs j ON j.id=q.job ORDER BY position")]}
 
     def queue_action(self, data):
         verb = data.get('action')
         with self.engine.lock:
+            self.next_due = 0
             if self.engine.shutting_down:
                 raise ValueError('Приложение завершается')
             with self.store.db() as db:
@@ -80,6 +84,8 @@ class Management:
         if (self.engine.shutting_down or not self.armed or not self.engine.api.credentials.connected
                 or any(thread.is_alive() for thread in tuple(self.engine.threads.values()))):
             return
+        if time.time() < self.next_due:
+            return
         with self.engine.lock:
             if self.engine.shutting_down or not self.armed or not self.engine.api.credentials.connected or self.paused():
                 return
@@ -98,6 +104,11 @@ class Management:
             with self.store.db() as db:
                 row = db.execute("SELECT job FROM job_queue WHERE state='waiting' ORDER BY position LIMIT 1").fetchone()
             if not row: return
+            from .work_policy import due
+            settings = self.store.job(row['job'])['settings']
+            if not due(settings):
+                self.next_due = datetime.fromisoformat(settings['run_at'].replace('Z','+00:00')).timestamp()
+                return
             try:
                 self.engine.action(row['job'], 'resume')
                 with self.store.db() as db:
@@ -142,7 +153,7 @@ class Management:
                     if data.get('confirm') != job_id:
                         raise ValueError('Подтвердите удаление записи задания')
                     # Preserve journal events and root-level report/output ownership for the folder.
-                    for table in ('entries','names','artifacts','partials','partial_ownership','pending_publications','duplicate_candidates','baseline','changes','verification_cache','scan_errors'):
+                    for table in ('entries','names','artifacts','partials','partial_ownership','pending_publications','duplicate_candidates','baseline','changes','verification_cache','scan_errors','scan_pages','skipped_sources'):
                         db.execute('DELETE FROM '+table+' WHERE job=?', (job_id,))
                     db.execute('DELETE FROM jobs WHERE id=?', (job_id,))
                     self.engine.controls.pop(job_id,None); self.engine.threads.pop(job_id,None)

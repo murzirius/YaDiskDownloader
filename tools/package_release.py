@@ -8,7 +8,7 @@ from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[1]
 VERSION=re.search(r'__version__\s*=\s*"([0-9.]+)"',(ROOT/'disk_downloader/__init__.py').read_text(encoding='utf-8')).group(1)
-ROOT_FILES=('README.md','LICENSE','.gitignore','run.py','build_windows.py','windows.manifest','start.cmd','start.ps1','START-CMD.txt','requirements.txt','requirements-dev.txt','requirements-build.txt','requirements-bootstrap.txt')
+ROOT_FILES=('pyproject.toml','start.sh','start.command','yadisk.cmd','build_posix.py','run_cli.py','README.md','LICENSE','.gitignore','run.py','build_windows.py','windows.manifest','start.cmd','start.ps1','START-CMD.txt','requirements.txt','requirements-dev.txt','requirements-build.txt','requirements-bootstrap.txt')
 
 
 def source_files():
@@ -18,7 +18,7 @@ def source_files():
     for name in ('disk_downloader','docs','tests','tools','.github'):
         for file in sorted((ROOT/name).rglob('*')):
             if not file.is_file() or file.is_symlink() or any(p in ('__pycache__','.pytest_cache','.venv','.state') for p in file.relative_to(ROOT).parts): continue
-            if file.suffix.lower() not in ('.py','.js','.cjs','.css','.html','.md','.txt','.yml','.yaml'): continue
+            if file.suffix.lower() not in ('.py','.js','.cjs','.css','.html','.md','.txt','.yml','.yaml','.svg'): continue
             yield file
 
 
@@ -32,7 +32,7 @@ def package(output, executable=None):
     with zipfile.ZipFile(cmd,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as archive:
         for file in source_files():
             relative=file.relative_to(ROOT)
-            if relative.parts[0]=='disk_downloader' or relative.as_posix() in ('README.md','LICENSE','run.py','start.cmd','start.ps1','START-CMD.txt','requirements.txt','requirements-bootstrap.txt','docs/usage.md'):
+            if relative.parts[0]=='disk_downloader' or relative.as_posix() in ('README.md','LICENSE','run.py','start.cmd','start.ps1','START-CMD.txt','requirements.txt','requirements-bootstrap.txt','yadisk.cmd','pyproject.toml','docs/usage.md','docs/cli.md','docs/features-v1.5.0.md','docs/validation-v1.5.0.md','docs/architecture.md','docs/testing.md'):
                 archive.write(file,'YaDiskDownloader-CMD/'+relative.as_posix())
     files.append(cmd)
     if executable:
@@ -41,7 +41,11 @@ def package(output, executable=None):
         windows=output/f'YaDiskDownloader-v{VERSION}-Windows-x64.zip'
         with zipfile.ZipFile(windows,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as archive:
             archive.write(executable,'YaDiskDownloader/YaDiskDownloader.exe')
-            for name in ('README.md','LICENSE','docs/usage.md','docs/features-v1.3.0.md','docs/architecture.md','docs/testing.md',f'docs/release-v{VERSION}.md'):
+            cli=executable.with_name('YaDiskDownloader-CLI.exe')
+            if cli.is_file():
+                archive.write(cli,'YaDiskDownloader/YaDiskDownloader-CLI.exe')
+                archive.write(ROOT/'yadisk.cmd','YaDiskDownloader/yadisk.cmd')
+            for name in ('README.md','LICENSE','docs/usage.md','docs/features-v1.3.0.md','docs/cli.md','docs/features-v1.5.0.md','docs/validation-v1.5.0.md','docs/architecture.md','docs/testing.md',f'docs/release-v{VERSION}.md'):
                 archive.write(ROOT/name,'YaDiskDownloader/'+name)
             archive.write(executable.parent/'THIRD_PARTY_NOTICES.txt','YaDiskDownloader/THIRD_PARTY_NOTICES.txt')
             archive.write(source,'YaDiskDownloader/source/'+source.name)

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yadisk-downloader"
+dynamic = ["version", "dependencies"]
+description = "Local Yandex Disk downloader with browser and terminal controls"
+requires-python = ">=3.11"
+license = "MIT"
+
+[project.scripts]
+yadisk = "disk_downloader.cli:main"
+
+[tool.setuptools]
+packages = ["disk_downloader"]
+py-modules = ["run"]
+
+[tool.setuptools.dynamic]
+version = {attr = "disk_downloader.__version__"}
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools.package-data]
+disk_downloader = ["static/*", "templates/*"]

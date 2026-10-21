@@ -27,4 +27,5 @@ def preview_type(meta):
 
 
 def selected_type(meta, settings):
-    return file_type(meta) in settings.get("file_types", FILE_TYPES)
+    from .selection_rules import included
+    return file_type(meta) in settings.get("file_types", FILE_TYPES) and included(meta,settings)

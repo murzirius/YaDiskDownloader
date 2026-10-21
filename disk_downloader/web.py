@@ -10,6 +10,7 @@ from pathlib import Path
 
 from flask import Flask, abort, jsonify, render_template, request, send_file, session
 from PIL import Image
+from .image_security import PREVIEW_FORMATS
 from werkzeug.exceptions import HTTPException
 
 from .api import APIError, Credentials, Deadline, DiskAPI, SIZES, Suspended, validate_resource
@@ -34,6 +35,7 @@ from .limits import normalize_saved_workers
 from .folder_dialog import FolderPicker
 from .import_state import find_import
 from .request_errors import RequestErrors
+from .platform_actions import open_path
 from .insights import DestinationChecks, download_plan, files as job_files, problems as job_problems
 
 
@@ -43,6 +45,8 @@ def create_app(state_dir=None, api=None, port=8766):
     app.config.update(MAX_CONTENT_LENGTH=1024 * 1024, SESSION_COOKIE_NAME=f"disk_downloader_{port}", SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Strict", SEND_FILE_MAX_AGE_DEFAULT=0)
     state = Path(state_dir or state_folder())
     store = Store(state / "jobs.sqlite3")
+    from .single_instance import state_key
+    state_identity = state_key(state)
     recovery = Recovery(store)
     credentials = api.credentials if api else Credentials()
     api = api or DiskAPI(credentials)
@@ -65,6 +69,12 @@ def create_app(state_dir=None, api=None, port=8766):
     engine.request_errors = request_errors
     destination_checks = DestinationChecks(store)
     app.extensions['destination_checks'] = destination_checks
+    from .folder_stats import FolderStats
+    folder_stats = FolderStats(api)
+    app.extensions['folder_stats'] = folder_stats
+    from .doctor import Doctor
+    doctor = Doctor(engine)
+    app.extensions['doctor'] = doctor
     auth_lock = threading.Lock()
     instance_id = secrets.token_hex(8)
 
@@ -142,7 +152,7 @@ def create_app(state_dir=None, api=None, port=8766):
         from . import __build__
         from .desktop import status as desktop_status
         from .single_instance import state_key
-        return jsonify(application='YaDiskDownloader', state_key=state_key(state), sqlite=sqlite3.sqlite_version, safe_sqlite_wal=safe_wal(), version=__version__, build=__build__, frozen=frozen(), tray=tray.status() if tray else {"visible": False, "error": ""}, desktop=desktop_status(), can_exit=bool(app.extensions.get("quit_app")), migration=app.extensions.get("migration", {"jobs": 0, "failed_sources": 0}))
+        return jsonify(application='YaDiskDownloader', state_key=state_identity, sqlite=sqlite3.sqlite_version, safe_sqlite_wal=safe_wal(), version=__version__, build=__build__, frozen=frozen(), tray=tray.status() if tray else {"visible": False, "error": ""}, desktop=desktop_status(), can_exit=bool(app.extensions.get("quit_app")), migration=app.extensions.get("migration", {"jobs": 0, "failed_sources": 0}))
 
     @app.post('/api/activate')
     def activate_instance():
@@ -191,9 +201,28 @@ def create_app(state_dir=None, api=None, port=8766):
             owned = db.execute("SELECT sha256 FROM service_outputs WHERE root=? AND kind='changes' AND local=?",(root_key(job['root']),relative)).fetchone()
         if not owned or os.stat(filename).st_nlink != 1 or digest_file(filename) != owned['sha256']:
             raise ValueError('Файл отчёта заменён другим файлом')
-        if os.name == "nt":
-            os.startfile(filename, "open")
+        open_path(filename)
         return jsonify(path=str(Path(job["root"]) / relative))
+
+    @app.get('/api/doctor')
+    def doctor_status():
+        if doctor.snapshot()['checked_at'] is None and not doctor.snapshot()['busy']:
+            doctor.start()
+        return jsonify(doctor.snapshot())
+
+    @app.post('/api/doctor')
+    def doctor_start():
+        return jsonify(doctor.start())
+
+    @app.post('/api/jobs/<job_id>/refresh-source')
+    def refresh_source(job_id):
+        previous = store.job(job_id)
+        data = dict(previous['settings'], operation='missing', destination=previous['root'])
+        return jsonify(id=engine.create(data))
+
+    @app.post('/api/jobs/<job_id>/limits')
+    def change_live_limits(job_id):
+        return jsonify(engine.live_limits(job_id, payload()))
 
     @app.get("/api/updates")
     def update_status():
@@ -267,8 +296,7 @@ def create_app(state_dir=None, api=None, port=8766):
     def diagnostics(job_id):
         local = write_bundle(engine, job_id)
         job = store.job(job_id)
-        if os.name == "nt":
-            os.startfile(safe_join(job["root"], ""), "explore")
+        open_path(safe_join(job["root"], ""), folder=True)
         return jsonify(local=local)
 
     @app.get("/api/status")
@@ -425,12 +453,37 @@ def create_app(state_dir=None, api=None, port=8766):
             data = api.metadata(path, {"preview_size": "S", "attempts": 1, "timeout": 12, "total_timeout": 12}, offset=int(offset), limit=100, sort=sort)
         finally:
             browse_slots.release()
+        if data.get('type') != 'dir':
+            raise ValueError('Выбранный путь Яндекс.Диска не является папкой')
         embedded = data.get("_embedded", {})
         items = []
+        seen = set()
         for item in embedded.get("items", []):
             validate_resource(item)
+            from .paths import parent_path
+            if item['path']==path or parent_path(item['path'])!=path or item['path'] in seen:
+                raise APIError('Яндекс.Диск вернул повторный файл или файл из другой папки')
+            seen.add(item['path'])
             items.append({k: item.get(k) for k in ("path", "name", "type", "size", "modified", "mime_type")} | {"has_preview": preview_type(item) and bool(item.get("preview"))})
+        cached = folder_stats.snapshot([item['path'] for item in items])['items']
+        for item in items:
+            if item['type'] == 'dir':
+                item['folder_stats'] = cached.get(item['path'])
+                item['modified'] = (item['folder_stats'] or {}).get('latest_modified')
+                item['size'] = (item['folder_stats'] or {}).get('bytes')
         return jsonify(path=path, items=items, total=embedded.get("total"), offset=int(offset), next_offset=int(offset) + len(items), has_more=bool(items) and (embedded.get("total") is None or int(offset) + len(items) < embedded["total"]))
+
+    @app.get('/api/folder-stats')
+    def get_folder_stats():
+        return jsonify(folder_stats.snapshot())
+
+    @app.post('/api/folder-stats')
+    def start_folder_stats():
+        data = payload()
+        if data.get('action') == 'cancel':
+            folder_stats.cancel.set()
+            return jsonify(folder_stats.snapshot())
+        return jsonify(folder_stats.start(data.get('paths')))
 
     @app.get("/api/thumbnail")
     def thumbnail():
@@ -459,7 +512,7 @@ def create_app(state_dir=None, api=None, port=8766):
                 data.extend(chunk)
                 if len(data) > 16 * 1024 * 1024:
                     raise APIError("Превью слишком большое для миниатюры")
-            with Image.open(io.BytesIO(data)) as image:
+            with Image.open(io.BytesIO(data), formats=PREVIEW_FORMATS) as image:
                 if image.width * image.height > 16_000_000:
                     raise APIError("Превью слишком большое для миниатюры")
                 image.thumbnail((400, 400))
@@ -551,11 +604,17 @@ def create_app(state_dir=None, api=None, port=8766):
             import subprocess
             explorer=Path(os.environ.get('SystemRoot',r'C:\Windows'))/'explorer.exe'
             subprocess.Popen([str(explorer),'/select,'+str(filename)])
+        else:
+            open_path(Path(filename).parent,folder=True)
         return jsonify(ok=True)
 
     @app.get("/api/jobs/<job_id>")
     def job_status(job_id):
-        return jsonify(engine.status_cache.snapshot(store.job(job_id)) | auth_status())
+        result=engine.status_cache.snapshot(store.job(job_id)) | auth_status()
+        with store.db() as db:
+            queued=db.execute('SELECT state FROM job_queue WHERE job=?',(job_id,)).fetchone()
+        result['queue_state']=queued[0] if queued else None
+        return jsonify(result)
 
     @app.post('/api/jobs/<job_id>/refresh-usage')
     def refresh_folder_usage(job_id):
@@ -590,8 +649,7 @@ def create_app(state_dir=None, api=None, port=8766):
         if not job["zip_path"] or not os.path.isfile(safe_join(job["root"], job["zip_path"])):
             raise ValueError("ZIP ещё не готов")
         root = safe_join(job["root"], "")
-        if os.name == "nt":
-            os.startfile(root, "explore")
+        open_path(root, folder=True)
         return jsonify(path=job["root"], zip_path=job["zip_path"])
 
     @app.post("/api/jobs/<job_id>/open-folder")
@@ -600,8 +658,7 @@ def create_app(state_dir=None, api=None, port=8766):
         root = safe_join(job["root"], "")
         if not os.path.isdir(root):
             raise ValueError("Папка с результатами не найдена. Возможно, её перенесли или отключили диск. Подключите диск либо выберите новое расположение в режиме «Дозагрузить недостающее».")
-        if os.name == "nt":
-            os.startfile(root, "explore")
+        open_path(root, folder=True)
         return jsonify(path=job["root"])
 
     @app.post("/api/jobs/<job_id>/open-journal")
@@ -615,8 +672,7 @@ def create_app(state_dir=None, api=None, port=8766):
             owned = db.execute("SELECT sha256 FROM service_outputs WHERE root=? AND kind='journal' AND local=?",(root_key(job['root']),relative)).fetchone()
         if not owned or os.stat(filename).st_nlink != 1 or digest_file(filename) != owned['sha256']:
             raise ValueError('Файл журнала заменён другим файлом')
-        if os.name == "nt":
-            os.startfile(filename, "open")
+        open_path(filename)
         return jsonify(path=str(Path(job["root"]) / relative))
 
     @app.get("/api/jobs/<job_id>/zip")

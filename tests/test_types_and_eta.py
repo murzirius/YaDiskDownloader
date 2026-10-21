@@ -197,3 +197,8 @@ def test_job_eta_accounts_for_active_bytes_and_zero_after_completion(system):
     engine.store.update_job(job_id, phase="completed")
     engine.threads[job_id] = SimpleNamespace(is_alive=lambda: False)
     assert engine.status(job_id)["eta_seconds"] == 0
+
+
+@pytest.fixture(autouse=True)
+def short_scan_pages(monkeypatch):
+    monkeypatch.setattr('disk_downloader.scanner.PAGE_SIZE',200)

@@ -124,7 +124,7 @@ class Tray:
                         if version == previous_version:
                             continue
                         pref = db.execute("SELECT value FROM preferences WHERE key='notifications'").fetchone()
-                        rows = db.execute('SELECT id,phase,generation,pause_reason FROM jobs').fetchall()
+                        rows = db.execute('SELECT id,phase,generation,pause_reason,settings FROM jobs').fetchall()
                         previous_version = version
                         enabled = not pref or pref[0] == 'true'
                         current = {}
@@ -139,7 +139,12 @@ class Tray:
                             elif job['phase'] == 'completed_with_errors': text = 'Загрузка завершена с замечаниями. Проверьте результат в приложении.'
                             elif job['phase'] == 'paused' and job['pause_reason']: text = job['pause_reason']
                             elif job['phase'] == 'failed': text = 'Задание требует внимания. Откройте приложение через значок в трее.'
-                            if text: self.icon.notify(text, 'YaDiskDownloader')
+                            if text:
+                                import json
+                                from .work_policy import quiet
+                                settings=json.loads(job['settings'])
+                                if not (quiet(settings) and settings.get('quiet_hours',{}).get('mute',True)):
+                                    self.icon.notify(text, 'YaDiskDownloader')
                         self.seen = current
                         first = False
             except Exception:

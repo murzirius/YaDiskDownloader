@@ -13,7 +13,8 @@ from pathlib import Path
 from contextlib import contextmanager
 
 import requests
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
+from .image_security import PREVIEW_FORMATS
 
 from .api import APIError, Deadline, NetworkError, PausedRequest, PREVIEW_MAX_BYTES, SIZES, Suspended, attempt_count, retry_delay, validate_resource
 from .import_state import backup_import, find_import, inherit, read_import, save_import
@@ -51,6 +52,10 @@ def file_hash(filename, checkpoint=lambda: None):
 
 
 def safe_error(exc):
+    if isinstance(exc, UnidentifiedImageError):
+        return 'Полученное превью не удалось прочитать как изображение. Яндекс.Диск мог вернуть неверные данные. Повторите загрузку файла.'
+    if isinstance(exc, Image.DecompressionBombError):
+        return 'Превью Яндекс.Диска превышает безопасный размер изображения. Этот вариант не сохранён; попробуйте загрузить оригинал.'
     if isinstance(exc, NetworkError):
         detail = str(exc)
         if detail == "Сетевая ошибка или таймаут":
@@ -118,6 +123,8 @@ class Control:
         return not getattr(self,'local_only',False) and getattr(self,'operation','download') not in ('pack','manifest','journal') and getattr(self,'phase','') != 'packing'
 
     def check(self):
+        if getattr(self, 'policy', None):
+            self.policy.check()
         if self.space_check and not self.paused:
             self.space_check()
         with self.condition:
@@ -175,6 +182,8 @@ class Control:
     def stop(self):
         with self.condition:
             self.stopped = True
+            self.paused = False
+            self.pause_reason = ''
             self.condition.notify_all()
         self.network.abort_requests()
 
@@ -191,7 +200,7 @@ class Control:
             verification = dict(self.verification) if self.verification and getattr(self,'phase','preparing')=='preparing' else None
             if verification:
                 verification['eta_seconds'] = self.verification_time.estimate(verification['checked'], verification['total'])
-            return {"active": list(self.active.values()), "speed": self.transferred / max(0.1, elapsed), 'verification':verification, 'health':self.health()}
+            return {"active": list(self.active.values()), "transferred": self.transferred, "speed": self.transferred / max(0.1, elapsed), 'verification':verification, 'health':self.health()}
 
     def active_clock(self):
         with self.condition:
@@ -257,7 +266,7 @@ class Engine:
             raise ValueError('Выберите быструю или полную проверку скачанных файлов.')
         values['verification_mode'] = verification_mode
         values["retries"] = values["attempts"] - 1
-        for name, default in (("create_zip", True), ("auto_pause", True), ("resume_parts", True), ("adaptive_workers", False), ("deduplicate", False)):
+        for name, default in (("create_zip", True), ("auto_pause", True), ("resume_parts", True), ("adaptive_workers", False), ("deduplicate", False), ("prevent_sleep", False)):
             value = data.get(name, default)
             if not isinstance(value, bool):
                 raise ValueError("Некорректная настройка " + name)
@@ -269,6 +278,10 @@ class Engine:
         values["max_disk_percent"] = fullness
         values["exclusions"] = exclusions.validate(data.get("exclusions", []))
         values["speed_limit_mib"] = rate_limit.validate(data.get("speed_limit_mib", 0))
+        from .selection_rules import validate as selection_settings
+        values.update(selection_settings(data))
+        from .work_policy import validate as policy_settings
+        values.update(policy_settings(data))
         return {"mode": mode, "preview_size": size, "reports": sorted(set(reports)), "file_types": sorted(set(file_types)),
                 "paths": normalize_selection(paths, data.get("whole_disk", False)), "whole_disk": data.get("whole_disk", False),
                 "destination": destination, "operation": operation, **values}
@@ -416,10 +429,10 @@ class Engine:
                 if live and live.is_alive():
                     control.stop()
                     with self.store.db() as db:
-                        db.execute("UPDATE jobs SET phase='stopping' WHERE id=? AND phase IN ('new','scanning','preparing','downloading','packing','paused')", (job_id,))
+                        db.execute("UPDATE jobs SET phase='stopping',pause_reason='' WHERE id=? AND phase IN ('new','scanning','preparing','downloading','packing','paused')", (job_id,))
                     control.event("system", "Запрошена остановка задания", level="warning")
                 else:
-                    self.store.update_job(job_id, phase="stopped", ended=now())
+                    self.store.update_job(job_id, phase="stopped", ended=now(), pause_reason="")
                     with self.store.db() as db:
                         db.execute("UPDATE entries SET status='cancelled' WHERE job=? AND kind='file' AND status IN ('pending','running')", (job_id,))
                     if control and control.journal:
@@ -541,6 +554,9 @@ class Engine:
         if not live or control and control.paused:
             status["speed"] = 0
         finishing = status["phase"] in ("completed", "completed_with_errors", "stopped", "failed", "ready")
+        if live and control and control.stopped and status['phase']=='stopped':
+            status['phase'] = 'stopping'
+            finishing = False
         if live and control and not finishing:
             if control.stopped:
                 status["phase"] = "stopping"
@@ -707,7 +723,11 @@ class Engine:
 
     def run(self, job_id, operation, control):
         try:
-            with self.store.activity():
+            from .power import SleepGuard
+            from .work_policy import Policy
+            settings = self.store.job(job_id)['settings']
+            control.policy = Policy(settings, control)
+            with self.store.activity(), SleepGuard(control, settings.get('prevent_sleep',False)):
                 self._run(job_id, operation, control)
         except Exception as exc:
             # Includes failures opening the activity connection / final journal.
@@ -850,45 +870,8 @@ class Engine:
                 with self.store.db() as db:
                     db.execute("INSERT OR REPLACE INTO scan_errors VALUES(?,?,?)", (job_id, path, safe_error(exc)))
                 control.event("errors", "Не удалось прочитать источник: " + safe_error(exc), path, "error")
-        while True:
-            control.check()
-            with self.store.db() as db:
-                directory = db.execute("SELECT path,scan_offset FROM entries WHERE job=? AND kind='dir' AND scanned=0 ORDER BY path LIMIT 1", (job_id,)).fetchone()
-            if not directory:
-                break
-            path, offset = directory
-            control.progress(path, offset, None, "Обход папки", unit="objects")
-            try:
-                meta = self.api.metadata(path, settings, control.check, offset=offset, limit=200)
-                embedded = meta.get("_embedded")
-                if not isinstance(embedded, dict) or not isinstance(embedded.get("items"), list):
-                    raise APIError("API не вернул содержимое папки")
-                items = embedded["items"]
-                total = embedded.get("total")
-                if total is not None and (isinstance(total, bool) or not isinstance(total, int) or total < 0):
-                    raise APIError("API вернул некорректное число объектов папки")
-                if not items and total is not None and offset < total:
-                    raise APIError("Пустая страница до окончания списка API")
-                with self.store.db() as db:
-                    for item in items:
-                        validate_resource(item)
-                        child = remote_path(item.get("path", ""))
-                        if parent_path(child) != path or item.get("type") not in ("file", "dir"):
-                            raise APIError("API вернул недопустимый дочерний путь")
-                        self.store.insert_entry(db, job_id, item, settings)
-                    next_offset = offset + len(items)
-                    total = embedded.get("total")
-                    done = not items or (isinstance(total, int) and next_offset >= total)
-                    db.execute("UPDATE entries SET scan_offset=?,scanned=? WHERE job=? AND path=?", (next_offset, int(done), job_id, path))
-                    db.execute("DELETE FROM scan_errors WHERE job=? AND path=?", (job_id, path))
-                control.event("scan", f"Получена страница папки: {len(items)} объектов; просмотрено {next_offset}" + (" · обход папки завершён" if done else ""), path)
-            except (APIError, PathError) as exc:
-                if isinstance(exc, APIError) and exc.status == 401:
-                    raise Suspended(str(exc))
-                with self.store.db() as db:
-                    db.execute("INSERT OR REPLACE INTO scan_errors VALUES(?,?,?)", (job_id, path, safe_error(exc)))
-                    db.execute("UPDATE entries SET scanned=1 WHERE job=? AND path=?", (job_id, path))
-                control.event("errors", "Ошибка обхода папки: " + safe_error(exc), path, "error")
+        from .scanner import scan_pages
+        scan_pages(self, job_id, settings, control)
         with control.lock:
             control.active.clear()
         self.store.update_job(job_id, scan_complete=1)
@@ -945,17 +928,19 @@ class Engine:
                             if source in cache:
                                 relative = cache[source]
                                 continue
-                            existing = db.execute("SELECT local FROM names WHERE job=? AND identity=?", (job_id, source)).fetchone()
-                            if existing:
-                                relative = existing[0]
-                            else:
-                                proposed = (relative + "/" if relative else "") + component(part, source)
-                                relative, counter = proposed, 0
-                                while db.execute("SELECT 1 FROM names WHERE job=? AND folded=?", (job_id, relative.casefold())).fetchone():
-                                    counter += 1
-                                    parent, _, name = proposed.rpartition("/")
-                                    relative = (parent + "/" if parent else "") + suffix(name, digest(source + str(counter)))
-                                db.execute("INSERT INTO names VALUES(?,?,?,?)", (job_id, source, relative, relative.casefold()))
+                            proposed = (relative + "/" if relative else "") + component(part, source)
+                            relative, counter = proposed, 0
+                            while True:
+                                inserted = db.execute("INSERT OR IGNORE INTO names VALUES(?,?,?,?)", (job_id, source, relative, relative.casefold())).rowcount
+                                if inserted:
+                                    break
+                                existing = db.execute("SELECT local FROM names WHERE job=? AND identity=?", (job_id, source)).fetchone()
+                                if existing:
+                                    relative = existing[0]
+                                    break
+                                counter += 1
+                                parent, _, name = proposed.rpartition("/")
+                                relative = (parent + "/" if parent else "") + suffix(name, digest(source + str(counter)))
                             if len(cache) > 8192:
                                 cache = {"disk:/": ""}
                             cache[source] = relative
@@ -980,10 +965,39 @@ class Engine:
             with control.lock:
                 control.active.clear()
 
+    def live_limits(self, job_id, data):
+        with self.lock:
+            if not isinstance(data, dict) or not data or set(data)-{'workers','speed_limit_mib'}:
+                raise ValueError('На ходу можно менять только потоки и скорость')
+            job = self.store.job(job_id)
+            updated = self.validate_settings(job['settings'] | data)
+            job['settings'].update({key:updated[key] for key in data})
+            self.store.update_job(job_id, settings=json.dumps(job['settings'],ensure_ascii=False))
+            control = self.controls.get(job_id)
+            if control:
+                with control.lock:
+                    control.workers = updated['workers']
+                control.rate_limiter.configure(updated['speed_limit_mib'])
+                if getattr(control,'policy',None):control.policy.settings['speed_limit_mib']=updated['speed_limit_mib']
+                control.event('system','Изменены потоки и ограничение скорости')
+            return {'workers':updated['workers'],'speed_limit_mib':updated['speed_limit_mib']}
+
     def download(self, job_id, control):
         workers = self.store.job(job_id)["settings"]["workers"]
         first_stage_work = False
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="disk-download") as pool:
+        priorities = self.store.job(job_id)['settings'].get('priority_paths',[])
+        for path in priorities:
+            prefix=path.rstrip('/')+'/'
+            cursor=''
+            while True:
+                control.check()
+                with self.store.db() as db:
+                    rows=db.execute("SELECT path,user_priority FROM entries WHERE job=? AND kind='file' AND path>=? AND path<? AND path>? AND (path=? OR path>=?) ORDER BY path LIMIT 1000",(job_id,path,prefix[:-1]+'0',cursor,path,prefix)).fetchall()
+                    if not rows:break
+                    db.executemany('UPDATE entries SET user_priority=0 WHERE job=? AND path=?',((job_id,row['path']) for row in rows if row['user_priority']!=0))
+                cursor=rows[-1]['path']
+        control.workers = workers
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="disk-download") as pool:
             for stage in range(2):
                 if stage and first_stage_work:
                     with control.lock:
@@ -999,10 +1013,10 @@ class Engine:
                 active = set()
                 while True:
                     control.check()
-                    capacity = (control.adaptive.limit() if control.adaptive else workers) - len(active)
+                    capacity = (control.adaptive.limit() if control.adaptive else control.workers) - len(active)
                     if capacity > 0:
                         with self.store.db() as db:
-                            entries = db.execute("SELECT * FROM entries WHERE job=? AND kind='file' AND status='pending'" + condition + " ORDER BY priority,path LIMIT ?", (*parameters, capacity)).fetchall()
+                            entries = db.execute("SELECT * FROM entries WHERE job=? AND kind='file' AND status='pending'" + condition + " ORDER BY priority,user_priority,path LIMIT ?", (*parameters, capacity)).fetchall()
                             db.executemany("UPDATE entries SET status='running' WHERE job=? AND path=?", ((job_id, entry['path']) for entry in entries))
                         for entry in entries:
                             if not stage:
@@ -1291,13 +1305,13 @@ class Engine:
                 else:
                     valid = cached or file_hash(filename, hash_checkpoint) == artifact["sha256"]
                 if valid and not cached and kind == "preview":
-                    with Image.open(filename) as image:
+                    with Image.open(filename, formats=PREVIEW_FORMATS) as image:
                         if image.width * image.height > 16_000_000:
                             valid = False
                         else:
                             image.verify()
                     if valid:
-                        with Image.open(filename) as image:
+                        with Image.open(filename, formats=PREVIEW_FORMATS) as image:
                             image.load()
                 valid = valid and signature == file_signature(filename, artifact["sha256"])
                 if valid and not cached and signature[-1] is not None:
@@ -1583,13 +1597,13 @@ class Engine:
                         proposed = entry["local"]
                     else:
                         keep = False
-                        with Image.open(temp) as image:
+                        with Image.open(temp, formats=PREVIEW_FORMATS) as image:
                             fmt = image.format
                             if image.width * image.height > 16_000_000:
                                 keep = False
                                 raise APIError("Превью превышает безопасный размер изображения")
                             image.verify()
-                        with Image.open(temp) as image:
+                        with Image.open(temp, formats=PREVIEW_FORMATS) as image:
                             image.load()
                         extensions = {"JPEG": "jpg", "PNG": "png", "GIF": "gif", "WEBP": "webp", "BMP": "bmp", "TIFF": "tif", "AVIF": "avif"}
                         if fmt not in extensions:
