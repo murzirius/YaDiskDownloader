@@ -43,6 +43,7 @@ def main():
     args = parser.parse_args()
     if sys.platform != 'darwin':
         parser.error('Run this check on macOS')
+    import fcntl
     dmg = args.dmg.resolve(strict=True)
     with tempfile.TemporaryDirectory(prefix='yadisk-macos-installer-') as folder:
         root = Path(folder)
@@ -87,11 +88,14 @@ def main():
             assert launcher.returncode == 0
             with socket.socket() as probe:
                 assert probe.connect_ex(('127.0.0.1', port)) != 0, 'Quit left the local server running'
+            with (state / 'server.lock').open('r+b') as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
             result = {'actual_app': True, 'actual_dmg': True, 'version': runtime['version'],
                       'readonly_mount': True, 'drag_install_equivalent': True, 'after_image_eject': True,
                       'signature_verified': True, 'hi_dpi_icon': True, 'finder_launch': True,
                       'browser_resources': True, 'packaged_cli': True, 'cocoa_quit': True,
-                      'server_fully_stopped': True, 'apple_notarized': False}
+                      'server_fully_stopped': True, 'state_lock_released': True, 'apple_notarized': False}
             args.output.write_text(json.dumps(result, indent=2), encoding='utf-8')
             print(json.dumps(result))
         finally:

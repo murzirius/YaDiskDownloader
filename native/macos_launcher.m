@@ -1,5 +1,8 @@
 #import <Cocoa/Cocoa.h>
 #include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -10,6 +13,7 @@
 @property(nonatomic, strong) NSButton *openButton;
 @property(nonatomic, strong) NSButton *retryButton;
 @property(nonatomic, copy) NSArray<NSString *> *options;
+@property(nonatomic, copy) NSString *statePath;
 @property(nonatomic) NSUInteger port;
 @property(nonatomic) BOOL noBrowser;
 @property(nonatomic) BOOL starting;
@@ -21,6 +25,7 @@
 @implementation DiskLauncher
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     self.port = 8766;
+    self.statePath = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/YaDiskDownloader"];
     NSMutableArray *options = [NSMutableArray array];
     NSArray *arguments = NSProcessInfo.processInfo.arguments;
     for (NSUInteger index = 1; index < arguments.count; index++) {
@@ -37,6 +42,7 @@
                 }
                 self.port = (NSUInteger)number;
             }
+            else self.statePath = value.stringByStandardizingPath;
             [options addObjectsFromArray:@[argument, value]];
         }
     }
@@ -190,6 +196,19 @@
     return connected;
 }
 
+- (BOOL)serverHasStopped {
+    if ([self portIsOpen]) return NO;
+    // Closing HTTP precedes the final file/SQLite checkpoints. Wait for the
+    // process's existing state lock too; never create or truncate this file.
+    NSString *lock = [self.statePath stringByAppendingPathComponent:@"server.lock"];
+    int fd = open(lock.fileSystemRepresentation, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return errno == ENOENT;
+    BOOL available = flock(fd, LOCK_EX | LOCK_NB) == 0;
+    if (available) flock(fd, LOCK_UN);
+    close(fd);
+    return available;
+}
+
 - (void)stopAndTerminate {
     self.stopping = YES;
     self.openButton.enabled = NO;
@@ -200,8 +219,8 @@
     [self runCommand:@"stop" completion:^(int status, NSString *text) {
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
             NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:35];
-            while ([self portIsOpen] && deadline.timeIntervalSinceNow > 0) [NSThread sleepForTimeInterval:0.2];
-            BOOL stopped = ![self portIsOpen];
+            while (![self serverHasStopped] && deadline.timeIntervalSinceNow > 0) [NSThread sleepForTimeInterval:0.2];
+            BOOL stopped = [self serverHasStopped];
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (stopped) { [NSApp replyToApplicationShouldTerminate:YES]; return; }
                 self.stopping = NO;
