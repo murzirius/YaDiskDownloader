@@ -115,6 +115,11 @@ def test_auto_start_runs_scan_download_and_reports_without_extra_action(system):
 
 
 def test_hard_floor_cannot_be_disabled_and_resume_requires_cleaned_space(system, monkeypatch):
+    from types import SimpleNamespace
+    from disk_downloader import destination
+    # Windows/Python 3.11 can give consecutive probes the same clock tick.
+    # Fresh free-space values must be recognized independently of timestamps.
+    monkeypatch.setattr(destination, 'time', SimpleNamespace(monotonic=lambda: 100.0))
     engine, api, root = system
     populate(api, 1)
     sample = shutil.disk_usage(root)

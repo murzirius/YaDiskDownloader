@@ -707,9 +707,9 @@ class Engine:
             control.next_space_check = time.monotonic() + 0.5
             job = self.store.job(job_id)
             if control.destination:
-                checked = control.destination.checked
+                generation = control.destination.generation
                 usage, error = control.destination.check(lambda: control.stopped, force=refresh or floor_check)
-                fresh_usage = checked != control.destination.checked
+                fresh_usage = generation != control.destination.generation
                 if control.stopped:
                     raise Suspended('Задание остановлено')
                 if error or usage is None:

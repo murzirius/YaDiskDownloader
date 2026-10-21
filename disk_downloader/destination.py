@@ -24,6 +24,8 @@ class DestinationGuard:
         self.condition = threading.Condition()
         self.running = False
         self.checked = None
+        # Consecutive completed probes can share a coarse system clock tick.
+        self.generation = 0
         self.value = None
         self.identity = None
         self.error = ''
@@ -52,6 +54,7 @@ class DestinationGuard:
                 self.slots.release()
                 self.value, self.error = value, error
                 self.checked = time.monotonic()
+                self.generation += 1
                 self.running = False
                 self.condition.notify_all()
 
