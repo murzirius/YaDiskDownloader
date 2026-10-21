@@ -159,3 +159,23 @@ rows.length=0;job.active[0].size=null;renderJobCounters(job);
 assert.equal(rows[0][1],'Готовим проверку…');
 """
     subprocess.run([node,'-e',fixture+function+assertions],check=True,timeout=10)
+
+
+@pytest.mark.skipif(__import__('os').name!='nt',reason='Windows device path URI encoding')
+def test_portable_inventory_uses_sqlite_uri_compatible_with_python_311(system,monkeypatch):
+    from urllib.parse import quote_from_bytes
+    from disk_downloader.import_state import read_import
+    engine,api,_=system
+    api.file('disk:/kept.bin',b'kept',preview=False)
+    first=run_job(system,mode='fallback')
+    manifest=engine.store.job(first['id'])['settings']['manifest_local']
+    def legacy_uri(path):
+        # CPython 3.11 pathlib._WindowsFlavour.make_uri semantics.
+        drive=path.drive
+        if len(drive)==2 and drive[1]==':':
+            return 'file:///%s/%s'%(drive,quote_from_bytes(path.as_posix()[2:].lstrip('/').encode('utf-8')))
+        return 'file:'+quote_from_bytes(path.as_posix().encode('utf-8'))
+    monkeypatch.setattr(Path,'as_uri',legacy_uri)
+    previous=read_import(first['root'],manifest)
+    assert previous['inventory_available']
+    assert previous['job']['settings']['paths']==['disk:/']

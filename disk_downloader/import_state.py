@@ -42,7 +42,11 @@ def find_import(store, root, exclude_job=None):
 
 def read_import(root, local):
     """Open the exact portable inventory selected when this job was created."""
-    filename = Path(safe_join(root, local))
+    # Keep the validated, ordinary path for URI encoding on Python 3.11.
+    # safe_join returns a Windows device path whose URI authority is rejected
+    # by SQLite on that runtime. Path validation still happens before opening.
+    safe_join(root, local)
+    filename = Path(root) / local
     with closing(sqlite3.connect(filename.resolve().as_uri() + '?mode=ro', uri=True)) as db:
         meta = dict(db.execute('SELECT key,value FROM import_meta'))
         if meta.get('format') != FORMAT:
