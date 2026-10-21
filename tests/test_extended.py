@@ -192,7 +192,11 @@ def test_issue_draft_never_includes_local_paths_or_token_automatically(system):
 def test_frozen_data_folder_is_outside_bundle(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
-    assert state_folder() == tmp_path / "local" / "YaDiskDownloader"
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    if sys.platform == 'win32':expected = tmp_path / 'local' / 'YaDiskDownloader'
+    elif sys.platform == 'darwin':expected = Path.home() / 'Library' / 'Application Support' / 'YaDiskDownloader'
+    else:expected = tmp_path / 'state' / 'YaDiskDownloader'
+    assert state_folder() == expected
     assert "_MEI" not in str(destination_folder())
 
 
