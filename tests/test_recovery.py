@@ -45,7 +45,7 @@ def test_scanning_has_no_percentage_and_resumes_page_offset(system, monkeypatch)
     # A later page may have been prefetched before stop, but was not committed
     # ahead of the blocked page. Restart must reread it and retain page zero.
     offsets = [offset for path, offset, limit in api.metadata_calls[before_restart:] if limit == 200]
-    assert offsets == [200, 400]
+    assert sorted(offsets) == [200, 400]
     assert sum(offset == 0 for path,offset,limit in api.metadata_calls if limit == 200) == 1
 
 

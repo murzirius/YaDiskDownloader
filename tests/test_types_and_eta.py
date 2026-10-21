@@ -65,7 +65,12 @@ def test_filter_does_not_stop_pagination(system):
     job_id = engine.create({"destination": str(tmp / "results"), "whole_disk": True, "file_types": ["music"]})
     job = wait_job(engine, job_id)
     assert job["files"] == 553
-    assert [offset for path, offset, limit in api.metadata_calls if path == "disk:/nested" and limit == 200] == [0, 200, 400, 600, 800, 1000]
+    # Parallel requests may reach the server in any order. Every page must
+    # still be fetched exactly once, and filtering must retain every match.
+    assert sorted(offset for path, offset, limit in api.metadata_calls if path == "disk:/nested" and limit == 200) == [0, 200, 400, 600, 800, 1000]
+    assert {row["path"] for row in engine.store.rows("SELECT path FROM entries WHERE job=? AND kind='file'", (job_id,))} == {
+        f"disk:/nested/{index:04}.bin" for index in range(1, 1107, 2)
+    }
     assert job["estimate"]["known_bytes"] == 553 * len(b"original")
 
 
