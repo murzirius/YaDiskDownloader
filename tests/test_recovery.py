@@ -37,12 +37,16 @@ def test_scanning_has_no_percentage_and_resumes_page_offset(system, monkeypatch)
     engine.action(job_id, "stop")
     wait_job(engine, job_id)
     blocked = False
+    before_restart = len(api.metadata_calls)
     restored = Engine(Store(tmp / "state" / "jobs.sqlite3"), api)
     restored.launch(job_id, "scan")
     ready = wait_job(restored, job_id)
     assert ready["phase"] == "ready" and ready["files"] == 457
-    offsets = [offset for path, offset, limit in api.metadata_calls if limit == 200]
-    assert offsets == [0, 200, 400]
+    # A later page may have been prefetched before stop, but was not committed
+    # ahead of the blocked page. Restart must reread it and retain page zero.
+    offsets = [offset for path, offset, limit in api.metadata_calls[before_restart:] if limit == 200]
+    assert offsets == [200, 400]
+    assert sum(offset == 0 for path,offset,limit in api.metadata_calls if limit == 200) == 1
 
 
 def test_pagination_without_total_ends_only_on_empty_page(system, monkeypatch):

@@ -32,6 +32,7 @@ from .limits import MAX_WORKERS
 from .status_cache import StatusCache
 from .destination import DestinationGuard, StorageRetry
 from .sqlite_support import error_details
+from .space_budget import HARD_FREE_BYTES, RESUME_FREE_BYTES, may_finish
 
 
 def now():
@@ -97,7 +98,11 @@ class Control:
         self.network = NetworkWait(self.event, clock=self.active_clock)
         self.remaining_time = RemainingTime(self.statistics_clock)
         self.space_check = None
-        self.space_lock = threading.Lock()
+        self.space_lock = threading.RLock()
+        self.space_draining = False
+        self.floor_latched = False
+        self.transfer_sizes = {}
+        self.free_credit = None
         self.next_space_check = 0
         self.pause_reason = ""
         self.adaptive = None
@@ -140,6 +145,14 @@ class Control:
                 self.check()
                 return True
         return False
+
+    def before_write(self, size):
+        # Charge writes between bounded OS probes so a fast local SSD cannot
+        # spend the last free space during the half-second probe interval.
+        with self.space_lock:
+            if self.free_credit is not None:
+                self.free_credit -= size
+        self.check()
 
     def health(self):
         if self.finished is not None:return {'warning':'','seconds_without_progress':0}
@@ -266,7 +279,7 @@ class Engine:
             raise ValueError('Выберите быструю или полную проверку скачанных файлов.')
         values['verification_mode'] = verification_mode
         values["retries"] = values["attempts"] - 1
-        for name, default in (("create_zip", True), ("auto_pause", True), ("resume_parts", True), ("adaptive_workers", False), ("deduplicate", False), ("prevent_sleep", False)):
+        for name, default in (("create_zip", True), ("auto_pause", True), ("resume_parts", True), ("adaptive_workers", False), ("deduplicate", False), ("prevent_sleep", False), ("auto_start", False)):
             value = data.get(name, default)
             if not isinstance(value, bool):
                 raise ValueError("Некорректная настройка " + name)
@@ -316,6 +329,20 @@ class Engine:
                 data["paths"] = previous["job"]["settings"]["paths"]
                 data["whole_disk"] = previous["job"]["settings"].get("whole_disk", False)
         settings = self.validate_settings(data)
+        # The same unfinished job already owns a durable page cursor. Reuse it
+        # when the selected folder and scan filters match, rather than importing
+        # its files into a fresh job and restarting the cloud walk at zero.
+        if (previous and previous.get('store') is self.store and not previous['job']['scan_complete'] and not previous['job'].get('archived')
+                and os.path.normcase(os.path.abspath(previous['job']['root'])) == os.path.normcase(os.path.abspath(settings['destination']))):
+            keys = ('paths','whole_disk','file_types','exclusions','date_from','date_to','date_field','include_unknown_dates')
+            old = previous['job']['settings']
+            normalized = self.validate_settings(old)
+            if all(normalized.get(key) == settings.get(key) for key in keys):
+                resumed = previous['id']
+                preserved = {key:value for key,value in old.items() if key not in settings}
+                self.store.update_job(resumed,settings=json.dumps(preserved | settings,ensure_ascii=False))
+                self.launch(resumed,'download' if settings['auto_start'] else 'scan')
+                return resumed
         if previous:
             if sorted(previous['job']['settings'].get('paths',[])) != sorted(settings['paths']):
                 settings['destination_warning'] = 'Выбор исходных папок отличается от прежней загрузки в эту папку. Проверьте выбранные пути перед запуском. Прежние файлы останутся на месте.'
@@ -335,7 +362,7 @@ class Engine:
             db.execute("INSERT INTO names(job,identity,local,folded) VALUES(?,?,?,?)", (job_id, "@service", service, service.casefold()))
             db.execute("UPDATE jobs SET generation=? WHERE id=?", (generation, job_id))
         try:
-            self.launch(job_id, "scan")
+            self.launch(job_id, "download" if settings['auto_start'] else "scan")
         except Exception:
             with self.store.db() as db:
                 for table in ("entries", "names", "artifacts", "partials", "partial_ownership", "baseline", "changes", "verification_cache", "scan_errors", "journal_events", "journal_jobs"):
@@ -374,6 +401,8 @@ class Engine:
             control.space_check = lambda: self.check_space(job_id, control)
             control.storage_check = lambda: self.check_space(job_id, control, force=True)
             control.destination = DestinationGuard(job['root'])
+            control.floor_latched = job.get('pause_reason','').startswith('Мало места на устройстве:')
+            control.resume_snapshot = job['phase'] in ('stopped','interrupted','failed','paused','pausing','stopping') or not job['scan_complete']
             control.selected_paths = tuple(paths) if paths else None
             control.reuse_scanned = operation == "download" and not paths and (job["settings"].get("operation") == "missing" or job["phase"] in ("paused", "stopped", "interrupted", "failed") or job["generation"] > 0)
             if operation == 'download' and not paths:
@@ -671,13 +700,16 @@ class Engine:
         with control.space_lock:
             if control.stopped:raise Suspended('Задание остановлено')
             if control.paused and not force:return True
-            if not force and time.monotonic() < control.next_space_check:
-                return bool(control.pause_reason)
+            floor_check = control.free_credit is not None and control.free_credit < HARD_FREE_BYTES and (not control.space_draining or not control.transfer_sizes)
+            if not force and not floor_check and time.monotonic() < control.next_space_check:
+                return control.paused
             refresh = force or control.next_space_check == 0
             control.next_space_check = time.monotonic() + 0.5
             job = self.store.job(job_id)
             if control.destination:
-                usage, error = control.destination.check(lambda: control.stopped, force=refresh)
+                checked = control.destination.checked
+                usage, error = control.destination.check(lambda: control.stopped, force=refresh or floor_check)
+                fresh_usage = checked != control.destination.checked
                 if control.stopped:
                     raise Suspended('Задание остановлено')
                 if error or usage is None:
@@ -691,14 +723,37 @@ class Engine:
                     return True
             else:
                 usage = shutil.disk_usage(job['root'])
+                fresh_usage = True
             control.next_space_check = time.monotonic()+.5
+            if fresh_usage or control.free_credit is None:
+                control.free_credit = usage.free
+            free = min(usage.free, control.free_credit)
+            floor = RESUME_FREE_BYTES if control.floor_latched else HARD_FREE_BYTES
+            if free < floor:
+                if not control.floor_latched and getattr(control,'phase','') == 'downloading' and may_finish(control.transfer_sizes, free):
+                    if not control.space_draining:
+                        control.space_draining = True
+                        control.event('system','Осталось меньше 500 МБ. Новые файлы не начинаем: завершаем небольшие текущие загрузки, затем включим паузу.',level='warning')
+                    return False
+                reason = 'Мало места на устройстве: осталось меньше 500 МБ или ещё не восстановлен запас. Скачивание на паузе. Освободите не менее 1 ГиБ и нажмите «Продолжить».'
+                changed = control.pause_reason != reason
+                control.floor_latched = True
+                control.space_draining = False
+                control.pause_reason = reason
+                control.pause()
+                if changed:
+                    self.store.update_job(job_id,phase='paused',pause_reason=reason)
+                    control.event('system',reason,level='warning')
+                return True
+            control.space_draining = False
+            control.floor_latched = False
             if not job["settings"].get("auto_pause", True):
                 return False
             occupied = (usage.total - usage.free) * 100 / max(1, usage.total)
             threshold = job["settings"].get("max_disk_percent", 95)
-            if occupied >= threshold or usage.free < 8 * 1024 * 1024:
+            if occupied >= threshold:
                 reason = f"Автопауза: диск заполнен на {occupied:.1f}%, порог {threshold:g}%. Освободите место и нажмите «Продолжить»."
-                if not control.pause_reason:
+                if control.pause_reason != reason:
                     control.pause_reason = reason
                     control.pause()
                     self.store.update_job(job_id, phase="paused", pause_reason=reason)
@@ -808,6 +863,16 @@ class Engine:
                 save_import(self.store, job_id, control.check)
                 saved_scan = True
                 self.store.update_job(job_id, phase="ready")
+                return
+            from .work_policy import due
+            if job['settings'].get('auto_start') and not due(job['settings']):
+                save_import(self.store,job_id,control.check)
+                saved_scan = True
+                self.store.update_job(job_id,phase='ready')
+                enqueue = getattr(self,'enqueue_after_scan',None)
+                if enqueue:
+                    enqueue(job_id)
+                control.event('system','Проверка завершена. Загрузка ждёт выбранного времени запуска.')
                 return
             self.phase(job_id, control, "downloading")
             self.download(job_id, control)
@@ -1014,7 +1079,7 @@ class Engine:
                 while True:
                     control.check()
                     capacity = (control.adaptive.limit() if control.adaptive else control.workers) - len(active)
-                    if capacity > 0:
+                    if capacity > 0 and not control.space_draining:
                         with self.store.db() as db:
                             entries = db.execute("SELECT * FROM entries WHERE job=? AND kind='file' AND status='pending'" + condition + " ORDER BY priority,user_priority,path LIMIT ?", (*parameters, capacity)).fetchall()
                             db.executemany("UPDATE entries SET status='running' WHERE job=? AND path=?", ((job_id, entry['path']) for entry in entries))
@@ -1079,12 +1144,53 @@ class Engine:
         flush_candidates()
 
     def check_local_results(self, job, control):
-        with self.store.session():
+        control = control or Control()
+        # Only cached read-only probes run in parallel. Any changed, missing or
+        # uncached file falls back to the ordinary serial hash/repair path.
+        with self.store.session(), ThreadPoolExecutor(max_workers=4,thread_name_prefix='disk-verify') as probes:
             try:
+                control.available_probe_pool = probes if job['settings'].get('verification_mode','fast') != 'full' and not job['settings'].get('deduplicate') else None
+                control.cached_probe_pool = control.available_probe_pool if str(job['root']).startswith(('\\\\','//')) else None
+                control.cached_probe_costs = []
                 return self._check_local_results(job, control)
             finally:
                 if control:
                     control.verification_records = None
+                    control.cached_results = None
+                    control.cached_probe_pool = None
+                    control.available_probe_pool = None
+
+    def _probe_cached_copies(self, job, entry, records, control):
+        import stat
+        meta = json.loads(entry['meta'])
+        result = {}
+        for kind in ('original','preview'):
+            control.check()
+            if kind == 'preview' and result.get('original') and job['settings'].get('missing_policy') != 'both':
+                break
+            artifact = records.get((entry['path'],kind))
+            if not artifact or not artifact.get('signature'):
+                continue
+            try:
+                valid = artifact['fingerprint'] == fingerprint(meta)
+                if kind == 'preview':
+                    valid = valid and preview_type(meta) and artifact['size'] <= PREVIEW_MAX_BYTES and (artifact['preview_size'] == job['settings']['preview_size'] or job['settings'].get('missing_policy') == 'any_result')
+                elif meta.get('sha256'):
+                    valid = valid and artifact['sha256'].lower() == meta['sha256'].lower()
+                if not valid:
+                    continue
+                filename = safe_join(job['root'],artifact['local'])
+                signature = file_signature(filename,artifact['sha256'])
+                if signature[-1] is None or signature[2] != artifact['size'] or artifact['signature'] != json.dumps(signature) or not stat.S_ISREG(os.stat(filename).st_mode):
+                    continue
+                control.check()
+                if file_signature(filename,artifact['sha256']) == signature:
+                    result[kind] = True
+            except (OSError,ValueError):
+                # Destination failures and changed content are handled by the
+                # owner thread, preserving its pause and invalidation rules.
+                continue
+        return result
 
     def _check_local_results(self, job, control):
         """Finish local verification before any download workers are started."""
@@ -1121,8 +1227,22 @@ class Engine:
             with self.store.db() as db:
                 artifacts = db.execute('SELECT a.*,v.signature FROM artifacts a LEFT JOIN verification_cache v ON v.job=a.job AND v.local=a.local WHERE a.job=? AND a.path>=? AND a.path<=?'+(' AND a.path IN (SELECT path FROM run_selection WHERE run=?)' if selection else ''), (job_id,rows[0]['path'],rows[-1]['path'],*scope_args)).fetchall()
             control.verification_records = {(row['path'],row['type']):dict(row) for row in artifacts}
-            for row in rows:
+            probes = {}
+            pool = getattr(control,'cached_probe_pool',None)
+            for index, row in enumerate(rows):
                 control.check()
+                probe_started, cached_before = time.monotonic(), control.verification_cached
+                if pool:
+                    for upcoming in range(index,min(index+4,len(rows))):
+                        if upcoming not in probes:
+                            probes[upcoming] = pool.submit(self._probe_cached_copies,job,dict(rows[upcoming]),control.verification_records,control)
+                    future = probes.pop(index)
+                    while True:
+                        try:
+                            control.cached_results = future.result(timeout=.1)
+                            break
+                        except TimeoutError:
+                            control.check()
                 entry = dict(row)
                 control.progress(entry["path"], checked, total, "Проверка скачанной папки", unit="files")
                 meta = json.loads(entry["meta"])
@@ -1137,7 +1257,7 @@ class Engine:
                     if preview and job['settings'].get('deduplicate'):
                         from .duplicates import compact
                         compact(self,job,entry,'preview',meta,control)
-                    if (original or preview) and job["settings"].get("operation") != "missing":
+                    if (original or preview) and job["settings"].get("operation") != "missing" and not getattr(control,'resume_snapshot',False):
                         # A restart resumes a saved inventory. Before skipping
                         # its verified copies, check whether the source changed.
                         try:
@@ -1179,6 +1299,13 @@ class Engine:
                     control.verification_time.estimate(checked,total)
                     control.verification = {'checked':checked,'total':total,'originals':originals,'previews':previews,'missing':checked-found,'complete':checked==total,'cached':control.verification_cached,'hashed':control.verification_hashed}
                 control.progress(entry["path"], checked, total, "Проверка скачанной папки", unit="files")
+                if not pool and getattr(control,'available_probe_pool',None) and control.verification_cached > cached_before:
+                    control.cached_probe_costs.append(time.monotonic()-probe_started)
+                    if len(control.cached_probe_costs) >= 8:
+                        if sum(control.cached_probe_costs)/len(control.cached_probe_costs) >= .006:
+                            pool = control.cached_probe_pool = control.available_probe_pool
+                        else:
+                            control.available_probe_pool = None
             cursor = rows[-1]["path"]
             flush()
         control.event("cache", f"Папка проверена: {checked} файлов, уже есть результат у {found}. Сначала будут скачаны файлы без результата.")
@@ -1249,6 +1376,9 @@ class Engine:
                 control.check()
 
     def _reusable(self, job, entry, kind, meta, control):
+        if (getattr(control,'cached_results',None) or {}).get(kind):
+            control.verification_cached += 1
+            return True
         records = getattr(control,'verification_records',None)
         if records is not None:
             artifact = records.get((entry['path'],kind))
@@ -1463,6 +1593,22 @@ class Engine:
                     control.remaining_time.result(bool(completed), reused=bool(completed) and len(reused) == len(completed) and not errors, fallback=fallback)
 
     def transfer(self, job, entry, kind, meta, control):
+        control.check()
+        while control.space_draining:
+            control.check()
+            time.sleep(.1)
+        identity = threading.get_ident()
+        with control.space_lock:
+            control.transfer_sizes[identity] = None
+        try:
+            return self._transfer(job, entry, kind, meta, control)
+        finally:
+            with control.space_lock:
+                control.transfer_sizes.pop(identity,None)
+                if control.space_draining and not control.transfer_sizes:
+                    control.next_space_check = 0
+
+    def _transfer(self, job, entry, kind, meta, control):
         import re
         settings = job["settings"]
         tries = attempt_count(settings)
@@ -1480,6 +1626,8 @@ class Engine:
                 self.api.wait(delay, control.check)
             row, temp, sha, md5 = self.partials.prepare(job, entry["path"], kind, stamp, control.check)
             size = offset = row["size"]
+            with control.space_lock:
+                control.transfer_sizes[threading.get_ident()] = max(0,meta['size']-size) if kind=='original' and isinstance(meta.get('size'),int) else None
             etag, total = row["etag"], row["total"]
             can_resume = persistent and (kind == "original" and (meta.get("sha256") or meta.get("md5")) or bool(etag))
             if size and not can_resume:
@@ -1536,6 +1684,8 @@ class Engine:
                             keep = False
                             raise APIError("Размер ответа оригинала не совпадает с метаданными")
                         etag = new_etag
+                        with control.space_lock:
+                            control.transfer_sizes[threading.get_ident()] = max(0,total-size) if total is not None else None
                         keep = persistent and (kind == "original" or bool(etag))
                         last_flush = last_checkpoint = time.monotonic()
                         checkpoint_size = size
@@ -1556,10 +1706,14 @@ class Engine:
                                     raise APIError("Превью превышает допустимый объём")
                                 with deadline.hold():
                                     control.rate_limiter.consume(len(chunk), control.check)
+                                control.before_write(len(chunk))
+                                deadline.check()
                                 stream.write(chunk)
                                 sha.update(chunk)
                                 md5.update(chunk)
                                 size += len(chunk)
+                                with control.space_lock:
+                                    control.transfer_sizes[threading.get_ident()] = max(0,total-size) if total is not None else None
                                 with control.lock:
                                     control.transferred += len(chunk)
                                     control.remaining_time.advance(kind, len(chunk))
@@ -1747,7 +1901,7 @@ class Engine:
                     done, sha = 0, hashlib.sha256()
                     with open(filename, "rb") as source, output.open(info, "w", force_zip64=True) as target:
                         while chunk := source.read(1024 * 1024):
-                            control.check()
+                            control.before_write(len(chunk))
                             target.write(chunk)
                             with control.lock:
                                 control.temporary_sizes[temp] = output.fp.tell()

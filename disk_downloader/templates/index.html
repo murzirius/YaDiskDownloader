@@ -81,7 +81,9 @@
       <label class="whole"><input id="create-zip" type="checkbox" checked> Создать ZIP после загрузки</label>
       <details class="exclusion-settings"><summary>Исключения папок и файлов</summary><label class="field">Один путь или шаблон на строку<textarea id="exclusions" rows="4" placeholder="disk:/Фото/Черновики&#10;*.tmp&#10;*.bak" spellcheck="false"></textarea></label><p class="hint">Путь disk:/… исключает файл или всю папку. Шаблоны имён действуют на любой глубине, без учёта регистра.</p><button id="exclude-selected">Исключить выбранное</button></details>
       <details class="profile-settings"><summary>Профили настроек</summary><select id="profile-list" aria-label="Профиль настроек"><option value="">Выберите профиль</option></select><div class="actions"><button id="apply-profile">Применить</button><button id="delete-profile">Удалить</button></div><input id="profile-name" aria-label="Название профиля" placeholder="Название профиля" maxlength="80"><button id="save-profile">Сохранить профиль</button></details>
-      <button id="estimate" class="primary wide">Оценить выбранное</button>
+      <label class="whole"><input id="auto-start" type="checkbox" checked> После проверки сразу скачивать</label>
+      <p id="auto-start-hint" class="hint">Этапы продолжатся автоматически. Обход можно остановить и продолжить с сохранённого места. При остатке меньше 500 МБ загрузка встанет на паузу, даже если автопауза отключена.</p>
+      <button id="estimate" class="primary wide">Проверить и скачать</button>
     </section>
     <section id="job-panel" class="job-panel" role="tabpanel" aria-labelledby="job-tab" hidden>
       <div class="section-title"><h2>Задание</h2><button id="refresh-jobs" class="quiet">Обновить</button></div>

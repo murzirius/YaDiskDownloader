@@ -12,6 +12,22 @@ class Management:
         # Restart never starts queued downloads before an explicit connection.
         self.armed = False
         self.next_due = 0
+        engine.enqueue_after_scan = self.enqueue_after_scan
+
+    def enqueue_after_scan(self, job_id):
+        """The owning scan worker may queue its prepared scheduled download."""
+        with self.engine.lock:
+            if self.engine.shutting_down:
+                return
+            control = self.engine.controls.get(job_id)
+            if control and control.stopped:
+                from .api import Suspended
+                raise Suspended('Задание остановлено')
+            with self.store.db() as db:
+                position = db.execute('SELECT COALESCE(MAX(position),0)+1 FROM job_queue').fetchone()[0]
+                db.execute("INSERT OR IGNORE INTO job_queue(job,position,action) VALUES(?,?,'resume')", (job_id,position))
+            self.armed = True
+            self.next_due = 0
 
     def paused(self):
         with self.store.db() as db:

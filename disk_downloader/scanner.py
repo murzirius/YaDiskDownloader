@@ -12,6 +12,8 @@ SCAN_WORKERS = 4
 
 def scan_pages(engine, job_id, settings, control):
     pending = {}
+    cursors, ahead = {}, {}
+    ignored = set()
     with ThreadPoolExecutor(max_workers=SCAN_WORKERS, thread_name_prefix='disk-scan') as pool:
         try:
             while True:
@@ -23,14 +25,27 @@ def scan_pages(engine, job_id, settings, control):
                         sql += ' AND path NOT IN (' + ','.join('?' for _ in excluded) + ')'
                     rows = db.execute(sql+' ORDER BY path LIMIT ?', (job_id, *excluded, SCAN_WORKERS-len(pending))).fetchall()
                 for path, offset in rows:
+                    cursors[path] = offset
                     control.progress(path, offset, None, 'Читаем список файлов Яндекс.Диска', unit='objects')
                     future = pool.submit(engine.api.metadata, path, settings, control.check, offset=offset, limit=PAGE_SIZE)
                     pending[future] = (path, offset)
                 if not pending:
                     break
-                done, _ = wait(pending, timeout=.1, return_when=FIRST_COMPLETED)
+                waiting = [future for future in pending if not future.done()]
+                if waiting:
+                    wait(waiting, timeout=.1, return_when=FIRST_COMPLETED)
+                # Completed later pages stay bounded in pending until the
+                # previous page is committed. A restart uses only that cursor.
+                done = sorted((future for future in pending if future.done()), key=lambda future: pending[future])
                 for future in done:
-                    path, offset = pending.pop(future)
+                    path, offset = pending[future]
+                    if future in ignored:
+                        pending.pop(future)
+                        ignored.discard(future)
+                        continue
+                    if offset != cursors[path]:
+                        continue
+                    pending.pop(future)
                     try:
                         meta = future.result()
                         control.check()
@@ -67,6 +82,23 @@ def scan_pages(engine, job_id, settings, control):
                             db.execute('UPDATE entries SET scan_offset=?,scanned=? WHERE job=? AND path=?', (next_offset, int(finished), job_id, path))
                             db.execute('DELETE FROM scan_errors WHERE job=? AND path=?', (job_id, path))
                             db.execute('INSERT OR REPLACE INTO scan_pages VALUES(?,?,?)',(job_id,path,signature))
+                        cursors[path] = next_offset
+                        if finished:
+                            ahead.pop(path, None)
+                            cursors.pop(path, None)
+                            for other, (name, _) in pending.items():
+                                if name == path:
+                                    ignored.add(other)
+                        elif len(items) == PAGE_SIZE and total is not None:
+                            scheduled = max((start + PAGE_SIZE for name, start in pending.values() if name == path), default=next_offset)
+                            ahead[path] = (scheduled, total)
+                        else:
+                            # A server may return fewer items than requested.
+                            # Discard speculative pages and follow its actual cursor.
+                            ahead.pop(path, None)
+                            for other, (name, _) in pending.items():
+                                if name == path:
+                                    ignored.add(other)
                         control.event('scan', f'Получено {len(items)} объектов; просмотрено {next_offset}' + (' · папка прочитана' if finished else ''), path)
                         with control.lock:
                             control.active.pop(path, None)
@@ -79,6 +111,19 @@ def scan_pages(engine, job_id, settings, control):
                             db.execute('INSERT OR REPLACE INTO scan_errors VALUES(?,?,?)', (job_id, path, message))
                             db.execute('UPDATE entries SET scanned=1 WHERE job=? AND path=?', (job_id, path))
                         control.event('errors', 'Ошибка обхода папки: '+message, path, 'error')
+                        ahead.pop(path, None)
+                        cursors.pop(path, None)
+                        for other, (name, _) in pending.items():
+                            if name == path:
+                                ignored.add(other)
+                # The same four request slots can now serve successive pages
+                # of one large folder, rather than waiting for it page by page.
+                for path, (start, total) in list(ahead.items()):
+                    while len(pending) < SCAN_WORKERS and start < total:
+                        future = pool.submit(engine.api.metadata, path, settings, control.check, offset=start, limit=PAGE_SIZE)
+                        pending[future] = (path, start)
+                        start += PAGE_SIZE
+                    ahead[path] = (start, total)
         finally:
             for future in pending:
                 future.cancel()

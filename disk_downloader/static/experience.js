@@ -49,12 +49,12 @@ const destinationStatus=node('p','Выберите папку — провери
 stepBoxes[0].append($('operation').closest('label'),$('operation-hint'),node('p','Выберите файлы или папки в списке слева. Можно отметить весь Диск.','hint'),$('whole-disk').closest('label'),$('file-types'));
 stepBoxes[1].append($('destination').closest('label'),destinationStatus);
 const confirmation=node('div',undefined,'setup-confirmation');confirmation.id='setup-confirmation';
-stepBoxes[2].append($('missing-policy-field'),$('new-mode-field'),$('mode-hint'),$('create-zip').closest('label'),confirmation,$('settings-panel').querySelector('.advanced-settings'),reportOptions,$('exclusions').closest('details'),$('profile-list').closest('details'),$('estimate'));
+stepBoxes[2].append($('missing-policy-field'),$('new-mode-field'),$('mode-hint'),$('create-zip').closest('label'),confirmation,$('settings-panel').querySelector('.advanced-settings'),reportOptions,$('exclusions').closest('details'),$('profile-list').closest('details'),$('auto-start').closest('label'),$('auto-start-hint'),$('estimate'));
 const setupNavigation=node('div',undefined,'actions setup-navigation'),setupBack=node('button','Назад'),setupNext=node('button','Дальше','primary');
 setupBack.onclick=()=>safely(()=>advanceSetup(wizardStep-1));setupNext.onclick=()=>safely(()=>advanceSetup(wizardStep+1));setupNavigation.append(setupBack,setupNext);
 setupNavigation.append(estimateButton);
 settingsPanel.append(...stepBoxes,setupNavigation);
-$('estimate').textContent='1. Проверить список и объём';
+$('auto-start').onchange();
 
 function openWorkspace(mode){
   welcome.hidden=true;workspace.hidden=false;home.removeAttribute('aria-current');
@@ -97,6 +97,7 @@ document.addEventListener('change',event=>{if(settingsPanel.contains(event.targe
 renderSetup();
 
 function applyDownloadSettings(value){
+  $('auto-start').checked=value.auto_start!==false;$('auto-start').onchange();
   for(const [id,key] of [['operation','operation'],['missing-policy','missing_policy'],['destination','destination'],['mode','mode'],['preview-size','preview_size'],['workers','workers'],['retries','attempts'],['timeout','timeout'],['total-timeout','total_timeout'],['max-disk-percent','max_disk_percent'],['speed-limit','speed_limit_mib']]){
     if(value[key]!==undefined)$(id).value=value[key];
   }
@@ -106,10 +107,13 @@ function applyDownloadSettings(value){
   $('exclusions').value=(value.exclusions||[]).join('\n');selected.clear();for(const path of value.paths||[])selected.add(path);updateSelection();renderFiles();state.limitsTouched=true;$('operation').onchange();renderSetup();
 }
 
+$('apply-profile').addEventListener('click',()=>{const profile=profiles.find(item=>item.name===$('profile-list').value);if(profile&&!profile.error){$('auto-start').checked=profile.settings.auto_start!==false;$('auto-start').onchange();}});
+
 const verificationSummary=node('div',undefined,'verification-summary');verificationSummary.id='preflight-summary';verificationSummary.role='status';verificationSummary.hidden=true;$('active-files').before(verificationSummary);
 const resultActions=node('div',undefined,'actions');resultActions.id='result-actions';$('result-info').after(resultActions);
 let resultActionsKey='';
 function renderExperience(job){
+  if(['stopped','interrupted'].includes(job.phase)&&!job.scan_complete)$('job-hint').textContent='Прогресс обхода сохранён. «Продолжить обход и загрузку» начнёт с сохранённой страницы и затем автоматически перейдёт к скачиванию.';
   refreshJournal.disabled=job.live;
   if(['completed','completed_with_errors'].includes(job.phase)&&!job.error){
     const saved=job.completeness.originals+job.completeness.preview_only;

@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS entries (
 );
 CREATE INDEX IF NOT EXISTS queue ON entries(job,kind,status);
 CREATE INDEX IF NOT EXISTS scan ON entries(job,kind,scanned);
+CREATE INDEX IF NOT EXISTS scan_path ON entries(job,kind,scanned,path);
 CREATE TABLE IF NOT EXISTS names (
  job TEXT NOT NULL, identity TEXT NOT NULL, local TEXT NOT NULL, folded TEXT NOT NULL,
  PRIMARY KEY(job,identity), UNIQUE(job,folded)
@@ -307,7 +308,7 @@ class Store:
             from .work_policy import validate as validate_policy
             validate_selection(settings)
             validate_policy(settings)
-            for key in ('create_zip','auto_pause','resume_parts','adaptive_workers','deduplicate','prevent_sleep'):
+            for key in ('create_zip','auto_pause','resume_parts','adaptive_workers','deduplicate','prevent_sleep','auto_start'):
                 if key in settings and not isinstance(settings[key],bool):
                     raise ValueError()
             fullness = settings.get('max_disk_percent',95)

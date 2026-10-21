@@ -86,6 +86,9 @@ class Partials:
                                 chunk = source.read(min(1024 * 1024, remaining))
                                 if not chunk:
                                     raise ValueError("Часть изменилась во время копирования")
+                                owner = getattr(checkpoint,'__self__',None)
+                                if owner and hasattr(owner,'before_write'):
+                                    owner.before_write(len(chunk))
                                 target.write(chunk)
                                 copied.update(chunk)
                                 remaining -= len(chunk)

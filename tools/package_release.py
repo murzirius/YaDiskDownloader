@@ -32,7 +32,7 @@ def package(output, executable=None):
     with zipfile.ZipFile(cmd,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as archive:
         for file in source_files():
             relative=file.relative_to(ROOT)
-            if relative.parts[0]=='disk_downloader' or relative.as_posix() in ('README.md','LICENSE','run.py','start.cmd','start.ps1','START-CMD.txt','requirements.txt','requirements-bootstrap.txt','yadisk.cmd','pyproject.toml','docs/usage.md','docs/cli.md','docs/features-v1.5.0.md','docs/validation-v1.5.0.md','docs/architecture.md','docs/testing.md'):
+            if relative.parts[0]=='disk_downloader' or relative.as_posix() in ('README.md','LICENSE','run.py','start.cmd','start.ps1','START-CMD.txt','requirements.txt','requirements-bootstrap.txt','yadisk.cmd','pyproject.toml','docs/usage.md','docs/cli.md','docs/features-v1.5.0.md','docs/validation-v1.5.0.md','docs/scan-pipeline-validation.md','docs/macos.md','docs/architecture.md','docs/testing.md'):
                 archive.write(file,'YaDiskDownloader-CMD/'+relative.as_posix())
     files.append(cmd)
     if executable:
@@ -45,7 +45,7 @@ def package(output, executable=None):
             if cli.is_file():
                 archive.write(cli,'YaDiskDownloader/YaDiskDownloader-CLI.exe')
                 archive.write(ROOT/'yadisk.cmd','YaDiskDownloader/yadisk.cmd')
-            for name in ('README.md','LICENSE','docs/usage.md','docs/features-v1.3.0.md','docs/cli.md','docs/features-v1.5.0.md','docs/validation-v1.5.0.md','docs/architecture.md','docs/testing.md',f'docs/release-v{VERSION}.md'):
+            for name in ('README.md','LICENSE','docs/usage.md','docs/features-v1.3.0.md','docs/cli.md','docs/features-v1.5.0.md','docs/validation-v1.5.0.md','docs/scan-pipeline-validation.md','docs/macos.md','docs/architecture.md','docs/testing.md',f'docs/release-v{VERSION}.md'):
                 archive.write(ROOT/name,'YaDiskDownloader/'+name)
             archive.write(executable.parent/'THIRD_PARTY_NOTICES.txt','YaDiskDownloader/THIRD_PARTY_NOTICES.txt')
             archive.write(source,'YaDiskDownloader/source/'+source.name)
