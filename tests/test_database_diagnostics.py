@@ -22,6 +22,8 @@ from disk_downloader.sqlite_support import error_details
     ('malformed JSON', 'invalid_json'),
     ('Nested write connections are not supported', 'nested_write'),
     ('private-path-and-token', 'unknown'),
+    ("Could not decode to UTF-8 column 'meta' with text 'private'", 'text_decode'),
+    ('Error while building row_cast_map', 'column_decode'),
 ])
 def test_sqlite_reasons_never_export_exception_text(tmp_path, message, reason):
     error = sqlite3.OperationalError(message)

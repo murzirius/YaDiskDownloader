@@ -6,6 +6,7 @@ from .exclusions import excluded
 from .file_types import selected_type
 from .journal import encoded
 from .paths import forget_temporary, temporary_file
+from .import_state import UNREADABLE_META
 
 
 LABELS = {"new": "Новые", "changed": "Изменённые", "unchanged": "Без изменений", "removed": "Больше нет в источнике", "excluded": "Исключены из выбора", "unknown": "Не удалось проверить"}
@@ -30,13 +31,19 @@ def compare(store, job_id, checkpoint=lambda: None):
         for row in store.rows(sql, (job_id,)):
             checkpoint()
             if not missing:
-                status = "new" if row["old"] is None else "unchanged" if stamp(json.loads(row["old"])) == stamp(json.loads(row["meta"])) else "changed"
+                before = json.loads(row['old']) if row['old'] is not None else None
+                status = 'unknown' if before and before.get(UNREADABLE_META) else "new" if before is None else "unchanged" if stamp(before) == stamp(json.loads(row["meta"])) else "changed"
                 batch.append((job_id, row["path"], status, row["old"], row["meta"]))
             else:
                 path = row["path"]
                 in_scope = any(root == "disk:/" or root == path or path.startswith(root + "/") for root in settings["paths"])
-                if not in_scope or excluded(path, settings) or not selected_type(json.loads(row["meta"]), settings):
+                before = json.loads(row['meta'])
+                if not in_scope or excluded(path, settings):
                     status = "excluded"
+                elif before.get(UNREADABLE_META):
+                    status = 'unknown'
+                elif not selected_type(before, settings):
+                    status = 'excluded'
                 elif not job["scan_complete"] or any(path == root or path.startswith(root.rstrip("/") + "/") for root in errors):
                     status = "unknown"
                 else:

@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+import uuid
 from contextlib import closing
 from pathlib import Path
 from urllib.parse import quote
@@ -10,6 +11,7 @@ from .paths import forget_temporary, publish, replace_owned, reserve_output, saf
 
 
 FORMAT = "disk-local-import-v1"
+UNREADABLE_META = '_unreadable_history'
 
 
 def _sqlite_uri(filename):
@@ -86,7 +88,9 @@ def inherit(store, job_id, previous, checkpoint=lambda: None, progress=lambda co
     root_length = len(os.path.abspath(store.job(job_id)['root']))
     same = bool(previous.get('store'))
     filename = previous['store'].filename if same else previous['file']
+    unreadable = 0
     with closing(sqlite3.connect(_sqlite_uri(filename),uri=True)) as source:
+        encoding = {'UTF-8':'utf-8','UTF-16le':'utf-16-le','UTF-16be':'utf-16-be'}[source.execute('PRAGMA encoding').fetchone()[0]]
         available = {row[0] for row in source.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         where = ' WHERE job=?' if same else ''
         args = (previous['id'],) if same else ()
@@ -101,11 +105,22 @@ def inherit(store, job_id, previous, checkpoint=lambda: None, progress=lambda co
             else:
                 yield from source.execute(sql,parameters)
 
-        def copy(table, sql, parameters, remote=None, local=None):
+        def copy(table, sql, parameters, remote=None, local=None, metadata=None):
+            nonlocal unreadable
             batch = []
             for record in records(sql, parameters):
                 checkpoint()
                 row = tuple(record)
+                if metadata is not None:
+                    try:
+                        text = row[metadata].decode(encoding)
+                    except (UnicodeDecodeError, AttributeError):
+                        # Preserve the original database. Only the comparison
+                        # baseline is marked unknown; fresh cloud metadata and
+                        # all existing content verification remain mandatory.
+                        text = json.dumps({UNREADABLE_META:True})
+                        unreadable += 1
+                    row = (*row[:metadata],text,*row[metadata+1:])
                 if remote is not None: remote_path(row[remote])
                 if local is not None:
                     relative_parts(row[local])
@@ -123,10 +138,10 @@ def inherit(store, job_id, previous, checkpoint=lambda: None, progress=lambda co
 
         # Retain change reports and collision-safe names without filesystem IO.
         if inventory in available:
-            copy('baseline', 'SELECT path,kind,meta FROM '+inventory+where, args, remote=0)
+            copy('baseline', 'SELECT path,kind,CAST(meta AS BLOB) AS meta FROM '+inventory+where, args, remote=0, metadata=2)
         if same:
-            copy('baseline', "SELECT b.path,b.kind,b.meta FROM baseline b LEFT JOIN changes c ON c.job=b.job AND c.path=b.path WHERE b.job=? AND (c.status='unknown' OR ?=0)",
-                 (previous['id'],previous['job']['scan_complete']), remote=0)
+            copy('baseline', "SELECT b.path,b.kind,CAST(b.meta AS BLOB) AS meta FROM baseline b LEFT JOIN changes c ON c.job=b.job AND c.path=b.path WHERE b.job=? AND (c.status='unknown' OR ?=0)",
+                 (previous['id'],previous['job']['scan_complete']), remote=0, metadata=2)
         if 'names' in available:
             copy('names', 'SELECT identity,local,folded FROM names'+where+(' AND ' if where else ' WHERE ')+
                  "(identity LIKE 'disk:/%' OR identity LIKE '@preview:disk:/%' OR identity LIKE '@output:%' OR identity='@service')", args, local=1)
@@ -135,7 +150,7 @@ def inherit(store, job_id, previous, checkpoint=lambda: None, progress=lambda co
 
         if 'artifacts' not in available:
             if details: details(0, 0, 'files')
-            return
+            return {'unreadable_metadata':unreadable}
         # One progress item per source file, even when both copies are present.
         total = source.execute('SELECT COUNT(DISTINCT path) FROM artifacts'+where,args).fetchone()[0]
         if details: details(0, total, 'files')
@@ -174,6 +189,26 @@ def inherit(store, job_id, previous, checkpoint=lambda: None, progress=lambda co
             if signature is not None and kind in ('original','preview'):
                 cache_batch.append((job_id,local,signature))
         flush()
+    return {'unreadable_metadata':unreadable}
+
+
+def backup_import(store, job_id, previous, checkpoint=lambda: None):
+    """Keep an immutable portable inventory before replacing recovered metadata."""
+    job = store.job(job_id)
+    local = reserve_output(store, job, '.disk-history-before-recovery-'+uuid.uuid4().hex[:12]+'.sqlite3')
+    temp = temporary_file(job['root'], store, 'history-backup')
+    try:
+        checkpoint()
+        with closing(sqlite3.connect(_sqlite_uri(previous['file']),uri=True)) as source, closing(sqlite3.connect(temp)) as target:
+            source.backup(target,pages=128,progress=lambda *args:checkpoint(),sleep=.05)
+        with open(temp,'r+b') as stream:
+            os.fsync(stream.fileno())
+        checkpoint()
+        publish(temp,safe_join(job['root'],local))
+        return local
+    finally:
+        if os.path.exists(temp):os.unlink(temp)
+        forget_temporary(store,job['root'],temp)
 
 
 def save_import(store, job_id, checkpoint=lambda: None):

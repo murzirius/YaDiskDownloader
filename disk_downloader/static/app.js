@@ -261,7 +261,7 @@ async function pollJob(){
     if(typeof renderDismissibleNetwork==='function')renderDismissibleNetwork(job);
     else{$('network-warning').hidden=!job.network_waiting;$('network-warning').textContent=job.network_warning||'';}
     const completenessMessage=!job.statistics_pending&&['completed','completed_with_errors'].includes(job.phase)?(job.scan_errors?'Обход завершился с ошибками: часть папок могла остаться непроверенной. ':!job.completeness.no_result&&!job.completeness.preview_only?'Все выбранные файлы сохранены в оригинале. ':'')+(job.completeness.preview_only?'Только превью: '+job.completeness.preview_only+'. Это уменьшенные копии. ':'')+(job.completeness.no_result?'Без результата: '+job.completeness.no_result+'. ':''):'';
-    const resultMessage=job.pause_reason||job.error||job.statistics_error||completenessMessage||(job.phase==='completed_with_errors'?'Результат неполный.':job.phase==='stopped'?'Остановлено. Незавершённых файлов: '+job.cancelled+'.':'');
+    const resultMessage=job.pause_reason||job.error||job.statistics_error||job.settings.history_warning||completenessMessage||(job.phase==='completed_with_errors'?'Результат неполный.':job.phase==='stopped'?'Остановлено. Незавершённых файлов: '+job.cancelled+'.':'');
     if(typeof renderDismissibleResult==='function')renderDismissibleResult(job,resultMessage);else $('result-info').textContent=resultMessage;
     if(job.zip_path){
       $('download-zip').hidden=false;

@@ -16,7 +16,7 @@ import requests
 from PIL import Image
 
 from .api import APIError, Deadline, NetworkError, PausedRequest, PREVIEW_MAX_BYTES, SIZES, Suspended, attempt_count, retry_delay, validate_resource
-from .import_state import find_import, inherit, read_import, save_import
+from .import_state import backup_import, find_import, inherit, read_import, save_import
 from .file_types import FILE_TYPES, file_type, preview_type, selected_type
 from .estimation import RemainingTime, VerificationTime
 from .paths import file_signature, forget_temporary, PathError, component, digest, native, normalize_selection, parent_path, publish, remote_path, reserve_output, safe_join, suffix, temporary_file
@@ -745,8 +745,13 @@ class Engine:
                 if not previous:
                     raise ValueError('На ПК не найдена прежняя опись загрузки. Проверьте папку или создайте дозагрузку заново.')
                 control.progress(job['root'],0,None,'Готовим проверку скачанных файлов',unit='local_files')
-                inherit(self.store,job_id,previous,control.check,details=lambda count,total,stage:control.progress(job['root'],count,total,'Подготовка списка скачанных файлов' if stage=='files' else 'Готовим проверку скачанных файлов',unit='local_files'))
+                inherited = inherit(self.store,job_id,previous,control.check,details=lambda count,total,stage:control.progress(job['root'],count,total,'Подготовка списка скачанных файлов' if stage=='files' else 'Готовим проверку скачанных файлов',unit='local_files')) or {}
                 settings = self.store.job(job_id)['settings']
+                if inherited.get('unreadable_metadata'):
+                    if not previous.get('store'):
+                        settings['history_backup_local'] = backup_import(self.store,job_id,previous,control.check)
+                    settings['history_warning'] = 'Часть прежней истории не удалось прочитать. При дозагрузке используются свежие данные Яндекс.Диска и проверка файлов на устройстве. Сравнение этих записей со старой загрузкой недоступно.'
+                    control.event('system',settings['history_warning'],level='warning')
                 settings.pop('_inherit_source',None)
                 self.store.update_job(job_id,settings=json.dumps(settings,ensure_ascii=False))
                 with control.lock: control.active.clear()

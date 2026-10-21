@@ -343,10 +343,14 @@ class Store:
                     cursor = db.execute(sql, params)
                     while rows := cursor.fetchmany(batch):
                         for row in rows:
-                            snapshot.write(json.dumps(dict(row), ensure_ascii=False)+'\n')
+                            snapshot.write(json.dumps(dict(row), ensure_ascii=False,
+                                default=lambda blob:{'__sqlite_blob__':blob.hex()})+'\n')
                 snapshot.seek(0)
                 for line in snapshot:
-                    yield json.loads(line)
+                    # SQLite BLOB values must survive the bounded snapshot.
+                    # Text that looks like JSON stays a string, never a marker.
+                    row = json.loads(line)
+                    yield {key:bytes.fromhex(value['__sqlite_blob__']) if isinstance(value,dict) and set(value)=={'__sqlite_blob__'} else value for key,value in row.items()}
             return
         with self.db() as db:
             cursor = db.execute(sql, params)

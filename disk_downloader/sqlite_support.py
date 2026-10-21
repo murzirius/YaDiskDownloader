@@ -8,6 +8,8 @@ def error_details(exc):
     text = str(exc).lower()
     reason, message = 'unknown', 'Программа на ПК не смогла прочитать или сохранить историю задания. Точная причина пока неизвестна.'
     for prefix, key, description in (
+        ('could not decode to utf-8', 'text_decode', 'Программа на ПК не смогла прочитать текст одной из записей истории.'),
+        ('error while building row_cast_map', 'column_decode', 'Программа на ПК не смогла прочитать названия полей прежней истории.'),
         ('invalid uri authority:', 'uri_authority', 'Программа на ПК неправильно обработала путь к файлу истории и не смогла его открыть.'),
         ('no such table:', 'missing_table', 'Программа на ПК не нашла нужный раздел в сохранённой истории или описи прежней загрузки.'),
         ('no such column:', 'missing_column', 'Программа на ПК не нашла нужные сведения в истории или описи прежней загрузки.'),
