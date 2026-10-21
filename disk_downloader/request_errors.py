@@ -7,6 +7,9 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import threading
 import traceback
+import sqlite3
+
+from .sqlite_support import error_details
 
 
 class RequestErrors:
@@ -21,12 +24,16 @@ class RequestErrors:
         except OSError:
             pass
 
-    def record(self, request_id, endpoint, exc):
+    def record(self, request_id, endpoint, exc, *, phase=None):
         value = {'request_id':request_id, 'time':datetime.now(timezone.utc).isoformat(),
                  'operation':endpoint, 'exception':type(exc).__name__,
                  'sqlite_code':getattr(exc, 'sqlite_errorname', ''),
                  'frames':[{'file':Path(frame.filename).name, 'function':frame.name, 'line':frame.lineno}
                            for frame in traceback.extract_tb(exc.__traceback__)[-12:]]}
+        if isinstance(exc, sqlite3.Error):
+            value['sqlite'] = error_details(exc)
+        if phase:
+            value['phase'] = phase
         with self.lock:
             self.items.append(value)
             if self.logger.handlers:

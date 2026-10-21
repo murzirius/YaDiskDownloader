@@ -19,6 +19,8 @@ SETTINGS = ("mode", "preview_size", "file_types", "workers", "attempts", "timeou
 
 def error_kind(value):
     value = value.lower()
+    if 'sqlite_' in value:
+        return 'local_database'
     for text, name in (("нет новых данных", "idle_timeout"), ("лимит попытки", "attempt_timeout"), ("таймаут", "network_timeout"), ("сетевая", "network"), ("места", "disk_space"), ("sha-256", "checksum"), ("sha256", "checksum"), ("md5", "checksum"), ("неполный", "incomplete_response"), ("размер", "size_mismatch"), ("недопустим", "validation"), ("токен", "authorization"), ("не подключ", "authorization"), ("недоступ", "unavailable")):
         if text in value:
             return name

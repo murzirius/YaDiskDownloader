@@ -30,6 +30,7 @@ from .network import NetworkWait
 from .limits import MAX_WORKERS
 from .status_cache import StatusCache
 from .destination import DestinationGuard, StorageRetry
+from .sqlite_support import error_details
 
 
 def now():
@@ -60,7 +61,8 @@ def safe_error(exc):
     if isinstance(exc, requests.RequestException):
         return "Сетевая ошибка или таймаут"
     if isinstance(exc, sqlite3.Error):
-        return 'Ошибка базы истории (' + getattr(exc, 'sqlite_errorname', 'SQLITE_ERROR') + ')'
+        detail = error_details(exc)
+        return detail['message'] + ' Код: ' + detail['code'] + '. Не удаляйте историю или скачанные файлы. Если ошибка повторяется, нажмите «Диагностика» → «Посмотреть состав» → «Сохранить ZIP диагностики» до закрытия программы.'
     if isinstance(exc, OSError):
         if exc.errno == 28 or getattr(exc, "winerror", None) == 112:
             return "Недостаточно места на диске ПК. Освободите место в папке загрузки и нажмите «Продолжить»."
@@ -688,6 +690,21 @@ class Engine:
                 return True
             return False
 
+    def failure_message(self, exc, operation, control):
+        message = safe_error(exc)
+        recorder = getattr(self, 'request_errors', None)
+        if recorder:
+            reference = uuid.uuid4().hex[:8]
+            try:
+                # Record before cleanup, which may itself fail on the same DB.
+                recorder.record(reference, 'job_'+operation, exc, phase=getattr(control, 'phase', 'starting'))
+            except Exception:
+                # Diagnostic IO must never replace the actual task failure.
+                pass
+            else:
+                message += ' Номер ошибки: ' + reference + '.'
+        return message
+
     def run(self, job_id, operation, control):
         try:
             with self.store.activity():
@@ -695,8 +712,9 @@ class Engine:
         except Exception as exc:
             # Includes failures opening the activity connection / final journal.
             # The next status request also reconciles a dead worker's phase.
+            message = self.failure_message(exc, operation, control)
             try:
-                self.store.update_job(job_id, phase="failed", ended=now(), error=safe_error(exc))
+                self.store.update_job(job_id, phase="failed", ended=now(), error=message)
             except sqlite3.Error:
                 pass
             finally:
@@ -776,21 +794,26 @@ class Engine:
             self.store.update_job(job_id, phase="stopped", ended=now(), error=str(exc))
             control.event("system", str(exc), level="warning")
         except BaseException as exc:
+            message = self.failure_message(exc, operation, control)
             with self.store.db() as db:
                 db.execute("UPDATE entries SET status='pending' WHERE job=? AND status='running'", (job_id,))
-            self.store.update_job(job_id, phase="failed", ended=now(), error=safe_error(exc))
-            control.event("errors", safe_error(exc), level="error")
+            self.store.update_job(job_id, phase="failed", ended=now(), error=message)
+            control.event("errors", message, level="error")
         finally:
             control.event("system", PHASES.get(self.store.job(job_id)["phase"], "Операция завершена"))
             control.journal.close()
             try:
                 if not saved_scan and not self.store.job(job_id)['settings'].get('_inherit_source'):
                     save_import(self.store, job_id)
-            except (OSError, sqlite3.Error, ValueError):
+            except (OSError, sqlite3.Error, ValueError) as exc:
                 warning = 'Не удалось обновить опись в папке на ПК. Файлы и история сохранены в приложении. Проверьте доступ к папке и свободное место; затем повторите сохранение описи.'
                 control.journal.error = warning
-                self.store.update_job(job_id, error=warning)
-                if self.store.job(job_id)['phase'] == 'completed':
+                self.failure_message(exc, 'manifest', control)
+                current = self.store.job(job_id)
+                # A secondary export failure must not hide the original cause.
+                if not current['error']:
+                    self.store.update_job(job_id, error=warning)
+                if current['phase'] == 'completed':
                     self.store.update_job(job_id, phase='completed_with_errors')
             with control.lock:
                 control.active.clear()
