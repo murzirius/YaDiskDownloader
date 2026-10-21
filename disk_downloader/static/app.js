@@ -124,9 +124,9 @@ function renderJobCounters(job){
   const extra=$('extra-counters');
   main.replaceChildren();
   extra.replaceChildren();
-  const history=job.active.find(file=>file.unit==='records');
+  const history=job.active.find(file=>file.unit==='local_files');
   for(const [label,value,wide] of [
-    history?['История папки',history.size==null?'Подсчитываем записи':`${history.done.toLocaleString('ru-RU')} / ${history.size.toLocaleString('ru-RU')} записей`,true]:[!job.scan_complete?'Найдено файлов':'Обработано',!job.scan_complete?String(job.files):`${job.processed} / ${job.files}`],
+    history?['Скачанные файлы',history.size==null?'Готовим проверку…':`${history.done.toLocaleString('ru-RU')} / ${history.size.toLocaleString('ru-RU')} файлов`,true]:[!job.scan_complete?'Найдено файлов':'Обработано',!job.scan_complete?String(job.files):`${job.processed} / ${job.files}`],
     ['Скорость',bytes(job.speed)+'/с'],
     ['На устройстве',job.folder_bytes_error?'Папка недоступна':bytes(job.folder_bytes??job.local_bytes)+(job.folder_bytes_scanning?' · уточняется':''),true],
     ['Свободно на диске',bytes(job.free_bytes),true],
@@ -165,7 +165,7 @@ function renderEstimate(job){
   details.append(node('p','Найденные оригиналы: '+bytes(estimate.original_bytes)+'. Неизвестных размеров: '+estimate.original_unknown+'.'));
   details.append(node('p',(job.settings.create_zip!==false?'Запас для ZIP и временных файлов: ':'Запас для временных файлов: ')+bytes(estimate.extra_temporary_bytes)+(hasUnknown?' + неизвестный объём':'')+' сверх результата.'));
   details.append(node('p','Размеры превью заранее неизвестны. Приоритет оригинала оценивается по оригиналам; итог зависит от успешности загрузки.'));
-  details.append(node('p','Показатель «На устройстве» учитывает всё содержимое папки, включая прежние загрузки, отчёты, ZIP и недокачанные части. Обновляется примерно каждые 10 секунд; ссылки на внешние папки не обходятся.'));
+  details.append(node('p','Показатель «На устройстве» учитывает скачанные оригиналы и превью. Журналы, отчёты, ZIP и посторонние файлы не обходятся. Объём обновляется в фоне: примерно раз в 30 секунд при работе и раз в 5 минут в простое. ZIP и недокачанные части занимают дополнительное место.'));
 }
 async function pollJob(){
   if(!state.job||state.polling||state.closing)return;
@@ -195,13 +195,13 @@ async function pollJob(){
     const option=$('job-history').selectedOptions[0];
     if(option&&option.value===job.id)option.textContent=(job.title||String(job.root||'').split(/[\\/]/).pop()||job.id.slice(0,8))+' · '+(phases[job.phase]||job.phase);
     $('job-content').hidden=false;
-    const history=job.active.find(file=>file.unit==='records');
-    $('phase').textContent=history&&job.phase==='preparing'?'Читаем историю скачанной папки':phases[job.phase]||job.phase;
+    const history=job.active.find(file=>file.unit==='local_files');
+    $('phase').textContent=history&&job.phase==='preparing'?'Готовим проверку скачанной папки':phases[job.phase]||job.phase;
     const packing=job.phase==='packing'||(job.phase==='paused'&&job.zip_total&&job.zip_done<job.zip_total);
     const percent=packing?(job.zip_total?Math.min(100,job.zip_done*100/job.zip_total):0):job.percent;
     if(history){
-      if(history.size==null){$('progress').removeAttribute('value');$('percentage').textContent='Подсчитываем записи истории…';}
-      else{const value=history.size?Math.min(100,history.done*100/history.size):100;$('progress').value=value;$('percentage').textContent=value.toLocaleString('ru-RU',{maximumFractionDigits:1})+'% истории';}
+      if(history.size==null){$('progress').removeAttribute('value');$('percentage').textContent='Готовим список скачанных файлов…';}
+      else{const value=history.size?Math.min(100,history.done*100/history.size):100;$('progress').value=value;$('percentage').textContent=value.toLocaleString('ru-RU',{maximumFractionDigits:1})+'% списка файлов';}
     }else if(job.verification&&['preparing','paused'].includes(job.phase)){
       const check=job.verification;
       $('progress').value=check.total?Math.min(100,check.checked*100/check.total):100;
@@ -223,8 +223,8 @@ async function pollJob(){
         const progress=node('progress');
         progress.max=file.size||1;
         progress.value=file.done;
-        div.append(progress,node('span',file.unit==='records'?file.done.toLocaleString('ru-RU')+' / '+file.size.toLocaleString('ru-RU')+' записей истории':file.unit==='objects'?file.done.toLocaleString('ru-RU')+' / '+file.size.toLocaleString('ru-RU')+' файлов':bytes(file.done)+' / '+bytes(file.size),'muted'));
-      }else div.append(node('div',file.unit==='records'?file.done.toLocaleString('ru-RU')+' записей истории':file.unit==='objects'?file.done.toLocaleString('ru-RU')+' объектов':bytes(file.done),'muted'));
+        div.append(progress,node('span',file.unit==='local_files'?file.done.toLocaleString('ru-RU')+' / '+file.size.toLocaleString('ru-RU')+' файлов':['objects','files'].includes(file.unit)?file.done.toLocaleString('ru-RU')+' / '+file.size.toLocaleString('ru-RU')+' файлов':bytes(file.done)+' / '+bytes(file.size),'muted'));
+      }else div.append(node('div',file.unit==='local_files'?file.done.toLocaleString('ru-RU')+' файлов':['objects','files'].includes(file.unit)?file.done.toLocaleString('ru-RU')+' объектов':bytes(file.done),'muted'));
       active.append(div);
     }
     renderEstimate(job);
@@ -235,7 +235,7 @@ async function pollJob(){
     $('stop-job').textContent=job.phase==='stopping'?'Останавливаем…':scanOnly?'Остановить обход':job.phase==='packing'?'Остановить ZIP':'Остановить загрузку';
     if(history&&job.phase!=='stopping')$('stop-job').textContent='Остановить подготовку';
     $('job-hint').textContent=state.closing?'Завершаем приложение…':job.phase==='stopping'?'Отменяем запросы и сохраняем прогресс…':job.phase==='ready'?(live?'Завершаем подготовку следующего этапа.':'Список готов. Нажмите «Начать скачивание».'):job.phase==='scanning'?'Составляем список файлов. Можно остановить и продолжить позже.':job.phase==='preparing'?'Проверяем локальные файлы и подготавливаем результаты.':job.phase==='paused'?'Работа на паузе. Для продолжения нажмите кнопку выше.':['stopped','interrupted'].includes(job.phase)?(scanOnly?'Обход остановлен. «Продолжить обход» вернёт вас к оценке.':(state.connected?'Прогресс сохранён. В блоке «Как продолжить загрузку» выберите, достаточно ли превью, и нажмите «Продолжить загрузку».':'Прогресс сохранён. Нажмите «Подключить Диск, чтобы продолжить», вставьте ключ доступа, затем продолжите загрузку.')):'Закрытие вкладки не останавливает работу. Для выхода используйте «Выход». ';
-    if(history&&!state.closing&&!['paused','stopping'].includes(job.phase))$('job-hint').textContent='Читаем историю предыдущей загрузки. У одного файла может быть несколько записей — это не число файлов. Затем сверим папку с Яндекс.Диском и проверим готовые копии.';
+    if(history&&!state.closing&&!['paused','stopping'].includes(job.phase))$('job-hint').textContent='Готовим список скачанных файлов. Логи и отчёты проверять не будем. Затем сверим файлы с Яндекс.Диском и проверим готовые копии.';
     if(live)renderRunning({id:job.id,phase:job.phase,scan_complete:job.scan_complete,active:job.active});
     const hasIssues=job.errors||job.scan_errors;
     const hasRetry=hasIssues||job.replacements||job.counts.partial||job.completeness.preview_only;
@@ -302,8 +302,8 @@ async function action(verb){
 function renderRunning(job){
   state.activeJob=job||null;$('estimate').disabled=!state.connected||!!job||state.closing;$('running-bar').hidden=!job||state.closing;
   if(!job)return;
-  const history=['preparing','paused'].includes(job.phase)&&(job.active||(state.jobStatus?.id===job.id?state.jobStatus.active:[])||[]).some(file=>file.unit==='records');
-  $('running-label').textContent=history?(job.phase==='paused'?'История · пауза':'Читаем историю'):phases[job.phase]||'Задание выполняется';
+  const history=['preparing','paused'].includes(job.phase)&&(job.active||(state.jobStatus?.id===job.id?state.jobStatus.active:[])||[]).some(file=>file.unit==='local_files');
+  $('running-label').textContent=history?(job.phase==='paused'?'Подготовка · пауза':'Готовим проверку'):phases[job.phase]||'Задание выполняется';
   const stopping=job.phase==='stopping';
   $('stop-active').textContent=stopping?'Останавливаем…':history?'Остановить подготовку':!job.scan_complete?'Остановить обход':'Остановить';
   $('stop-active').disabled=state.stopPending||stopping||['completed','completed_with_errors'].includes(job.phase);

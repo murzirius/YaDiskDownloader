@@ -10,7 +10,7 @@ from disk_downloader.store import Store
 
 
 @pytest.mark.parametrize('portable',[False,True])
-def test_history_progress_has_finite_record_total_and_restarts_safely(system,portable):
+def test_file_list_progress_counts_each_file_once_and_restarts_safely(system,portable):
     engine,api,tmp=system
     for index in range(3):api.file(f'disk:/file-{index}.bin',b'kept',preview=False)
     first=run_job(system,mode='fallback',reports=['json'])
@@ -27,7 +27,8 @@ def test_history_progress_has_finite_record_total_and_restarts_safely(system,por
     progress=[];legacy=[]
     inherit(target,'restored',previous,progress=legacy.append,details=lambda *values:progress.append(values))
     assert progress[0][0]==0 and progress[-1][0]==progress[-1][1]
-    assert progress[-1][1]>3  # One file has several different history records.
+    assert progress[-1][1]==3
+    progress=[item for item in progress if item[1] is not None]
     assert all(0<=done<=total for done,total,_ in progress)
     assert all(a[0]<=b[0] for a,b in zip(progress,progress[1:]))
     assert legacy[-1]==progress[-1][0]

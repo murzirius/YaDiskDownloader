@@ -47,8 +47,9 @@ def benchmark(reference,files=2000,service_records=6000,runs=3):
             samples=[]
             for index in range(runs):
                 target=Store(folder/f'{label}-{index}.sqlite3');add_job(target,'target')
-                original=module.safe_join;checks=[0]
+                original=module.safe_join;checks=[0];path_checks=[0]
                 def tracked(root,local):
+                    path_checks[0]+=1
                     if str(local).startswith('journal-'):checks[0]+=1
                     return original(root,local)
                 module.safe_join=tracked
@@ -62,7 +63,7 @@ def benchmark(reference,files=2000,service_records=6000,runs=3):
                     assert db.execute('SELECT COUNT(*) FROM baseline').fetchone()[0]==files
                     assert db.execute('SELECT COUNT(*) FROM verification_cache').fetchone()[0]==files
                     assert db.execute('SELECT COUNT(*) FROM names').fetchone()[0]==files+service_records
-                samples.append({'seconds':round(elapsed,4),'cpu_seconds':round(used_cpu,4),'service_path_checks':checks[0]})
+                samples.append({'seconds':round(elapsed,4),'cpu_seconds':round(used_cpu,4),'service_path_checks':checks[0],'filesystem_path_checks':path_checks[0]})
             results[label]={'samples':samples,'median_seconds':round(statistics.median(x['seconds'] for x in samples),4),'median_cpu_seconds':round(statistics.median(x['cpu_seconds'] for x in samples),4)}
     return {'files':files,'service_records':service_records,'runs':runs,'metadata_only':True,'results':results}
 

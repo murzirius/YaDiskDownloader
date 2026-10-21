@@ -12,12 +12,15 @@ FORMAT = "disk-local-import-v1"
 
 
 def find_import(store, root, exclude_job=None):
+    # Resolve only the chosen destination, never unrelated old NAS roots.
     normalized = os.path.normcase(str(Path(root).resolve()))
+    lexical = os.path.normcase(os.path.abspath(root))
     for row in store.rows("SELECT id,root FROM jobs ORDER BY started DESC"):
         if row['id'] == exclude_job:
             continue
         same_name = Path(root).name == "Disk-" + row["id"][:12]
-        if os.path.normcase(str(Path(row["root"]).resolve())) == normalized or same_name:
+        saved = os.path.normcase(os.path.abspath(row['root']))
+        if saved in (lexical, normalized) or same_name:
             job = store.job(row["id"])
             if job['settings'].get('_inherit_source'):
                 continue
@@ -31,81 +34,125 @@ def find_import(store, root, exclude_job=None):
             continue
     for _, filename in sorted(manifests, key=lambda item: item[0], reverse=True):
         try:
-            safe_join(root, filename.name)
-            with closing(sqlite3.connect(filename.resolve().as_uri() + "?mode=ro", uri=True)) as db:
-                meta = dict(db.execute("SELECT key,value FROM import_meta"))
-                if meta.get("format") == FORMAT:
-                    settings = json.loads(meta["settings"])
-                    if not isinstance(settings, dict) or not isinstance(settings.get("paths"), list):
-                        continue
-                    return {"job": {"settings": settings, "service": meta["service"], "generation": int(meta["generation"])}, "file": filename, "inventory_available": bool(db.execute("SELECT 1 FROM sqlite_master WHERE name='inventory'").fetchone())}
+            return read_import(root, filename.name)
         except (sqlite3.Error, OSError, ValueError, KeyError, TypeError):
             continue
     return None
 
 
+def read_import(root, local):
+    """Open the exact portable inventory selected when this job was created."""
+    filename = Path(safe_join(root, local))
+    with closing(sqlite3.connect(filename.resolve().as_uri() + '?mode=ro', uri=True)) as db:
+        meta = dict(db.execute('SELECT key,value FROM import_meta'))
+        if meta.get('format') != FORMAT:
+            raise ValueError('Локальная опись загрузки имеет неизвестный формат. Выберите прежнюю папку результатов заново.')
+        settings = json.loads(meta['settings'])
+        if not isinstance(settings, dict) or not isinstance(settings.get('paths'), list):
+            raise ValueError('Локальная опись загрузки повреждена. Выберите прежнюю папку результатов заново.')
+        return {'job': {'settings': settings, 'service': meta['service'], 'generation': int(meta['generation'])},
+                'file': filename, 'inventory_available': bool(db.execute("SELECT 1 FROM sqlite_master WHERE name='inventory'").fetchone())}
+
+
 def inherit(store, job_id, previous, checkpoint=lambda: None, progress=lambda count: None, details=None):
-    """Copy in bounded, restartable batches without holding a writer during IO."""
-    root = store.job(job_id)['root']
+    """Import reusable file metadata; filesystem verification happens once later.
+
+    Never resolve history paths here: on SMB each safe_join performs several
+    network round trips. Names and the comparison baseline are database data,
+    not files to inspect. Output names remain reserved to prevent treating a
+    generated report as a downloaded original; their content is never read.
+    """
+    root_length = len(os.path.abspath(store.job(job_id)['root']))
     same = bool(previous.get('store'))
-    source_context = previous['store'].db() if same else closing(sqlite3.connect(previous['file'].resolve().as_uri()+'?mode=ro',uri=True))
-    with source_context as source:
+    filename = previous['store'].filename if same else previous['file']
+    with closing(sqlite3.connect(Path(filename).resolve().as_uri()+'?mode=ro',uri=True)) as source:
         available = {row[0] for row in source.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        tasks = []
-        inventory = 'entries' if same else 'inventory'
         where = ' WHERE job=?' if same else ''
         args = (previous['id'],) if same else ()
-        if inventory in available:
-            tasks.append(('baseline','SELECT path,kind,meta FROM '+inventory+where,args,0,None))
-        if same:
-            tasks.append(('baseline',"SELECT b.path,b.kind,b.meta FROM baseline b LEFT JOIN changes c ON c.job=b.job AND c.path=b.path WHERE b.job=? AND (c.status='unknown' OR ?=0)",(previous['id'],previous['job']['scan_complete']),0,None))
-        for table,columns,remote,local in (
-            ('names','identity,local,folded',None,1),
-            ('artifacts','path,type,local,size,sha256,fingerprint,preview_size',0,2),
-            ('partials','path,type,local,fingerprint,size,sha256,etag,total',0,2),
-        ):
-            if table in available:
-                selection = 'SELECT '+columns+' FROM '+table+where
-                if table == 'names':
-                    selection += (' AND ' if where else ' WHERE ') + "(identity LIKE 'disk:/%' OR identity LIKE '@preview:disk:/%' OR identity LIKE '@output:%' OR identity='@service')"
-                tasks.append((table,selection,args,remote,local))
-        # An external manifest is not trusted to skip hashing local content.
-        if same:
-            tasks.append(('verification_cache',"SELECT v.local,v.signature FROM verification_cache v WHERE v.job=? AND EXISTS(SELECT 1 FROM artifacts a WHERE a.job=v.job AND a.local=v.local AND a.type IN ('original','preview'))",args,None,0))
-        count = 0
-        total = None
-        if details:
-            total = 0
-            for _,sql,parameters,_,_ in tasks:
-                checkpoint()
-                total += source.execute('SELECT COUNT(*) FROM ('+sql+')',parameters).fetchone()[0]
-            details(0,total,None)
-        for table,sql,parameters,remote,local in tasks:
-            if details:details(count,total,table)
-            rows = previous['store'].rows(sql,parameters) if same else source.execute(sql,parameters)
+        inventory = 'entries' if same else 'inventory'
+        if details: details(0, None, 'metadata')
+
+        def records(sql, parameters):
+            if same and not previous['store'].wal:
+                # Legacy CMD SQLite uses rollback journaling: release the read
+                # lock before writing batches into another job of the same DB.
+                yield from (tuple(row.values()) for row in previous['store'].rows(sql,parameters))
+            else:
+                yield from source.execute(sql,parameters)
+
+        def copy(table, sql, parameters, remote=None, local=None):
             batch = []
-            for record in rows:
+            for record in records(sql, parameters):
                 checkpoint()
-                row = tuple(record.values()) if isinstance(record,dict) else tuple(record)
+                row = tuple(record)
                 if remote is not None: remote_path(row[remote])
                 if local is not None:
-                    if table == 'names' and row[0].startswith('@output:'):
-                        # Keep collision reservations, without touching report/log files.
-                        parts=relative_parts(row[local])
-                        if len(str(Path(root).absolute().joinpath(*parts)))>30000:
-                            raise PathError('Путь превышает предел файловой системы')
-                    else:safe_join(root,row[local])
-                batch.append((job_id,*row))
-                if len(batch)>=200:
-                    with store.db() as target:
-                        target.executemany('INSERT OR IGNORE INTO '+table+' VALUES('+','.join('?' for _ in batch[0])+')',batch)
-                    count+=len(batch); progress(count); batch.clear()
-                    if details:details(count,total,table)
-            if batch:
-                with store.db() as target:
-                    target.executemany('INSERT OR IGNORE INTO '+table+' VALUES('+','.join('?' for _ in batch[0])+')',batch)
-                count+=len(batch); progress(count)
-                if details:details(count,total,table)
+                    relative_parts(row[local])
+                    if root_length+1+len(row[local])>30000:
+                        raise PathError('Путь превышает предел файловой системы')
+                batch.append((job_id, *row))
+                if len(batch) == 200:
+                    write(table, batch)
+                    batch.clear()
+            if batch: write(table, batch)
+
+        def write(table, batch):
+            with store.db() as target:
+                target.executemany('INSERT OR IGNORE INTO '+table+' VALUES('+','.join('?' for _ in batch[0])+')',batch)
+
+        # Retain change reports and collision-safe names without filesystem IO.
+        if inventory in available:
+            copy('baseline', 'SELECT path,kind,meta FROM '+inventory+where, args, remote=0)
+        if same:
+            copy('baseline', "SELECT b.path,b.kind,b.meta FROM baseline b LEFT JOIN changes c ON c.job=b.job AND c.path=b.path WHERE b.job=? AND (c.status='unknown' OR ?=0)",
+                 (previous['id'],previous['job']['scan_complete']), remote=0)
+        if 'names' in available:
+            copy('names', 'SELECT identity,local,folded FROM names'+where+(' AND ' if where else ' WHERE ')+
+                 "(identity LIKE 'disk:/%' OR identity LIKE '@preview:disk:/%' OR identity LIKE '@output:%' OR identity='@service')", args, local=1)
+        if 'partials' in available:
+            copy('partials','SELECT path,type,local,fingerprint,size,sha256,etag,total FROM partials'+where,args,remote=0,local=2)
+
+        if 'artifacts' not in available:
+            if details: details(0, 0, 'files')
+            return
+        # One progress item per source file, even when both copies are present.
+        total = source.execute('SELECT COUNT(DISTINCT path) FROM artifacts'+where,args).fetchone()[0]
+        if details: details(0, total, 'files')
+        cached = same and 'verification_cache' in available
+        join = ' LEFT JOIN verification_cache v ON v.job=a.job AND v.local=a.local' if cached else ''
+        sql = 'SELECT a.path,a.type,a.local,a.size,a.sha256,a.fingerprint,a.preview_size,'+('v.signature' if cached else 'NULL')+' FROM artifacts a'+join+(' WHERE a.job=?' if same else '')+' ORDER BY a.path,a.type'
+        batch, cache_batch = [], []
+        done = 0
+        last_path = None
+
+        def flush():
+            if not batch: return
+            with store.db() as target:
+                target.executemany('INSERT OR IGNORE INTO artifacts VALUES(?,?,?,?,?,?,?,?)', batch)
+                target.executemany('INSERT OR IGNORE INTO verification_cache VALUES(?,?,?)', cache_batch)
+            batch.clear()
+            cache_batch.clear()
+            progress(done)
+            if details: details(done,total,'files')
+
+        for record in records(sql,args):
+            checkpoint()
+            path,kind,local,size,sha,stamp,preview_size,signature = record
+            remote_path(path)
+            relative_parts(local)
+            if root_length+1+len(local)>30000:
+                raise PathError('Путь превышает предел файловой системы')
+            if kind not in ('original','preview'):
+                raise ValueError('Локальная опись содержит неизвестный тип копии. Выберите прежнюю папку результатов заново.')
+            if path != last_path:
+                if len(batch) >= 200: flush()
+                done += 1
+                last_path = path
+            batch.append((job_id,path,kind,local,size,sha,stamp,preview_size))
+            # A portable manifest may never authorize skipping content hashing.
+            if signature is not None and kind in ('original','preview'):
+                cache_batch.append((job_id,local,signature))
+        flush()
 
 
 def save_import(store, job_id, checkpoint=lambda: None):

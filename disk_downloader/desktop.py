@@ -260,8 +260,8 @@ def launch(main, inspect_window=None):
                         counts='Уточняем число файлов…' if job.get('statistics_pending') else f"Файлов обработано: {job.get('processed',0)} / {job.get('files',0)}. Оригиналы: {job.get('originals',0)}. Превью: {job.get('previews',0)}."
                         current=action[0] if action else {}
                         percent=int(job.get('percent') or 0)
-                        if current.get('unit') in ('records','objects','files') and current.get('size') is not None:
-                            counts=f"{'Записей истории' if current['unit']=='records' else 'Файлов' if current['unit']=='files' else 'Объектов'}: {current['done']} / {current['size']}"
+                        if current.get('unit') in ('records','objects','files','local_files') and current.get('size') is not None:
+                            counts=f"{'Записей истории' if current['unit']=='records' else 'Файлов' if current['unit'] in ('files','local_files') else 'Объектов'}: {current['done']} / {current['size']}"
                             percent=int(min(100,current['done']*100/max(1,current['size'])))
                         self.text(5,job.get('pause_reason') or job.get('health',{}).get('warning') or job.get('error') or job.get('network_warning') or counts)
                         self.user.SendMessageW(self.controls[3],0x0402,percent,0)

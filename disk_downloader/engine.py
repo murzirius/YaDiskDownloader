@@ -16,7 +16,7 @@ import requests
 from PIL import Image
 
 from .api import APIError, Deadline, NetworkError, PausedRequest, PREVIEW_MAX_BYTES, SIZES, Suspended, attempt_count, retry_delay, validate_resource
-from .import_state import find_import, inherit, save_import
+from .import_state import find_import, inherit, read_import, save_import
 from .file_types import FILE_TYPES, file_type, preview_type, selected_type
 from .estimation import RemainingTime, VerificationTime
 from .paths import file_signature, forget_temporary, PathError, component, digest, native, normalize_selection, parent_path, publish, remote_path, reserve_output, safe_join, suffix, temporary_file
@@ -723,12 +723,11 @@ class Engine:
                 if source.get('job'):
                     previous = {'job':self.store.job(source['job']),'store':self.store,'id':source['job']}
                 else:
-                    previous = find_import(self.store, Path(job['root']), exclude_job=job_id)
+                    previous = read_import(job['root'], source['manifest'])
                 if not previous:
                     raise ValueError('На ПК не найдена прежняя опись загрузки. Проверьте папку или создайте дозагрузку заново.')
-                history_labels = {'baseline':'список файлов и папок','names':'имена и пути','artifacts':'скачанные копии','partials':'недокачанные части','verification_cache':'результаты прежних проверок'}
-                control.progress(job['root'],0,None,'Подсчитываем записи истории',unit='records')
-                inherit(self.store,job_id,previous,control.check,details=lambda count,total,stage:control.progress(job['root'],count,total,'Читаем историю: '+history_labels.get(stage,'подготовка списка'),unit='records'))
+                control.progress(job['root'],0,None,'Готовим проверку скачанных файлов',unit='local_files')
+                inherit(self.store,job_id,previous,control.check,details=lambda count,total,stage:control.progress(job['root'],count,total,'Подготовка списка скачанных файлов' if stage=='files' else 'Готовим проверку скачанных файлов',unit='local_files'))
                 settings = self.store.job(job_id)['settings']
                 settings.pop('_inherit_source',None)
                 self.store.update_job(job_id,settings=json.dumps(settings,ensure_ascii=False))
@@ -1116,7 +1115,7 @@ class Engine:
                 if original:
                     need_preview = want_both and preview_type(meta)
                     desired = ('pending' if need_preview and not preview else 'existing',2,'existing_verified','existing_verified' if preview else 'not_requested' if need_preview else 'not_needed')
-                    if not want_both:
+                    if not want_both and (entry['path'],'preview') in control.verification_records:
                         self.remove_preview(job, entry['path'], control)
                 elif preview and job['settings'].get('missing_policy','originals') == 'any_result':
                     desired = ('existing',1,'not_requested','existing_verified')

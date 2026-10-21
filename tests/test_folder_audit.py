@@ -142,7 +142,7 @@ def test_inheritance_runs_outside_request_and_can_stop_resume(system,monkeypatch
     assert time.monotonic()-started<test_timeout(2)
     assert entered.wait(test_timeout(5))
     activity=engine.controls[job_id].snapshot()['active']
-    assert activity[0]['unit']=='records' and activity[0]['done']==1 and activity[0]['size']==4
+    assert activity[0]['unit']=='local_files' and activity[0]['done']==1 and activity[0]['size']==4
     assert engine.lock.acquire(blocking=False)
     engine.lock.release()
     engine.action(job_id,'stop')
