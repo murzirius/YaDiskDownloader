@@ -179,3 +179,25 @@ def test_portable_inventory_uses_sqlite_uri_compatible_with_python_311(system,mo
     previous=read_import(first['root'],manifest)
     assert previous['inventory_available']
     assert previous['job']['settings']['paths']==['disk:/']
+
+
+@pytest.mark.skipif(__import__('os').name!='nt',reason='Windows UNC inventory URI')
+@pytest.mark.parametrize('raw,expected',[
+    (r'\\server\share\Photo set\опись.sqlite3','file:////server/share/Photo%20set/%D0%BE%D0%BF%D0%B8%D1%81%D1%8C.sqlite3?mode=ro'),
+    (r'\\?\UNC\server\share\inventory.sqlite3','file:////server/share/inventory.sqlite3?mode=ro'),
+    (r'\\?\C:\Photo set\inventory.sqlite3','file:///C:/Photo%20set/inventory.sqlite3?mode=ro'),
+])
+def test_inventory_uri_preserves_unc_without_sqlite_authority(raw,expected,monkeypatch):
+    from disk_downloader.import_state import _sqlite_uri
+    monkeypatch.setattr(Path,'resolve',lambda self:self)
+    assert _sqlite_uri(raw)==expected
+
+
+@pytest.mark.skipif(__import__('os').name!='nt',reason='Windows device path')
+def test_portable_inventory_accepts_explicit_device_root(system):
+    from disk_downloader.import_state import read_import
+    from disk_downloader.paths import native
+    engine,api,_=system;api.file('disk:/kept.bin',b'kept',preview=False)
+    first=run_job(system,mode='fallback')
+    manifest=engine.store.job(first['id'])['settings']['manifest_local']
+    assert read_import(native(first['root']),manifest)['inventory_available']

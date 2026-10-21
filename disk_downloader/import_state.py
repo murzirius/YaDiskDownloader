@@ -3,12 +3,29 @@ import os
 import sqlite3
 from contextlib import closing
 from pathlib import Path
+from urllib.parse import quote
 from .paths import remote_path,relative_parts,PathError
 
 from .paths import forget_temporary, publish, replace_owned, reserve_output, safe_join, temporary_file
 
 
 FORMAT = "disk-local-import-v1"
+
+
+def _sqlite_uri(filename):
+    """Read-only URI compatible with Windows device and UNC paths."""
+    filename = Path(filename).resolve()
+    if os.name == 'nt':
+        value = str(filename)
+        if value.startswith('\\\\?\\UNC\\'):
+            value = '\\\\' + value[8:]
+        elif value.startswith('\\\\?\\'):
+            value = value[4:]
+        if value.startswith('\\\\'):
+            # Empty URI authority; //server/share remains a Windows UNC path.
+            return 'file://' + quote(value.replace('\\','/'), safe='/') + '?mode=ro'
+        filename = Path(value)
+    return filename.as_uri() + '?mode=ro'
 
 
 def find_import(store, root, exclude_job=None):
@@ -47,7 +64,7 @@ def read_import(root, local):
     # by SQLite on that runtime. Path validation still happens before opening.
     safe_join(root, local)
     filename = Path(root) / local
-    with closing(sqlite3.connect(filename.resolve().as_uri() + '?mode=ro', uri=True)) as db:
+    with closing(sqlite3.connect(_sqlite_uri(filename), uri=True)) as db:
         meta = dict(db.execute('SELECT key,value FROM import_meta'))
         if meta.get('format') != FORMAT:
             raise ValueError('Локальная опись загрузки имеет неизвестный формат. Выберите прежнюю папку результатов заново.')
@@ -69,7 +86,7 @@ def inherit(store, job_id, previous, checkpoint=lambda: None, progress=lambda co
     root_length = len(os.path.abspath(store.job(job_id)['root']))
     same = bool(previous.get('store'))
     filename = previous['store'].filename if same else previous['file']
-    with closing(sqlite3.connect(Path(filename).resolve().as_uri()+'?mode=ro',uri=True)) as source:
+    with closing(sqlite3.connect(_sqlite_uri(filename),uri=True)) as source:
         available = {row[0] for row in source.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         where = ' WHERE job=?' if same else ''
         args = (previous['id'],) if same else ()
@@ -167,7 +184,7 @@ def save_import(store, job_id, checkpoint=lambda: None):
         filename = safe_join(job["root"], local)
         if os.path.isfile(filename):
             try:
-                with closing(sqlite3.connect((Path(job["root"]) / local).resolve().as_uri() + "?mode=ro", uri=True)) as db:
+                with closing(sqlite3.connect(_sqlite_uri(Path(job["root"]) / local), uri=True)) as db:
                     owned = db.execute("SELECT value FROM import_meta WHERE key='format'").fetchone() == (FORMAT,)
             except sqlite3.Error:
                 pass
