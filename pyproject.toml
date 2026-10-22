@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "yadisk-downloader"
 dynamic = ["version", "dependencies"]
-description = "Local Yandex Disk downloader with browser and terminal controls"
+description = "Local Yandex Disk downloader with browser controls and a Linux CLI"
 requires-python = ">=3.11"
 license = "MIT"
 

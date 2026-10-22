@@ -80,8 +80,6 @@ jobs:
       - run: python build_windows.py --output dist/windows --work build/windows
       - name: Smoke actual EXE, UI, patched SQLite, tray and full shutdown
         run: python tools/smoke_windows_exe.py --exe dist/windows/YaDiskDownloader.exe --output smoke-results.json
-      - name: Smoke actual Windows console application
-        run: python tools/smoke_cli.py --exe dist/windows/YaDiskDownloader-CLI.exe --output cli-smoke-results.json
       - name: Check background SQLite diagnostics in actual EXE
         run: python tools/check_exe_database_errors.py --exe dist/windows/YaDiskDownloader.exe --output database-error-results.json
       - name: Recover unreadable application history in actual EXE
@@ -95,7 +93,6 @@ jobs:
           name: windows-exe-smoke
           path: |
             smoke-results.json
-            cli-smoke-results.json
             desktop-dpi-results.json
             database-error-results.json
             history-recovery-application.json
@@ -108,7 +105,6 @@ jobs:
           name: Windows-release
           path: |
             dist/release/*-Windows-x64.zip
-            dist/release/*-Windows-CMD.zip
       - name: Publish checked release assets
         if: startsWith(github.ref, 'refs/tags/v')
         env:
@@ -117,8 +113,7 @@ jobs:
         shell: pwsh
         run: |
           $windowsArchive = "dist/release/YaDiskDownloader-${env:RELEASE_TAG}-Windows-x64.zip"
-          $cmdArchive = "dist/release/YaDiskDownloader-${env:RELEASE_TAG}-Windows-CMD.zip"
-          foreach ($archive in @($windowsArchive, $cmdArchive)) {
+          foreach ($archive in @($windowsArchive)) {
             if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
               throw "Release archive is missing: $archive"
             }
@@ -128,7 +123,7 @@ jobs:
             gh release create $env:RELEASE_TAG --verify-tag --title "YaDiskDownloader $env:RELEASE_TAG" --notes-file "docs/release-$env:RELEASE_TAG.md"
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
-          gh release upload $env:RELEASE_TAG $windowsArchive $cmdArchive --clobber
+          gh release upload $env:RELEASE_TAG $windowsArchive --clobber
           exit $LASTEXITCODE
 
   native_cli:
@@ -136,7 +131,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-15, macos-15-intel]
+        os: [ubuntu-22.04]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6

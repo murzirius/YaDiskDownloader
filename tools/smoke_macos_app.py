@@ -11,7 +11,7 @@ import tempfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from disk_downloader.cli import Client
+from disk_downloader.service_control import Client
 import requests
 
 
@@ -58,7 +58,7 @@ def main():
             app = root / 'Installed Applications' / source.name
             app.parent.mkdir()
             run(['ditto', source, app])
-            assert digest(source / 'Contents/MacOS/yadisk') == digest(app / 'Contents/MacOS/yadisk')
+            assert digest(source / 'Contents/Helpers/YaDiskDownloader-Service') == digest(app / 'Contents/Helpers/YaDiskDownloader-Service')
         finally:
             run(['hdiutil', 'detach', mount])
         run(['codesign', '--verify', '--deep', '--strict', app])
@@ -78,9 +78,13 @@ def main():
             resource = client.session.get(client.base + '/static/file-icons.svg', timeout=5)
             assert resource.ok and b'<symbol id="folder"' in resource.content
             assert client.call('/api/status')['jobs'] == []
-            # The installed executable remains usable as a terminal client.
-            cli = run([app / 'Contents/MacOS/yadisk', '--port', str(port), '--state-dir', state, '--json', 'status'])
-            assert json.loads(cli.stdout)['jobs'] == []
+            service = app / 'Contents/Helpers/YaDiskDownloader-Service'
+            assert not (app / 'Contents/MacOS/yadisk').exists()
+            assert not (app / 'Contents/MacOS/YaDiskDownloader-CLI').exists()
+            status = run([service, '--port', str(port), '--state-dir', state, 'status'])
+            assert json.loads(status.stdout)['jobs'] == []
+            rejected = subprocess.run([str(service), 'download'], capture_output=True, timeout=10)
+            assert rejected.returncode == 2
             # Exercise Cocoa's actual Quit action, not an HTTP replacement for it.
             script = 'on run argv\ntell application (item 1 of argv) to quit\nend run'
             run(['osascript', '-e', script, str(app)], timeout=95)
@@ -91,10 +95,10 @@ def main():
             with (state / 'server.lock').open('r+b') as lock:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-            result = {'actual_app': True, 'actual_dmg': True, 'version': runtime['version'],
+            result = {'actual_app': True, 'actual_dmg': True, 'version': runtime['version'], 'build': runtime['build'],
                       'readonly_mount': True, 'drag_install_equivalent': True, 'after_image_eject': True,
                       'signature_verified': True, 'hi_dpi_icon': True, 'finder_launch': True,
-                      'browser_resources': True, 'packaged_cli': True, 'cocoa_quit': True,
+                      'browser_resources': True, 'private_service': True, 'public_cli_absent': True, 'cocoa_quit': True,
                       'server_fully_stopped': True, 'state_lock_released': True, 'apple_notarized': False}
             args.output.write_text(json.dumps(result, indent=2), encoding='utf-8')
             print(json.dumps(result))

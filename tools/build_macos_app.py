@@ -36,18 +36,19 @@ def stage_bundle(binary, output, architecture):
     """Refuse to overwrite an existing bundle or follow an input symlink."""
     binary = Path(binary)
     if binary.is_symlink() or not binary.is_file():
-        raise ValueError('The native CLI must be a regular file')
+        raise ValueError('The application service must be a regular file')
     notices = binary.parent / 'THIRD_PARTY_NOTICES.txt'
     if notices.is_symlink() or not notices.is_file():
-        raise ValueError('The native CLI license notices are missing')
+        raise ValueError('The application service license notices are missing')
     info = bundle_info(architecture)
     app = Path(output) / 'YaDiskDownloader.app'
     app.mkdir(parents=True, exist_ok=False)
     contents = app / 'Contents'
     (contents / 'MacOS').mkdir(parents=True)
     (contents / 'Resources').mkdir()
-    shutil.copy2(binary, contents / 'MacOS' / 'yadisk')
-    (contents / 'MacOS' / 'yadisk').chmod(0o755)
+    (contents / 'Helpers').mkdir()
+    shutil.copy2(binary, contents / 'Helpers' / 'YaDiskDownloader-Service')
+    (contents / 'Helpers' / 'YaDiskDownloader-Service').chmod(0o755)
     for source, name in [(ROOT / 'LICENSE', 'LICENSE.txt'), (notices, notices.name), (ROOT / 'docs' / 'macos.md', 'macOS.txt')]:
         shutil.copyfile(source, contents / 'Resources' / name)
     (contents / 'Info.plist').write_bytes(plistlib.dumps(info, sort_keys=True))
@@ -71,7 +72,7 @@ def main():
     # file(1) inspects the actual Mach-O architecture before creating a bundle.
     description = subprocess.check_output(['file', str(binary)], text=True, timeout=10)
     if architecture not in description:
-        parser.error('The CLI executable architecture differs from this Mac')
+        parser.error('The application service architecture differs from this Mac')
     output = args.output.resolve()
     app = stage_bundle(binary, output / 'image', architecture)
     icon = app / 'Contents' / 'Resources' / 'AppIcon.icns'
@@ -81,7 +82,7 @@ def main():
     run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Wextra', '-Werror',
          '-Wno-unused-parameter', '-Wno-deprecated-declarations', '-mmacosx-version-min=13.0', '-arch', architecture,
          '-framework', 'Cocoa', ROOT / 'native' / 'macos_launcher.m', '-o', executable])
-    # The CLI's embedded PyInstaller binaries were signed during its own build.
+    # The service's embedded PyInstaller binaries were signed during its own build.
     # Sign the new launcher, then the outer bundle; do not rewrite nested binaries.
     run(['codesign', '--force', '--sign', '-', executable])
     run(['codesign', '--force', '--sign', '-', app])

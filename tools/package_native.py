@@ -11,9 +11,9 @@ from disk_downloader import __version__
 
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--binary',type=Path,required=True);parser.add_argument('--output',type=Path,required=True);args=parser.parse_args()
-    if sys.platform not in ('darwin','linux'):parser.error('Build on macOS or Linux')
+    if sys.platform != 'linux':parser.error('The CLI is available only on Linux')
     binary=args.binary.resolve(strict=True);root=Path(__file__).resolve().parents[1]
-    system='macOS' if sys.platform=='darwin' else 'Linux';machine=platform.machine().lower();arch='arm64' if machine in ('arm64','aarch64') else 'x64' if machine in ('amd64','x86_64') else machine
+    system='Linux';machine=platform.machine().lower();arch='arm64' if machine in ('arm64','aarch64') else 'x64' if machine in ('amd64','x86_64') else machine
     args.output.mkdir(parents=True,exist_ok=True)
     output=args.output/f'YaDiskDownloader-v{__version__}-{system}-{arch}.tar.gz'
     def executable(info):

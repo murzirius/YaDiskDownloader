@@ -1,5 +1,9 @@
 #!/bin/sh
 set -eu
+if [ "$(uname -s)" != "Linux" ]; then
+    echo "Этот способ запуска доступен только в Linux. В macOS откройте приложение из DMG." >&2
+    exit 2
+fi
 cd -- "$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
 python_bin=${YADISK_PYTHON:-python3}
 "$python_bin" -c 'import sys; assert sys.version_info >= (3,11), "Python 3.11 or newer is required"'

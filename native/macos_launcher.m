@@ -118,9 +118,9 @@
 - (void)runCommand:(NSString *)command completion:(void (^)(int, NSString *))completion {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSTask *task = [[NSTask alloc] init];
-        task.executableURL = [NSBundle.mainBundle.executableURL.URLByDeletingLastPathComponent URLByAppendingPathComponent:@"yadisk"];
+        task.executableURL = [NSBundle.mainBundle.bundleURL URLByAppendingPathComponent:@"Contents/Helpers/YaDiskDownloader-Service"];
         NSMutableArray *arguments = [self.options mutableCopy];
-        [arguments addObjectsFromArray:@[@"--json", command]];
+        [arguments addObject:command];
         task.arguments = arguments;
         task.standardInput = [NSFileHandle fileHandleWithNullDevice];
         NSPipe *pipe = [NSPipe pipe];

@@ -31,14 +31,24 @@ def test_portable_originals_count_before_start_without_media_requests(system, tm
     assert api.media_calls == [('disk:/new.bin', 'original')]
 
 
-def test_cmd_distribution_has_launcher_dependencies_and_no_private_state(tmp_path):
-    files = package(tmp_path)
-    cmd = next(file for file in files if file.name.endswith('-Windows-CMD.zip'))
-    with zipfile.ZipFile(cmd) as archive:
-        names = set(archive.namelist())
-        for name in ('start.cmd', 'start.ps1', 'run.py', 'START-CMD.txt', 'requirements.txt', 'requirements-bootstrap.txt', 'disk_downloader/engine.py', 'disk_downloader/templates/index.html', 'disk_downloader/static/app.js'):
-            assert 'YaDiskDownloader-CMD/' + name in names
-        assert not any(any(part in ('.state', '.venv', '__pycache__') for part in Path(name).parts) for name in names)
+def test_windows_distribution_has_only_gui_exe_and_no_private_state(tmp_path):
+    binary=tmp_path/'binary'/'YaDiskDownloader.exe'
+    binary.parent.mkdir()
+    binary.write_bytes(b'example-gui-exe')
+    (binary.parent/'YaDiskDownloader-CLI.exe').write_bytes(b'stale-cli-must-not-ship')
+    (binary.parent/'THIRD_PARTY_NOTICES.txt').write_text('licenses',encoding='utf-8')
+    wheels=binary.parent/'third_party'
+    wheels.mkdir()
+    (wheels/'pystray-0.19.5-py2.py3-none-any.whl').write_bytes(b'test-source-wheel')
+    output=tmp_path/'release'
+    files=package(output,binary)
+    assert len(files)==1 and files[0].name.endswith('-Windows-x64.zip')
+    assert list(output.iterdir())==files
+    with zipfile.ZipFile(files[0]) as archive:
+        names=set(archive.namelist())
+        assert archive.read('YaDiskDownloader/YaDiskDownloader.exe')==b'example-gui-exe'
+        assert not any(name.endswith(('.cmd','.ps1')) or 'YaDiskDownloader-CLI' in name for name in names)
+        assert not any(any(part in ('.state','.venv','__pycache__') for part in Path(name).parts) for name in names)
         assert archive.testzip() is None
 
 

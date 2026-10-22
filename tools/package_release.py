@@ -1,14 +1,14 @@
 """Build distribution ZIPs from an explicit allowlist, without local state."""
 import argparse
-import hashlib
 import os
 import re
+import tempfile
 import zipfile
 from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[1]
 VERSION=re.search(r'__version__\s*=\s*"([0-9.]+)"',(ROOT/'disk_downloader/__init__.py').read_text(encoding='utf-8')).group(1)
-ROOT_FILES=('pyproject.toml','start.sh','start.command','yadisk.cmd','build_posix.py','run_cli.py','README.md','LICENSE','.gitignore','run.py','build_windows.py','windows.manifest','start.cmd','start.ps1','START-CMD.txt','requirements.txt','requirements-dev.txt','requirements-build.txt','requirements-bootstrap.txt')
+ROOT_FILES=('pyproject.toml','start.sh','build_posix.py','build_macos_service.py','run_cli.py','run_macos_service.py','README.md','LICENSE','.gitignore','run.py','build_windows.py','windows.manifest','requirements.txt','requirements-dev.txt','requirements-build.txt','requirements-bootstrap.txt')
 
 
 def source_files():
@@ -23,28 +23,23 @@ def source_files():
 
 
 def package(output, executable=None):
+    if executable is None:
+        raise ValueError('Windows EXE is required')
+    executable=Path(executable).resolve(strict=True)
+    if not executable.is_file(): raise ValueError('EXE not found')
+    output=Path(output)
     output.mkdir(parents=True,exist_ok=True)
-    source=output/f'YaDiskDownloader-v{VERSION}-source.zip'
-    with zipfile.ZipFile(source,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as archive:
-        for file in source_files(): archive.write(file,'disk-downloader/'+file.relative_to(ROOT).as_posix())
-    files=[source]
-    cmd=output/f'YaDiskDownloader-v{VERSION}-Windows-CMD.zip'
-    with zipfile.ZipFile(cmd,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as archive:
-        for file in source_files():
-            relative=file.relative_to(ROOT)
-            if relative.parts[0]=='disk_downloader' or relative.as_posix() in ('README.md','LICENSE','run.py','start.cmd','start.ps1','START-CMD.txt','requirements.txt','requirements-bootstrap.txt','yadisk.cmd','pyproject.toml','docs/usage.md','docs/cli.md','docs/features-v1.5.0.md','docs/validation-v1.5.0.md','docs/scan-pipeline-validation.md','docs/macos.md','docs/architecture.md','docs/testing.md'):
-                archive.write(file,'YaDiskDownloader-CMD/'+relative.as_posix())
-    files.append(cmd)
-    if executable:
-        executable=executable.resolve()
-        if not executable.is_file(): raise ValueError('EXE not found')
-        windows=output/f'YaDiskDownloader-v{VERSION}-Windows-x64.zip'
-        with zipfile.ZipFile(windows,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as archive:
+    windows=output/f'YaDiskDownloader-v{VERSION}-Windows-x64.zip'
+    # The source required by dependency licenses stays inside the EXE archive;
+    # never leave a separate source or checksum asset in the release directory.
+    with tempfile.TemporaryDirectory(prefix='.package-',dir=output) as folder:
+        temporary=Path(folder)
+        source=temporary/f'YaDiskDownloader-v{VERSION}-source.zip'
+        with zipfile.ZipFile(source,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as archive:
+            for file in source_files(): archive.write(file,'disk-downloader/'+file.relative_to(ROOT).as_posix())
+        candidate=temporary/windows.name
+        with zipfile.ZipFile(candidate,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as archive:
             archive.write(executable,'YaDiskDownloader/YaDiskDownloader.exe')
-            cli=executable.with_name('YaDiskDownloader-CLI.exe')
-            if cli.is_file():
-                archive.write(cli,'YaDiskDownloader/YaDiskDownloader-CLI.exe')
-                archive.write(ROOT/'yadisk.cmd','YaDiskDownloader/yadisk.cmd')
             for name in ('README.md','LICENSE','docs/usage.md','docs/features-v1.3.0.md','docs/cli.md','docs/features-v1.5.0.md','docs/validation-v1.5.0.md','docs/scan-pipeline-validation.md','docs/macos.md','docs/architecture.md','docs/testing.md',f'docs/release-v{VERSION}.md'):
                 archive.write(ROOT/name,'YaDiskDownloader/'+name)
             archive.write(executable.parent/'THIRD_PARTY_NOTICES.txt','YaDiskDownloader/THIRD_PARTY_NOTICES.txt')
@@ -52,12 +47,10 @@ def package(output, executable=None):
             wheels=list((executable.parent/'third_party').glob('pystray-0.19.5-*.whl'))
             if len(wheels)!=1: raise ValueError('Original pystray source wheel is required')
             archive.write(wheels[0],'YaDiskDownloader/third_party/'+wheels[0].name)
-        files.append(windows)
-    for file in files:
-        with zipfile.ZipFile(file) as archive:
+        with zipfile.ZipFile(candidate) as archive:
             if archive.testzip() is not None: raise ValueError('ZIP integrity check failed')
-    (output/f'SHA256SUMS-v{VERSION}.txt').write_text(''.join(hashlib.sha256(file.read_bytes()).hexdigest()+'  '+file.name+'\n' for file in files),encoding='ascii')
-    return files
+        candidate.replace(windows)
+    return [windows]
 
 
 if __name__=='__main__':
@@ -65,4 +58,5 @@ if __name__=='__main__':
     if args.check_tag:
         if os.environ.get('RELEASE_TAG')!='v'+VERSION: raise SystemExit('Release tag does not match application version')
     else:
+        if not args.exe: parser.error('Windows EXE is required')
         for file in package(args.output,args.exe): print(file.name)

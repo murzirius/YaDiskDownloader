@@ -42,14 +42,8 @@ def main():
     from disk_downloader.tray import image
     icon = work / "app.ico"
     image(256).save(icon, sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])
-    command = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--onefile", "--windowed", "--noupx", "--manifest", str(root / "windows.manifest"), "--name", "YaDiskDownloader", "--icon", str(icon), "--distpath", str(output), "--workpath", str(work / "cache"), "--specpath", str(work), "--hidden-import", "pystray._win32", "--add-data", str(root / "disk_downloader" / "templates") + ";disk_downloader/templates", "--add-data", str(root / "disk_downloader" / "static") + ";disk_downloader/static", str(root / "run.py")]
+    command = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--onefile", "--windowed", "--noupx", "--exclude-module", "disk_downloader.cli", "--manifest", str(root / "windows.manifest"), "--name", "YaDiskDownloader", "--icon", str(icon), "--distpath", str(output), "--workpath", str(work / "cache"), "--specpath", str(work), "--hidden-import", "pystray._win32", "--add-data", str(root / "disk_downloader" / "templates") + ";disk_downloader/templates", "--add-data", str(root / "disk_downloader" / "static") + ";disk_downloader/static", str(root / "run.py")]
     subprocess.run(command, cwd=root, check=True)
-    cli_command = list(command)
-    cli_command[cli_command.index('--windowed')] = '--console'
-    cli_command[cli_command.index('--name')+1] = 'YaDiskDownloader-CLI'
-    cli_command[-1] = str(root/'run_cli.py')
-    cli_command += ['--hidden-import','run']
-    subprocess.run(cli_command, cwd=root, check=True)
     notices(output)
 
 

@@ -180,6 +180,7 @@ def test_rate_limit_changes_release_wait_without_deadlock():
     assert done.wait(test_timeout(2));thread.join()
 
 
+@pytest.mark.skipif(sys.platform != 'linux', reason='The public CLI is Linux-only')
 def test_cli_background_survives_its_launch_terminal_process(tmp_path):
     from disk_downloader.cli import Client
     with socket.socket() as probe:probe.bind(('127.0.0.1',0));port=probe.getsockname()[1]
@@ -207,12 +208,13 @@ def test_cli_background_survives_its_launch_terminal_process(tmp_path):
             except psutil.TimeoutExpired:process.kill();process.wait(timeout=5)
 
 
-def test_theme_icons_packaged_and_cli_has_no_token_argument():
+def test_theme_icons_packaged_and_cli_has_no_token_argument(monkeypatch):
     root=Path(__file__).resolve().parents[1]
     import importlib.util
     spec=importlib.util.spec_from_file_location('package',root/'tools/package_release.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
     assert root/'disk_downloader/static/file-icons.svg' in set(module.source_files())
     from disk_downloader.cli import main
+    monkeypatch.setattr(sys,'platform','linux')
     with pytest.raises(SystemExit):main(['connect','--token','never-pass-secret-in-arguments'])
 
 
@@ -310,7 +312,7 @@ def test_system_helpers_restore_library_environment(monkeypatch):
 
 def test_frozen_background_process_has_independent_resources(monkeypatch,tmp_path):
     import requests
-    from disk_downloader import cli
+    from disk_downloader import service_control as cli
     calls=[];options=[]
     def client(*args):
         calls.append(args)
