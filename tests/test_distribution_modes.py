@@ -1,8 +1,19 @@
 import json
 import sys
+from pathlib import Path
+import subprocess
 
 import pytest
 import requests
+
+
+def test_gui_entry_does_not_dispatch_terminal_commands(tmp_path):
+    entry = Path(__file__).resolve().parents[1] / 'run.py'
+    result = subprocess.run([sys.executable, '-X', 'utf8', str(entry), 'status'], cwd=tmp_path,
+                            capture_output=True, text=True, encoding='utf-8', timeout=20)
+    assert result.returncode == 2
+    assert 'unrecognized arguments: status' in result.stderr
+    assert not list(tmp_path.iterdir())
 
 
 @pytest.mark.parametrize('platform', ['win32', 'darwin'])

@@ -144,10 +144,6 @@ def main():
 
 if __name__ == "__main__":
     try:
-        from disk_downloader.cli import COMMANDS
-        if any(argument in COMMANDS for argument in sys.argv[1:2]):
-            from disk_downloader.cli import main as cli_main
-            sys.exit(cli_main())
         window = os.name=='nt' and '--no-window' not in sys.argv and '--apply-update' not in sys.argv and ('--window' in sys.argv or frozen() and '--no-browser' not in sys.argv)
         sys.exit(desktop.launch(main) if window else main())
     except Exception:
