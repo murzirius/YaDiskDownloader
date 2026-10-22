@@ -163,10 +163,11 @@ def test_throttling_hold_preserves_network_deadline_and_cancellation():
         time.sleep(0.14)
         with pytest.raises(APIError):
             deadline.check()
-    with Deadline(1, cancelled=lambda: True) as deadline:
+    # Cancellation must work while the time budget is held, even without a
+    # network timeout. Wait for the event instead of assuming a 60 ms schedule.
+    with Deadline(0, cancelled=lambda: True) as deadline:
         with deadline.hold():
-            time.sleep(0.06)
-            assert deadline.expired.is_set()
+            assert deadline.expired.wait(test_timeout(0.5))
 
 
 def test_rate_limit_can_be_stopped_immediately():
