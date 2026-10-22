@@ -40,7 +40,7 @@ def package(output, executable=None):
         candidate=temporary/windows.name
         with zipfile.ZipFile(candidate,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as archive:
             archive.write(executable,'YaDiskDownloader/YaDiskDownloader.exe')
-            for name in ('README.md','LICENSE','docs/usage.md','docs/features-v1.3.0.md','docs/cli.md','docs/features-v1.5.0.md','docs/validation-v1.5.0.md','docs/scan-pipeline-validation.md','docs/macos.md','docs/architecture.md','docs/testing.md',f'docs/release-v{VERSION}.md'):
+            for name in ('README.md','LICENSE','docs/usage.md','docs/features-v1.3.0.md','docs/cli.md','docs/features-v1.5.0.md','docs/validation-v1.5.0.md','docs/scan-pipeline-validation.md','docs/validation-storage-v1.5.0.md','docs/macos.md','docs/architecture.md','docs/testing.md',f'docs/release-v{VERSION}.md'):
                 archive.write(ROOT/name,'YaDiskDownloader/'+name)
             archive.write(executable.parent/'THIRD_PARTY_NOTICES.txt','YaDiskDownloader/THIRD_PARTY_NOTICES.txt')
             archive.write(source,'YaDiskDownloader/source/'+source.name)

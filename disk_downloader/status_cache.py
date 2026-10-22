@@ -43,8 +43,10 @@ class StatusCache:
         control = self.engine.controls.get(key)
         thread = self.engine.threads.get(key)
         live = bool(thread and thread.is_alive())
-        result.update(control.snapshot() if live and control else {'active': [], 'speed': 0})
+        result.update(control.snapshot() if control else {'active': [], 'speed': 0, 'session':None})
+        if not live:result['active'] = []
         result['live'] = live
+        result['storage'] = control.storage_snapshot() if control else None
         result['requires_connection'] = not (live and control and not control.requires_connection())
         finishing = job['phase'] in ('ready', 'stopped', 'failed', 'completed', 'completed_with_errors')
         if live and control and not finishing:
@@ -61,7 +63,8 @@ class StatusCache:
 
     def refresh(self, key, token):
         try:
-            value = self.engine.status(key)
+            with self.engine.cached_storage_status():
+                value = self.engine.status(key)
             value['statistics_pending'] = False
             with self.lock:
                 if token[0] != self.generation:

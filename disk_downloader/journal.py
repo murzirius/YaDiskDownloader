@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .paths import forget_temporary, safe_join, temporary_file
 from .service_outputs import location, finish
+from .destination import export_available
 
 
 GROUPS = {"system": "Задание", "scan": "Обход диска", "original": "Оригиналы", "preview": "Превью", "cache": "Уже скачанное", "errors": "Ошибки и повторы", "archive": "Отчёты и ZIP"}
@@ -68,6 +69,9 @@ class Journal:
         due = time.monotonic() + self.interval
         while not self.stopped.wait(max(0, due - time.monotonic())):
             self.flush()
+            if not export_available(self.engine.controls.get(self.job_id)):
+                due = time.monotonic()+self.interval
+                continue
             try:
                 from .reports import write_reports, REPORT_LOCK
                 from .import_state import save_import
@@ -110,6 +114,9 @@ class Journal:
             return False
 
     def flush(self, final=False):
+        if not export_available(self.engine.controls.get(self.job_id)):
+            self.error = 'Накопитель недоступен. События сохранены в истории приложения; HTML-журнал обновится после подключения.'
+            return
         temp = None
         started = time.monotonic()
         def checkpoint():

@@ -92,11 +92,13 @@
         <div class="phase-line"><strong id="phase">—</strong><span id="percentage">—</span></div>
         <div id="resume-options" class="resume-options" hidden><strong>Как продолжить загрузку</strong><label class="field">Файлы, у которых уже есть превью<select id="resume-policy"><option value="originals">Попробовать скачать оригиналы</option><option value="any_result">Считать скачанными и пропустить</option></select></label><p id="resume-options-hint" class="hint">Сначала проверим папку и обновим прогресс. Готовые оригиналы заново скачиваться не будут.</p></div>
         <progress id="progress" max="100" value="0" aria-label="Прогресс задания"></progress>
+        <div id="storage-warning" class="storage-warning" role="status" aria-live="polite" hidden><strong>Накопитель недоступен</strong><p id="storage-warning-text"></p><p id="storage-retry-status" class="hint"></p><button id="stop-storage-retry" class="quiet">Оставить на паузе</button></div>
         <div class="actions job-controls"><button id="start-job" class="primary">Начать скачивание</button><button id="pause-job" title="Приостановить работу без потери прогресса">Пауза</button><button id="resume-job" class="primary">Продолжить</button><button id="stop-job" class="danger" title="Остановить текущее задание и сохранить прогресс">Остановить</button></div>
         <p id="job-hint" class="hint" role="status" aria-live="polite"></p>
         <button id="connect-for-job" class="primary wide" hidden>Подключить Диск, чтобы продолжить</button>
         <button id="open-job-folder" class="quiet wide">Открыть папку с результатами</button>
-        <div id="counters" class="counters"></div>
+        <section class="statistics-card" aria-labelledby="total-statistics-title"><h3 id="total-statistics-title">Всего</h3><p class="hint statistics-note">Общий результат этого задания, включая файлы из прежней загрузки.</p><div id="counters" class="counters"></div></section>
+        <section class="statistics-card session-card" aria-labelledby="session-statistics-title"><h3 id="session-statistics-title">Эта сессия</h3><p id="session-note" class="hint statistics-note"></p><div id="session-counters" class="counters"></div><p id="verification-live" class="hint" role="status"></p></section>
         <div id="active-files" class="active-files"></div>
         <div id="estimate-info" class="estimate-info"></div>
         <div class="actions"><button id="folder-volumes">Объём по папкам</button><button id="show-changes">Изменения</button></div>

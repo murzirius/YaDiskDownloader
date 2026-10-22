@@ -89,6 +89,12 @@ class Control:
         self.lock = threading.Lock()
         self.started = time.monotonic()
         self.transferred = 0
+        self.session_id = uuid.uuid4().hex
+        self.session_started_at = now()
+        self.session_saved_bytes = 0
+        self.session_originals = 0
+        self.session_previews = 0
+        self.session_errors = 0
         self.elapsed_before = 0
         self.pause_started = None
         self.finished = None
@@ -119,6 +125,14 @@ class Control:
         self.last_progress = self.started
         self.pause_acknowledged = False
         self.expected_waiters = 0
+        self.pause_kind = ''
+        self.pause_serial = 0
+        self.storage_problem = False
+        self.storage_problem_reason = ''
+        self.storage_retry_thread = None
+        self.storage_retry_due = None
+        self.storage_retry_attempt = 0
+        self.storage_retry_delays = (2, 4, 8, 16, 32, 60)
 
     def event(self, group, message, path="", level="info"):
         if self.journal:
@@ -174,13 +188,34 @@ class Control:
                 self.expected_waiters -= 1
                 self.last_progress = time.monotonic()
 
-    def pause(self):
+    def pause(self, source='user'):
         with self.condition:
+            # A destination probe must never override a user/policy/space pause.
+            if source == 'user' or not self.paused or self.pause_kind in ('storage','storage_manual'):
+                if source == 'user' or source != self.pause_kind or not self.paused:
+                    self.pause_serial += 1
+                self.pause_kind = source
             if not self.paused:
                 self.paused = True
                 self.pause_acknowledged = False
                 self.pause_started = time.monotonic()
+            self.condition.notify_all()
         self.network.pause_requests()
+
+    def resume_storage(self, serial):
+        with self.condition:
+            if self.stopped or not self.paused or self.pause_kind != 'storage' or serial != self.pause_serial:
+                return False
+            self.resume()
+            return True
+
+    def storage_snapshot(self):
+        with self.condition:
+            waiting = self.paused and self.storage_problem and not self.stopped
+            return {'waiting':waiting, 'automatic':waiting and self.pause_kind == 'storage',
+                    'attempt':self.storage_retry_attempt,
+                    'retry_in':max(0,self.storage_retry_due-time.monotonic()) if waiting and self.storage_retry_due is not None else None,
+                    'message':self.storage_problem_reason if waiting else ''}
 
     def resume(self):
         with self.condition:
@@ -188,6 +223,8 @@ class Control:
                 self.elapsed_before += time.monotonic() - self.pause_started
                 self.pause_started = None
             self.paused = False
+            self.pause_kind = ''
+            self.storage_retry_due = None
             self.pause_acknowledged = False
             self.last_progress = time.monotonic()
             self.condition.notify_all()
@@ -209,11 +246,17 @@ class Control:
 
     def snapshot(self):
         with self.lock:
-            elapsed = (self.finished or self.pause_started or time.monotonic()) - self.started - self.elapsed_before - self.network.elapsed
+            elapsed = self.active_clock() - self.started - self.network.elapsed
             verification = dict(self.verification) if self.verification and getattr(self,'phase','preparing')=='preparing' else None
             if verification:
                 verification['eta_seconds'] = self.verification_time.estimate(verification['checked'], verification['total'])
-            return {"active": list(self.active.values()), "transferred": self.transferred, "speed": self.transferred / max(0.1, elapsed), 'verification':verification, 'health':self.health()}
+            session = {'id':self.session_id, 'started_at':self.session_started_at,
+                       'elapsed_seconds':max(0, elapsed), 'transferred_bytes':self.transferred,
+                       'saved_bytes':self.session_saved_bytes, 'originals':self.session_originals,
+                       'previews':self.session_previews, 'errors':self.session_errors,
+                       'checked_files':self.verification['checked'] if self.verification else 0,
+                       'check_total':self.verification['total'] if self.verification else None}
+            return {"session":session, "active": list(self.active.values()), "transferred": self.transferred, "speed": self.transferred / max(0.1, elapsed), 'verification':verification, 'health':self.health()}
 
     def active_clock(self):
         with self.condition:
@@ -237,6 +280,7 @@ class Engine:
         self.folder_usage = FolderUsage()
         self.maintenance_busy = False
         self.status_cache = StatusCache(self)
+        self.status_options = threading.local()
 
     def validate_settings(self, data):
         if "attempts" not in data and "retries" in data and (isinstance(data["retries"], bool) or not isinstance(data["retries"], int) or not 0 <= data["retries"] <= 8):
@@ -483,7 +527,7 @@ class Engine:
                     job["settings"].update({key: validated[key] for key in keys})
                     self.store.update_job(job_id, settings=json.dumps(job["settings"], ensure_ascii=False))
 
-                if control.pause_reason and self.check_space(job_id, control, force=True):
+                if (control.pause_reason or control.storage_problem) and self.check_space(job_id, control, force=True):
                     raise ValueError(control.pause_reason)
                 self.store.update_job(job_id, phase=getattr(control, "phase", "downloading"), pause_reason="")
                 control.pause_reason = ""
@@ -572,6 +616,13 @@ class Engine:
         finally:
             self.lock.release()
 
+    @contextmanager
+    def cached_storage_status(self):
+        previous = getattr(self.status_options,'cached_storage',False)
+        self.status_options.cached_storage = True
+        try:yield
+        finally:self.status_options.cached_storage = previous
+
     def status(self, job_id):
         self.reconcile(job_id)
         live = bool(self.threads.get(job_id) and self.threads[job_id].is_alive())
@@ -579,6 +630,7 @@ class Engine:
         control = self.controls.get(job_id)
         status.update(control.snapshot() if control else {"active": [], "speed": 0})
         status["live"] = live
+        status['storage'] = control.storage_snapshot() if control else None
         status['requires_connection'] = not (live and control and not control.requires_connection())
         if not live or control and control.paused:
             status["speed"] = 0
@@ -606,50 +658,74 @@ class Engine:
         counted_outputs = set()
         # Use recorded output sizes; do not stat thousands of old report names.
         from .service_outputs import root_key
-        for row in self.store.rows('SELECT s.local,s.signature FROM service_output_signatures s JOIN names n ON n.job=? AND n.identity=\'@output:\'||s.local AND n.local=s.local WHERE s.root=?', (job_id, root_key(status['root']))):
+        output_root = os.path.normcase(os.path.abspath(status['root'])) if getattr(self.status_options,'cached_storage',False) else root_key(status['root'])
+        for row in self.store.rows('SELECT s.local,s.signature FROM service_output_signatures s JOIN names n ON n.job=? AND n.identity=\'@output:\'||s.local AND n.local=s.local WHERE s.root=?', (job_id, output_root)):
             try:
                 service_bytes += max(0, int(json.loads(row['signature'])[2]))
                 counted_outputs.add(row['local'])
             except (ValueError, TypeError, IndexError):
                 pass
-        for name in ('manifest_local', 'changes_local'):
-            if status['settings'].get(name) and status['settings'][name] not in counted_outputs:
+        if getattr(self.status_options,'cached_storage',False):
+            if status['settings'].get('manifest_local') not in counted_outputs:
+                service_bytes += status['settings'].get('manifest_bytes',0)
+            # HTTP statistics use committed sizes and live write counters. Actual
+            # filesystem accounting belongs to the bounded background inventory.
+            if status['zip_path']:
+                service_bytes += status.get('zip_bytes',0)
+            temporary = ()
+            if control:
+                with control.lock:
+                    temporary = tuple((filename, control.temporary_sizes.get(filename,0)) for filename in control.temporary)
+                service_bytes += sum(size for filename,size in temporary)
+            active_temporary = {name for name,size in temporary}
+            temporary_sizes = dict(temporary)
+            for part in self.store.rows('SELECT local,size FROM partials WHERE job=?',(job_id,)):
+                filename = native(Path(status['root'])/part['local'])
+                written = temporary_sizes.get(filename,part['size'])
+                status['partial_bytes'] += written
+                if filename not in active_temporary:
+                    service_bytes += written
+        else:
+            for name in ('manifest_local', 'changes_local'):
+                if status['settings'].get(name) and status['settings'][name] not in counted_outputs:
+                    try:
+                        service_bytes += os.path.getsize(safe_join(status['root'], status['settings'][name]))
+                    except (OSError, PathError):
+                        pass
+            if status["zip_path"]:
                 try:
-                    service_bytes += os.path.getsize(safe_join(status['root'], status['settings'][name]))
+                    service_bytes += os.path.getsize(safe_join(status["root"], status["zip_path"]))
                 except (OSError, PathError):
                     pass
-        if status["zip_path"]:
-            try:
-                service_bytes += os.path.getsize(safe_join(status["root"], status["zip_path"]))
-            except (OSError, PathError):
-                pass
-        if control:
-            with control.lock:
-                temporary = tuple((filename, control.temporary_sizes.get(filename, 0)) for filename in control.temporary)
-            for filename, written in temporary:
+            if control:
+                with control.lock:
+                    temporary = tuple((filename, control.temporary_sizes.get(filename, 0)) for filename in control.temporary)
+                for filename, written in temporary:
+                    try:
+                        actual = os.path.getsize(filename)
+                    except FileNotFoundError:
+                        continue
+                    except OSError:
+                        actual = 0
+                    service_bytes += max(actual, written)
+            active_temporary = {name for name, written in temporary} if control else set()
+            for part in self.store.rows("SELECT local FROM partials WHERE job=?", (job_id,)):
                 try:
-                    actual = os.path.getsize(filename)
-                except FileNotFoundError:
-                    continue
-                except OSError:
-                    actual = 0
-                service_bytes += max(actual, written)
-        active_temporary = {name for name, written in temporary} if control else set()
-        for part in self.store.rows("SELECT local FROM partials WHERE job=?", (job_id,)):
-            try:
-                filename = safe_join(status["root"], part["local"])
-                size = os.path.getsize(filename)
-                status["partial_bytes"] += size
-                if filename not in active_temporary:
-                    service_bytes += size
-            except (OSError, PathError):
-                pass
+                    filename = safe_join(status["root"], part["local"])
+                    size = os.path.getsize(filename)
+                    status["partial_bytes"] += size
+                    if filename not in active_temporary:
+                        service_bytes += size
+                except (OSError, PathError):
+                    pass
         status["local_bytes"] = status["saved_bytes"] + service_bytes
         usage = self.folder_usage.for_job(self.store, job_id, status["root"], active=live and not (control and control.paused))
         status["folder_bytes"] = usage['bytes'] if usage['bytes'] is not None else None if usage.get('error') else status['local_bytes']
         status['folder_bytes_error'] = usage.get('error','')
         status["folder_bytes_scanning"] = usage["scanning"]
         status["folder_bytes_updated"] = usage["updated"]
+        status['folder_bytes_partial'] = usage.get('partial',False)
+        status['folder_files_counted'] = usage.get('counted_files',0)
         status["eta_seconds"] = None
         status["eta_phase"] = None
         status["eta_message"] = "Ожидание интернета" if status["network_waiting"] else "Уточняется…"
@@ -682,10 +758,18 @@ class Engine:
             status["eta_phase"] = phase
         elif status["phase"] in ("completed", "completed_with_errors") and not live:
             status["eta_seconds"] = 0
-        try:
-            status["free_bytes"] = shutil.disk_usage(status["root"]).free
-        except OSError:
-            status["free_bytes"] = None
+        if getattr(self.status_options,'cached_storage',False):
+            if control and control.destination:
+                with control.destination.condition:
+                    value = control.destination.value
+                    status['free_bytes'] = value.free if value is not None else None
+            else:
+                status['free_bytes'] = usage.get('free_bytes')
+        else:
+            try:
+                status["free_bytes"] = shutil.disk_usage(status["root"]).free
+            except OSError:
+                status["free_bytes"] = None
         return status
 
     def phase(self, job_id, control, phase):
@@ -715,8 +799,11 @@ class Engine:
                 if error or usage is None:
                     reason = error or 'Папка загрузки недоступна. Подключите накопитель и нажмите «Продолжить».'
                     changed = control.pause_reason != reason
+                    control.storage_problem = True
+                    control.storage_problem_reason = reason
                     control.pause_reason = reason
-                    control.pause()
+                    control.pause(source='storage' if control.destination.snapshot()['recoverable'] else 'storage_manual')
+                    self.start_storage_recovery(job_id, control)
                     if changed:
                         self.store.update_job(job_id,phase='paused',pause_reason=reason)
                         control.event('system',reason,level='warning')
@@ -724,6 +811,8 @@ class Engine:
             else:
                 usage = shutil.disk_usage(job['root'])
                 fresh_usage = True
+            control.storage_problem = False
+            control.storage_problem_reason = ''
             control.next_space_check = time.monotonic()+.5
             if fresh_usage or control.free_credit is None:
                 control.free_credit = usage.free
@@ -740,7 +829,7 @@ class Engine:
                 control.floor_latched = True
                 control.space_draining = False
                 control.pause_reason = reason
-                control.pause()
+                control.pause(source='space')
                 if changed:
                     self.store.update_job(job_id,phase='paused',pause_reason=reason)
                     control.event('system',reason,level='warning')
@@ -755,11 +844,64 @@ class Engine:
                 reason = f"Автопауза: диск заполнен на {occupied:.1f}%, порог {threshold:g}%. Освободите место и нажмите «Продолжить»."
                 if control.pause_reason != reason:
                     control.pause_reason = reason
-                    control.pause()
+                    control.pause(source='space')
                     self.store.update_job(job_id, phase="paused", pause_reason=reason)
                     control.event("system", reason, level="warning")
                 return True
             return False
+
+    def start_storage_recovery(self, job_id, control):
+        # Called under the destination/space lock: at most one monitor per run.
+        if control.pause_kind != 'storage' or control.stopped:
+            return
+        if control.storage_retry_thread and control.storage_retry_thread.is_alive():
+            return
+        def recover():
+            try:
+                while True:
+                    with control.condition:
+                        if control.stopped or not control.paused or control.pause_kind != 'storage':return
+                        serial = control.pause_serial
+                        delay = control.storage_retry_delays[min(control.storage_retry_attempt,len(control.storage_retry_delays)-1)]
+                        control.storage_retry_attempt += 1
+                        control.storage_retry_due = time.monotonic()+delay
+                        while not control.stopped and control.paused and control.pause_kind == 'storage' and serial == control.pause_serial:
+                            left = control.storage_retry_due-time.monotonic()
+                            if left <= 0:break
+                            control.condition.wait(left)
+                        if control.stopped or not control.paused or control.pause_kind != 'storage' or serial != control.pause_serial:return
+                    if self.check_space(job_id,control,force=True):
+                        continue
+                    with self.lock:
+                        if self.shutting_down or self.controls.get(job_id) is not control:return
+                        self.store.update_job(job_id,phase=getattr(control,'phase','downloading'),pause_reason='')
+                        if control.resume_storage(serial):
+                            control.pause_reason = ''
+                            control.storage_retry_attempt = 0
+                            control.event('system','Накопитель снова доступен. Прежняя папка проверена; продолжаем работу.',level='success')
+                        else:
+                            self.store.update_job(job_id,phase='stopping' if control.stopped else 'paused',pause_reason=control.pause_reason)
+                    return
+            except Suspended:
+                pass
+            except Exception as exc:
+                # Remain safely paused; a failed monitor never resumes writes.
+                self.failure_message(exc,'storage_recovery',control)
+                with control.condition:
+                    if control.pause_kind == 'storage':control.pause_kind = 'storage_manual'
+                control.event('system','Приложение на устройстве не смогло повторно проверить накопитель. Работа остаётся на паузе. Проверьте подключение и нажмите «Продолжить».',level='warning')
+            finally:
+                with control.space_lock:
+                    with control.condition:
+                        control.storage_retry_due = None
+                        control.storage_retry_thread = None
+                    if not self.shutting_down and self.controls.get(job_id) is control:
+                        self.start_storage_recovery(job_id,control)
+        control.storage_retry_thread = threading.Thread(target=recover,name='disk-storage-recovery',daemon=True)
+        try:control.storage_retry_thread.start()
+        except RuntimeError:
+            control.pause_kind = 'storage_manual'
+            control.event('system','Не удалось запустить повторную проверку накопителя. Проверьте подключение и нажмите «Продолжить».',level='warning')
 
     def failure_message(self, exc, operation, control):
         message = safe_error(exc)
@@ -894,6 +1036,9 @@ class Engine:
             control.journal.close()
             try:
                 if not saved_scan and not self.store.job(job_id)['settings'].get('_inherit_source'):
+                    from .destination import export_available
+                    if not export_available(control):
+                        raise OSError('Destination unavailable; progress remains in application history')
                     save_import(self.store, job_id)
             except (OSError, sqlite3.Error, ValueError) as exc:
                 warning = 'Не удалось обновить опись в папке на ПК. Файлы и история сохранены в приложении. Проверьте доступ к папке и свободное место; затем повторите сохранение описи.'
@@ -1209,7 +1354,9 @@ class Engine:
             control.verification = {'checked':0,'total':total,'originals':0,'previews':0,'missing':0,'complete':not total,'cached':0,'hashed':0}
         cursor = ""
         updates, remove_previews = [], []
+        last_flush = time.monotonic()
         def flush():
+            nonlocal last_flush
             if not updates and not remove_previews:
                 return
             with self.store.db() as db:
@@ -1217,6 +1364,7 @@ class Engine:
                 db.executemany("DELETE FROM artifacts WHERE job=? AND path=? AND type='preview'", remove_previews)
             updates.clear()
             remove_previews.clear()
+            last_flush = time.monotonic()
         control.event("cache", "Проверка папки перед дозагрузкой")
         while True:
             control.check()
@@ -1271,9 +1419,9 @@ class Engine:
                             # error / retry; do not silently accept stale data.
                             original = preview = False
                 except (OSError, ValueError):
-                    # An unreadable local file must not prevent the remaining folder check.
-                    with self.store.db() as db:
-                        db.execute("DELETE FROM artifacts WHERE job=? AND path=?", (job_id, entry["path"]))
+                    # A preview failure is not evidence that a verified original
+                    # has vanished. Let reusable() invalidate only its own copy.
+                    preview = False
                 if original:
                     need_preview = want_both and preview_type(meta)
                     desired = ('pending' if need_preview and not preview else 'existing',2,'existing_verified','existing_verified' if preview else 'not_requested' if need_preview else 'not_needed')
@@ -1286,7 +1434,7 @@ class Engine:
                 previous = tuple(entry[key] for key in ('status','priority','original_status','preview_status'))
                 if previous != desired or entry['error'] or entry['fallback']:
                     updates.append((*desired,job_id,entry['path']))
-                if not original:
+                if not original or time.monotonic()-last_flush >= .5:
                     # Publish invalidations before checking a slow / unavailable
                     # next file. Verified result records remain durable per file.
                     flush()
@@ -1484,6 +1632,7 @@ class Engine:
         original_status = preview_status = "not_requested"
         fallback = False
         finalized = False
+        final_error = False
         try:
             control.check()
             self.store.update_entry(job_id, path, error="", original_attempts=0, preview_attempts=0, original_status="not_requested", preview_status="not_requested", fallback=0)
@@ -1557,11 +1706,14 @@ class Engine:
             else:
                 status = "existing" if len(reused) == len(completed) else "done"
             if not completed or other_errors:
+                final_error = True
                 control.event("errors", "; ".join(errors if not completed else other_errors), path, "error")
             self.store.update_entry(job_id, path, status=status, error="; ".join(errors if not completed else other_errors), original_status=original_status, preview_status=preview_status, fallback=int(fallback))
             finalized = True
         except StorageRetry:
-            self.store.update_entry(job_id, path, status='pending')
+            # The same future retries in process(). Keep ownership until it
+            # finishes, otherwise the scheduler can submit this file twice.
+            self.store.update_entry(job_id, path, status='running')
             raise
         except Suspended:
             self.store.update_entry(job_id, path, status="pending", original_status=original_status, preview_status=preview_status)
@@ -1578,18 +1730,21 @@ class Engine:
             # invalidate it. Keep it in reports and archives during outages.
             self.store.update_entry(job_id, path, status="error", error=safe_error(exc), original_status=original_status, preview_status=preview_status)
             finalized = True
+            final_error = True
             control.event("errors", "Ошибка обработки файла: " + safe_error(exc), path, "error")
         except Exception as exc:
             if control.storage_error(exc):
-                self.store.update_entry(job_id,path,status='pending')
+                self.store.update_entry(job_id,path,status='running')
                 raise StorageRetry() from exc
             self.store.update_entry(job_id, path, status="error", error=safe_error(exc), original_status=original_status, preview_status=preview_status)
             finalized = True
+            final_error = True
             control.event("errors", "Ошибка обработки файла: " + safe_error(exc), path, "error")
         finally:
             with control.lock:
                 control.active.pop(path, None)
                 if finalized:
+                    control.session_errors += int(final_error)
                     control.remaining_time.result(bool(completed), reused=bool(completed) and len(reused) == len(completed) and not errors, fallback=fallback)
 
     def transfer(self, job, entry, kind, meta, control):
@@ -1786,6 +1941,10 @@ class Engine:
                     with self.store.db() as db:
                         db.execute("INSERT OR REPLACE INTO artifacts VALUES(?,?,?,?,?,?,?,?)", (job["id"], entry["path"], kind, relative, size, sha.hexdigest(), fingerprint(meta), settings["preview_size"] if kind == "preview" else None))
                         db.execute('DELETE FROM pending_publications WHERE job=? AND path=? AND type=?', (job['id'], entry['path'], kind))
+                    with control.lock:
+                        control.session_saved_bytes += size
+                        if kind == 'original':control.session_originals += 1
+                        else:control.session_previews += 1
                     if control.adaptive:
                         control.adaptive.success()
                     self.remember_file(job, relative, sha.hexdigest())

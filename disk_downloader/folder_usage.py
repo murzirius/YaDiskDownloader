@@ -1,4 +1,6 @@
 import os
+import shutil
+import stat
 import sqlite3
 import threading
 import time
@@ -34,7 +36,7 @@ class FolderUsage:
             item = self.folders.setdefault(root, {"bytes": None, "updated": None, "scanning": False, "due": 0, "error":"", "checked":0, 'generation':0,'dirty':False})
             scope = inventory[0] if inventory else None
             if item.get('scope') != scope:
-                item.update(scope=scope, bytes=None, checked=0, dirty=True)
+                item.update(scope=scope, bytes=None, checked=0, dirty=True, partial=True, counted_files=0)
                 item['generation'] += 1
             item['inventory'] = inventory[1] if inventory else None
             if force:
@@ -57,12 +59,32 @@ class FolderUsage:
         if generation is None:
             with self.lock: generation=self.folders[root].get('generation',0)
         total = 0
+        free = None
+        try:free = shutil.disk_usage(native(root)).free
+        except OSError:pass
         error = ''
+        counted = 0
+        last_publish = 0
+        def progress():
+            nonlocal last_publish
+            current = time.monotonic()
+            if current-last_publish < .25:return
+            last_publish = current
+            with self.lock:
+                item = self.folders[root]
+                if item.get('generation',0) == generation:
+                    item['counted_files'] = counted
+                    if item['bytes'] is None or item.get('partial'):
+                        item.update(bytes=total,partial=True,updated=time.time())
         if inventory:
             try:
                 for filename in inventory():
                     try:
-                        total += os.stat(filename, follow_symlinks=False).st_size
+                        info = os.stat(filename, follow_symlinks=False)
+                        if not stat.S_ISREG(info.st_mode):continue
+                        total += info.st_size
+                        counted += 1
+                        progress()
                     except FileNotFoundError:
                         continue
             except (OSError, ValueError, sqlite3.Error):
@@ -90,4 +112,4 @@ class FolderUsage:
             stale = item.get('generation',0) != generation
             item.update(scanning=False, dirty=stale)
             if not stale:
-                item.update(bytes=None if error else total, updated=time.time(), due=time.monotonic()+self.interval, checked=time.monotonic(), error=error)
+                item.update(bytes=None if error else total, free_bytes=free, partial=False, counted_files=counted, updated=time.time(), due=time.monotonic()+self.interval, checked=time.monotonic(), error=error)

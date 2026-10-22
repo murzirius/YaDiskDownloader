@@ -140,7 +140,7 @@ async function openJob(id){selectJob(id);if(typeof openWorkspace==='function')op
 async function refreshJobs(){state.renderKey=null;const result=await api('/api/status');renderRunning(result.active_job);const history=$('job-history');history.replaceChildren();if(!result.jobs.length){history.append(new Option('Нет заданий',''));$('job-content').hidden=true;return;}for(const job of result.jobs)history.append(new Option(`${job.title||String(job.root||'').split(/[\\/]/).pop()||job.id.slice(0,8)} · ${phases[job.phase]||job.phase}`,job.id));if(state.job&&!result.jobs.some(job=>job.id===state.job)){try{const previous=await api('/api/jobs/'+state.job);history.append(new Option((previous.title||previous.id.slice(0,8))+' · '+(phases[previous.phase]||previous.phase),previous.id));}catch{selectJob(null);}}if(!state.job)selectJob(result.active_job?.id||result.jobs[0].id);history.value=state.job;showPanel('job');await pollJob();}
 function counter(holder,label,value,wide=false){const div=node('div',undefined,wide?'storage-counter':undefined);div.append(node('span',label),node('strong',String(value)));holder.append(div);}
 function renderJobCounters(job){
-  if(job.statistics_pending){$('counters').replaceChildren(node('p',job.statistics_error||'Считаем сохранённые файлы в фоне…','hint'));$('extra-counters').replaceChildren();return;}
+  if(job.statistics_pending&&!job.files){$('counters').replaceChildren(node('p',job.statistics_error||'Обновляем общие итоги. Текущий прогресс показан в панели «Эта сессия».','hint'));$('extra-counters').replaceChildren();return;}
   const main=$('counters');
   const extra=$('extra-counters');
   main.replaceChildren();
@@ -148,8 +148,7 @@ function renderJobCounters(job){
   const history=job.active.find(file=>file.unit==='local_files');
   for(const [label,value,wide] of [
     history?['Скачанные файлы',history.size==null?'Готовим проверку…':`${history.done.toLocaleString('ru-RU')} / ${history.size.toLocaleString('ru-RU')} файлов`,true]:[!job.scan_complete?'Найдено файлов':'Обработано',!job.scan_complete?String(job.files):`${job.processed} / ${job.files}`],
-    ['Скорость',bytes(job.speed)+'/с'],
-    ['На устройстве',job.folder_bytes_error?'Папка недоступна':bytes(job.folder_bytes??job.local_bytes)+(job.folder_bytes_scanning?' · уточняется':''),true],
+    ['На устройстве',job.folder_bytes_error?'Папка недоступна':(job.folder_bytes_partial?'≥ ':'')+bytes(job.folder_bytes??job.local_bytes)+(job.folder_bytes_scanning?' · считаем файлы':''),true],
     ['Свободно на диске',bytes(job.free_bytes),true],
     ['Полные оригиналы',job.completeness.originals],
     ['Только превью',job.completeness.preview_only],
@@ -157,6 +156,7 @@ function renderJobCounters(job){
     ['Ошибки',job.errors+job.scan_errors]
   ])counter(main,label,value,wide);
   if(job.previous_results)counter(main,'Уже есть результат',job.previous_results,true);
+  if(job.statistics_pending)main.append(node('p','Общие итоги уточняются…','hint'));
   if(['downloading','packing','paused'].includes(job.phase))counter(main,job.eta_phase==='packing'?'До конца ZIP':'До конца загрузки',job.phase==='paused'?'Пауза':job.eta_seconds==null?(job.eta_message||'Уточняется…'):remainingTime(job.eta_seconds),true);
   for(const [label,value] of [
     ['Потоки',`${job.workers_status.current} / ${job.workers_status.maximum}`],['Недокачанные части',bytes(job.partial_bytes)],
@@ -164,6 +164,26 @@ function renderJobCounters(job){
     ['Нет превью',job.missing_previews],['Отменено',job.cancelled],
     ['Передано',bytes(job.downloaded)],['Сохранено',bytes(job.saved_bytes)]
   ])counter(extra,label,value);
+}
+function renderSessionCounters(job){
+  const holder=$('session-counters'),session=job.session;
+  holder.replaceChildren();
+  $('session-note').textContent=session?'С запуска или продолжения этого задания в '+new Date(session.started_at).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'})+'. Обновление страницы не сбрасывает счётчики.':'Сессия начнётся при запуске или продолжении задания.';
+  if(session){
+    const seconds=Math.floor(session.elapsed_seconds||0),time=seconds<60?seconds+' с':Math.floor(seconds/60)+' мин '+seconds%60+' с';
+    for(const [label,value] of [['Новых оригиналов',session.originals],['Новых превью',session.previews],['Передано по сети',bytes(session.transferred_bytes)],['Скорость',bytes(job.speed)+'/с'],['Объём новых копий',bytes(session.saved_bytes)],['Время без пауз',time]])counter(holder,label,value);
+    if(session.errors)counter(holder,'Файлов с ошибкой',session.errors);
+  }
+  const check=job.verification;
+  $('verification-live').textContent=check?'Проверено на устройстве: '+check.checked.toLocaleString('ru-RU')+' / '+check.total.toLocaleString('ru-RU')+'. Найдено оригиналов: '+check.originals.toLocaleString('ru-RU')+', только превью: '+check.previews.toLocaleString('ru-RU')+'.'+(check.complete?' Проверка завершена.':' Остальные файлы ещё проверяются.'):(session?.check_total!=null?'В этой сессии проверено на устройстве: '+session.checked_files.toLocaleString('ru-RU')+' файлов.':'');
+}
+function renderStorage(job){
+  const storage=job.storage,waiting=!!storage?.waiting;
+  $('storage-warning').hidden=!waiting;
+  if(!waiting)return;
+  $('storage-warning-text').textContent=storage.message;
+  $('storage-retry-status').textContent=storage.automatic?(storage.retry_in>0?'Повторная проверка через '+Math.ceil(storage.retry_in)+' с.':'Проверяем накопитель…')+' После восстановления прежней папки работа продолжится сама.':'Автоматическое продолжение выключено. Проверьте накопитель и нажмите «Продолжить».';
+  $('stop-storage-retry').hidden=!storage.automatic;
 }
 function renderEstimate(job){
   if(job.statistics_pending){$('estimate-info').hidden=true;return;}
@@ -235,6 +255,8 @@ async function pollJob(){
       $('percentage').textContent=(percent??0).toLocaleString('ru-RU',{maximumFractionDigits:1})+'%'+(packing?' ZIP':' обработано');
     }
     renderJobCounters(job);
+    renderSessionCounters(job);
+    renderStorage(job);
     const active=$('active-files');
     active.replaceChildren();
     for(const file of job.active){
@@ -256,7 +278,8 @@ async function pollJob(){
     $('stop-job').textContent=job.phase==='stopping'?'Останавливаем…':scanOnly?'Остановить обход':job.phase==='packing'?'Остановить ZIP':'Остановить загрузку';
     if(history&&job.phase!=='stopping')$('stop-job').textContent='Остановить подготовку';
     $('job-hint').textContent=state.closing?'Завершаем приложение…':job.phase==='stopping'?'Отменяем запросы и сохраняем прогресс…':job.phase==='ready'?(live?'Завершаем подготовку следующего этапа.':'Список готов. Нажмите «Начать скачивание».'):job.phase==='scanning'?'Составляем список файлов. Можно остановить и продолжить позже.':job.phase==='preparing'?'Проверяем локальные файлы и подготавливаем результаты.':job.phase==='paused'?'Работа на паузе. Для продолжения нажмите кнопку выше.':['stopped','interrupted'].includes(job.phase)?(scanOnly?'Обход остановлен. «Продолжить обход» вернёт вас к оценке.':(state.connected?'Прогресс сохранён. В блоке «Как продолжить загрузку» выберите, достаточно ли превью, и нажмите «Продолжить загрузку».':'Прогресс сохранён. Нажмите «Подключить Диск, чтобы продолжить», вставьте ключ доступа, затем продолжите загрузку.')):'Закрытие вкладки не останавливает работу. Для выхода используйте «Выход». ';
-    if(history&&!state.closing&&!['paused','stopping'].includes(job.phase))$('job-hint').textContent='Готовим список скачанных файлов. Логи и отчёты проверять не будем. Затем сверим файлы с Яндекс.Диском и проверим готовые копии.';
+    if(job.storage?.waiting&&!state.closing)$('job-hint').textContent=job.storage.automatic?'Ждём восстановления накопителя. Можно оставить задание на паузе или остановить его.':'Работа на паузе: проверьте папку назначения и нажмите «Продолжить».';
+    if(history&&!job.storage?.waiting&&!state.closing&&!['paused','stopping'].includes(job.phase))$('job-hint').textContent='Готовим список скачанных файлов. Логи и отчёты проверять не будем. Затем сверим файлы с Яндекс.Диском и проверим готовые копии.';
     if(live)renderRunning({id:job.id,phase:job.phase,scan_complete:job.scan_complete,active:job.active});
     const hasIssues=job.errors||job.scan_errors;
     const hasRetry=hasIssues||job.replacements||job.counts.partial||job.completeness.preview_only;
@@ -268,7 +291,7 @@ async function pollJob(){
     $('resume-job').hidden=!job.can_resume||!['paused','stopped','interrupted','failed'].includes(job.phase);
     $('resume-job').disabled=state.actionPending||(!state.connected&&job.requires_connection!==false);
     $('connect-for-job').hidden=state.connected||job.requires_connection===false||!job.can_resume||!['ready','paused','stopped','interrupted','failed'].includes(job.phase);
-    $('resume-options').hidden=job.requires_connection===false||!job.can_resume||!['ready','paused','stopped','interrupted','failed'].includes(job.phase);
+    $('resume-options').hidden=!!job.storage?.waiting||job.requires_connection===false||!job.can_resume||!['ready','paused','stopped','interrupted','failed'].includes(job.phase);
     $('resume-policy').disabled=live;
     $('resume-options-hint').textContent=live?'Чтобы изменить учёт превью, остановите задание. Затем выберите вариант и продолжите — прогресс сохранится.':'Проверим папку перед продолжением. Сначала скачаем файлы без копий. Готовые оригиналы повторно не скачиваем.';
     $('stop-job').hidden=!live;
@@ -282,7 +305,7 @@ async function pollJob(){
     if(typeof renderDismissibleNetwork==='function')renderDismissibleNetwork(job);
     else{$('network-warning').hidden=!job.network_waiting;$('network-warning').textContent=job.network_warning||'';}
     const completenessMessage=!job.statistics_pending&&['completed','completed_with_errors'].includes(job.phase)?(job.scan_errors?'Обход завершился с ошибками: часть папок могла остаться непроверенной. ':!job.completeness.no_result&&!job.completeness.preview_only?'Все выбранные файлы сохранены в оригинале. ':'')+(job.completeness.preview_only?'Только превью: '+job.completeness.preview_only+'. Это уменьшенные копии. ':'')+(job.completeness.no_result?'Без результата: '+job.completeness.no_result+'. ':''):'';
-    const resultMessage=job.pause_reason||job.error||job.statistics_error||job.settings.history_warning||completenessMessage||(job.phase==='completed_with_errors'?'Результат неполный.':job.phase==='stopped'?'Остановлено. Незавершённых файлов: '+job.cancelled+'.':'');
+    const resultMessage=(!job.storage?.waiting&&job.pause_reason)||job.error||job.statistics_error||job.settings.history_warning||completenessMessage||(job.phase==='completed_with_errors'?'Результат неполный.':job.phase==='stopped'?'Остановлено. Незавершённых файлов: '+job.cancelled+'.':'');
     if(typeof renderDismissibleResult==='function')renderDismissibleResult(job,resultMessage);else $('result-info').textContent=resultMessage;
     if(job.zip_path){
       $('download-zip').hidden=false;
@@ -403,3 +426,5 @@ async function chooseNativeFolder(initial=''){
   })();
   try{return await state.folderSelection;}finally{state.folderSelection=null;}
 }
+
+$('stop-storage-retry').onclick=()=>safely(()=>action('pause'));

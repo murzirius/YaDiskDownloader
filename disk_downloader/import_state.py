@@ -249,11 +249,18 @@ def save_import(store, job_id, checkpoint=lambda: None):
             checkpoint()
             db.commit()
         checkpoint()
+        manifest_bytes = os.path.getsize(temp)
         target = safe_join(job["root"], local)
         if owned and os.path.exists(target):
             replace_owned(temp, target)
         else:
             publish(temp, target)
+        # Cache the size just written; UI polling must not stat a slow NAS.
+        with store.db() as db:
+            settings = json.loads(db.execute('SELECT settings FROM jobs WHERE id=?',(job_id,)).fetchone()[0])
+            if settings.get('manifest_local') == local:
+                settings['manifest_bytes'] = manifest_bytes
+                db.execute('UPDATE jobs SET settings=? WHERE id=?',(json.dumps(settings,ensure_ascii=False),job_id))
     finally:
         if os.path.exists(temp):
             os.unlink(temp)

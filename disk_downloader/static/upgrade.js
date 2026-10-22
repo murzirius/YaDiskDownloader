@@ -394,6 +394,7 @@ renderExperience=function(job){
   if(lastJobId!==job.id){lastJobId=job.id;verifySelect.value=job.settings.verification_mode||'fast';duplicateCheck.checked=!!job.settings.deduplicate;lastMovement=Date.now();}
   const movement=JSON.stringify([job.phase,job.processed,job.verification?.checked,job.active.map(file=>[file.path,file.done,file.size])]);
   if(movement!==movementKey){movementKey=movement;lastMovement=Date.now();}
+  taskStage.hidden=!!job.storage?.waiting;
   const message=job.network_waiting?job.network_warning:job.pause_reason||job.health?.warning||job.error||({'ready':'Проверьте план ниже и нажмите «Начать скачивание».','paused':'Работа на паузе. Нажмите «Продолжить», когда будете готовы.','scanning':'Получаем список с Яндекс.Диска. Скачивание ещё не началось.','preparing':'Проверяем скачанные файлы и готовим план. Журналы и отчёты не перечитываются как контент.','downloading':'Сохраняем выбранные файлы. Можно поставить на паузу или остановить с сохранением прогресса.','packing':'Скачивание окончено. Собираем ZIP из сохранённых результатов.'}[job.phase]||phases[job.phase]);
   const stage=JSON.stringify([job.id,message,job.queue_state,job.verification?.cached,job.verification?.hashed]);
   if(stage!==stageKey){stageKey=stage;taskStage.replaceChildren(node('strong',message));if(job.verification)taskStage.append(node('p','Без повторного чтения: '+(job.verification.cached||0)+' · Проверено по содержимому: '+(job.verification.hashed||0),'hint'));}
