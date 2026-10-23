@@ -51,11 +51,21 @@ def _finish_pair(target, temporary, signature, checkpoint):
 
 
 def _media_owner(db, row, key):
+    # Partial fingerprints identify the transfer variant, while publication
+    # fingerprints identify the remote resource. Match the actual writer's
+    # stamp, including preview size, rather than accepting an untyped stamp.
+    if not isinstance(row['fingerprint'], str) or row['type'] not in ('original', 'preview'):
+        return False
+    stamp = row['fingerprint'] + ':' + row['type']
+    if row['type'] == 'preview':
+        if not isinstance(row['preview_size'], str):
+            return False
+        stamp += ':' + row['preview_size']
     return _temporary_name(row['temp']) and db.execute("""SELECT 1 FROM partials p
       JOIN partial_ownership o ON o.job=p.job AND o.local=p.local
       JOIN temporary_files t ON t.root=? AND t.local=p.local AND t.purpose='partial'
       WHERE p.job=? AND p.path=? AND p.type=? AND p.local=? AND p.fingerprint=?
-      AND p.size=? AND p.sha256=?""", (key,row['job'],row['path'],row['type'],row['temp'],row['fingerprint'],row['size'],row['sha256'])).fetchone() is not None
+      AND p.size=? AND p.sha256=?""", (key,row['job'],row['path'],row['type'],row['temp'],stamp,row['size'],row['sha256'])).fetchone() is not None
 
 
 def _same_pending(current, row):

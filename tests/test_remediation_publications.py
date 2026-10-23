@@ -30,7 +30,7 @@ def pending_copy(system, *, linked=True):
     with engine.store.db() as db:
         entry = dict(db.execute("SELECT * FROM entries WHERE job=? AND kind='file'",(key,)).fetchone())
     stamp = fingerprint(json.loads(entry['meta']))
-    _,temp,_,_ = engine.partials.prepare(job,entry['path'],'original',stamp,lambda:None)
+    _,temp,_,_ = engine.partials.prepare(job,entry['path'],'original',stamp+':original',lambda:None)
     Path(temp).write_bytes(content)
     sha = hashlib.sha256(content)
     engine.partials.save(job,entry['path'],'original',len(content),sha,'',len(content))
@@ -433,8 +433,11 @@ def test_service_cancel_after_unlink_retries_without_guessing_temp_ownership(tmp
         assert {row[0] for row in db.execute('SELECT local FROM temporary_files')} == {temp.name,unrelated}
 
 
-@pytest.mark.skipif(os.name == 'nt',reason='Requires native POSIX link/unlink crash window')
-def test_native_posix_process_killed_between_link_and_unlink_recovers(tmp_path):
+@pytest.mark.parametrize('kind', ['original', 'preview'])
+@pytest.mark.parametrize('publication', ['native', 'forced-link'])
+def test_native_posix_process_killed_between_link_and_unlink_recovers(tmp_path, kind, publication):
+    if os.name == 'nt' and publication == 'native':
+        pytest.skip('Requires native POSIX link/unlink crash window')
     from disk_downloader.engine import Engine
     from disk_downloader.store import Store
     from conftest import FakeAPI
@@ -445,27 +448,34 @@ from conftest import FakeAPI
 from disk_downloader.engine import Engine
 from disk_downloader.store import Store
 import disk_downloader.paths as paths
+import disk_downloader.engine as engine_module
 base=Path(sys.argv[1])
-api=FakeAPI();api.file('disk:/photo.bin',b'original',preview=False)
+kind=sys.argv[2]
+api=FakeAPI();api.file('disk:/photo.bin',b'original',preview=True)
 store=Store(base/'state/jobs.sqlite3');engine=Engine(store,api)
 original=paths.os.unlink
+if sys.argv[3]=='forced-link':
+    def link_publish(temp,target):
+        os.link(temp,target)
+        os.unlink(temp)
+    engine_module.publish=link_publish
 def unlink(name,*args,**kwargs):
     if Path(name).name.startswith('.disk-') and Path(name).exists() and os.stat(name).st_nlink==2:
         with store.db() as db:
-            pending=db.execute('SELECT 1 FROM pending_publications WHERE temp=?',(Path(name).name,)).fetchone()
+            pending=db.execute('SELECT 1 FROM pending_publications WHERE temp=? AND type=?',(Path(name).name,kind)).fetchone()
         if pending:
             (base/'reached').write_text('linked',encoding='ascii')
             while True:time.sleep(.05)
     return original(name,*args,**kwargs)
 paths.os.unlink=unlink
-key=engine.create({'destination':str(base/'results'),'whole_disk':True,'mode':'fallback','reports':['json'],'create_zip':False,'auto_start':True,'auto_pause':False})
+key=engine.create({'destination':str(base/'results'),'whole_disk':True,'mode':'fallback' if kind=='original' else 'previews','reports':['json'],'create_zip':False,'auto_start':True,'auto_pause':False})
 (base/'job').write_text(key,encoding='ascii')
 while True:time.sleep(.05)
 '''
     environment = os.environ.copy()
     environment['PYTHONDONTWRITEBYTECODE'] = '1'
     environment['PYTHONPATH'] = os.pathsep.join((str(Path(__file__).resolve().parents[1]),str(Path(__file__).resolve().parent)))
-    process = subprocess.Popen([sys.executable,'-B','-c',code,str(tmp_path)],env=environment,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    process = subprocess.Popen([sys.executable,'-B','-c',code,str(tmp_path),kind,publication],env=environment,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
     try:
         due = time.monotonic()+30
         while time.monotonic()<due and not (tmp_path/'reached').is_file():
@@ -476,7 +486,7 @@ while True:time.sleep(.05)
         key = (tmp_path/'job').read_text(encoding='ascii')
         store = Store(tmp_path/'state/jobs.sqlite3')
         assert recover_publications(store) == 1
-        api = FakeAPI();api.file('disk:/photo.bin',b'original',preview=False)
+        api = FakeAPI();api.file('disk:/photo.bin',b'original',preview=True)
         engine = Engine(store,api)
         engine.action(key,'resume')
         assert wait_job(engine,key)['phase'] == 'completed'
