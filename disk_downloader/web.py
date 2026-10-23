@@ -249,9 +249,9 @@ def create_app(state_dir=None, api=None, port=8766):
     @app.get("/api/profiles")
     def profiles():
         items = []
-        for row in store.rows("SELECT * FROM profiles ORDER BY name"):
+        for row in store.profile_rows():
             try:
-                value = json.loads(row["settings"])
+                value = row["settings"]
                 if not isinstance(value, dict):
                     raise ValueError()
                 normalize_saved_workers(value)
@@ -272,7 +272,9 @@ def create_app(state_dir=None, api=None, port=8766):
             raise ValueError("Название профиля: от 1 до 80 символов")
         name = name.strip()
         if data.get("delete"):
-            with store.db() as db:
+            with engine.lock, store.db() as db:
+                if engine.history_restore_busy:
+                    raise ValueError('Приложение на ПК восстанавливает историю. Дождитесь завершения, затем повторите действие.')
                 db.execute("DELETE FROM profiles WHERE name=?", (name,))
             return jsonify(ok=True)
         value = data.get("settings")
@@ -282,7 +284,9 @@ def create_app(state_dir=None, api=None, port=8766):
         validated = engine.validate_settings(value | {"whole_disk": True} if empty_sources else value)
         if empty_sources:
             validated.update(paths=[], whole_disk=False)
-        with store.db() as db:
+        with engine.lock, store.db() as db:
+            if engine.history_restore_busy:
+                raise ValueError('Приложение на ПК восстанавливает историю. Дождитесь завершения, затем повторите действие.')
             if db.execute("SELECT COUNT(*) FROM profiles").fetchone()[0] >= 100 and not db.execute("SELECT 1 FROM profiles WHERE name=?", (name,)).fetchone():
                 raise ValueError("Можно сохранить до 100 профилей")
             db.execute("INSERT OR REPLACE INTO profiles VALUES(?,?)", (name, json.dumps(validated, ensure_ascii=False)))
@@ -371,8 +375,12 @@ def create_app(state_dir=None, api=None, port=8766):
     @app.get('/api/backups')
     def list_backups(): return jsonify(items=backups.list())
 
+    def backup_checkpoint():
+        if engine.shutting_down:
+            raise InterruptedError('Приложение на ПК завершается. Незавершённая резервная копия не заменит прежнюю историю.')
+
     @app.post('/api/backups')
-    def backup_create(): return jsonify(name=backups.create())
+    def backup_create(): return jsonify(name=backups.create(checkpoint=backup_checkpoint))
 
     @app.get('/api/backups/<name>/download')
     def backup_download(name): return send_file(backups.path(name),as_attachment=True,download_name=name)
@@ -389,12 +397,20 @@ def create_app(state_dir=None, api=None, port=8766):
         if data.get('confirm') is not True: raise ValueError('Подтвердите восстановление истории и профилей')
         with engine.lock:
             engine.ensure_idle()
-            safety=backups.restore(data.get('name'))
-            credentials.clear()
-            engine.controls.clear(); engine.threads.clear(); management.armed=False
-            engine.status_cache.invalidate()
-            with maintenance.lock:
-                maintenance.result={'busy':False,'processed':0,'total':0,'items':[],'counts':{},'complete':False}
+            engine.maintenance_busy = True
+            engine.history_restore_busy = True
+        try:
+            safety=backups.restore(data.get('name'), checkpoint=backup_checkpoint)
+            with engine.lock:
+                credentials.clear()
+                engine.controls.clear(); engine.threads.clear(); management.armed=False
+                engine.status_cache.invalidate()
+                with maintenance.lock:
+                    maintenance.result={'busy':False,'processed':0,'total':0,'items':[],'counts':{},'complete':False}
+        finally:
+            with engine.lock:
+                engine.history_restore_busy = False
+                engine.maintenance_busy = False
         return jsonify(ok=True,safety_copy=safety)
 
     @app.get('/api/notifications')

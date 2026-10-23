@@ -52,7 +52,18 @@ def component(name, identity):
 
 def suffix(name, tag):
     stem, ext = os.path.splitext(name)
-    return f"{stem}~{tag}{ext}"
+    # Leave room for .preview.avif on a component that is allocated again
+    # after a collision. UTF-8 <=240 also fits Windows' UTF-16 component limit.
+    preview = '.preview' if stem.endswith('.preview') else ''
+    if preview:
+        stem = stem[:-len(preview)]
+    marker = '~' + tag
+    budget = 240 - len((preview + marker).encode('utf-8'))
+    if budget < 0:
+        raise PathError('Суффикс имени файла слишком длинный')
+    ext = ext.encode('utf-8')[:budget].decode('utf-8', errors='ignore')
+    stem = stem.encode('utf-8')[:budget-len(ext.encode('utf-8'))].decode('utf-8', errors='ignore')
+    return stem + preview + marker + ext
 
 
 def native(path):

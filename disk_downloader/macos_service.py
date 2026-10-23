@@ -28,7 +28,7 @@ def main(argv=None):
         parser.error('Порт должен быть от 1024 до 65535')
     try:
         if args.command == 'start':
-            result = start_background(args.port, args.state_dir)
+            result = start_background(args.port, args.state_dir, stop_on_failure=True)
         else:
             try:
                 client = Client(args.port, args.state_dir)

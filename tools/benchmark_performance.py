@@ -45,21 +45,26 @@ entered=threading.Event();online=threading.Event();online.set()
 class SyntheticAPI(FakeAPI):
     def __init__(self):
         super().__init__(); self.pages=defaultdict(list);self.media_calls=deque(maxlen=100);self.metadata_calls=deque(maxlen=100)
-        self.request_count=Counter();self.slow=False;self.outage=False;self.outages=0
+        self.request_count=Counter();self.slow=False;self.outage=False;self.outages=0;self.media_successes=0;self.outage_started=None
     def index(self):
         for path,meta in self.tree.items():
             if path!='disk:/':self.pages[parent_path(path)].append(meta)
         for children in self.pages.values():children.sort(key=lambda m:m['name'])
     def metadata(self,path,settings=None,checkpoint=lambda:None,offset=0,limit=200,**kw):
         checkpoint(); self.request_count['metadata']+=1
+        if self.outage and not online.is_set():raise NetworkError()
         meta=copy.deepcopy(self.tree[path])
         if meta['type']=='dir':meta['_embedded']={'items':copy.deepcopy(self.pages[path][offset:offset+limit]),'total':len(self.pages[path])}
         return meta
     def media(self,path,kind,settings,checkpoint=lambda:None):
-        checkpoint();self.request_count['media']+=1; entered.set()
-        if self.outage and not self.outages:
-            self.outages+=1;online.clear();raise NetworkError(offline=True)
+        checkpoint();entered.set()
+        with self.lock:
+            self.request_count['media']+=1
+            if self.outage and not self.outages:
+                self.outages+=1;self.outage_started=time.monotonic();online.clear()
+            if self.outage and not online.is_set():raise NetworkError()
         response,session=super().media(path,kind,settings,checkpoint)
+        with self.lock:self.media_successes+=1
         response.chunks=65536
         if self.slow:
             original=response.iter_content
@@ -196,7 +201,7 @@ before_io=counters();before_cpu=time.process_time();before_wall=time.perf_counte
 sampler=threading.Thread(target=sample,daemon=True);sampler.start()
 poller=None
 if args.case!='summary':poller=threading.Thread(target=poll,daemon=True);poller.start()
-correct={}
+correct={};offline_validation=None
 try:
     if args.case in ('idle','history','pause'):
         stop.wait(args.seconds)
@@ -210,10 +215,20 @@ try:
     elif args.case in ('download','offline'):
         engine.action(job,'start')
         if args.case=='offline':
-            due=time.monotonic()+10
-            while online.is_set() and time.monotonic()<due:time.sleep(.01)
-            assert not online.is_set();time.sleep(5);online.set()
+            network=engine.controls[job].network
+            try:
+                assert network.offline.wait(10), 'No real NetworkWait transition'
+                assert engine.status(job)['network_waiting']
+                time.sleep(5)
+                with api.lock:successes=api.media_successes
+                with store.db() as db:assert db.execute('SELECT COUNT(*) FROM artifacts WHERE job=?',(job,)).fetchone()[0]==0
+                assert not online.is_set() and network.offline.is_set() and successes==0
+                offline_validation={'waiting_observed':True,'successes_before_recovery':successes,'outage_seconds':time.monotonic()-api.outage_started}
+            finally:online.set()
         value=wait_job(job);assert value['phase']=='completed'
+        if args.case=='offline':
+            offline_validation['network_wait_seconds']=network.elapsed
+            assert network.elapsed>=5 and not network.offline.is_set()
     elif args.case=='missing':
         job=engine.create(settings|{'operation':'missing','destination':store.job(job)['root'],'missing_policy':'any_result'})
         wait_job(job);engine.action(job,'start');value=wait_job(job);assert value['phase']=='completed'
@@ -250,6 +265,7 @@ result={'case':args.case,'files':args.files,'seconds':elapsed,'cpu_seconds':cpu,
         'http_p95_ms':1000*ordered[min(len(ordered)-1,int(len(ordered)*.95))] if ordered else None,
         'network_requests':dict(api.request_count),'outages':api.outages,'correctness':correct,'sqlite':sqlite3.sqlite_version,'python':sys.version.split()[0],
         'profiled':args.profile,'http_transport':'flask-test-client' if args.test_client else 'tcp-waitress','source':str(args.source)}
+if offline_validation is not None:result['offline_validation']=offline_validation
 (args.output/'result.json').write_text(json.dumps(result,indent=2),encoding='utf-8')
 print(json.dumps(result),flush=True)
 session.close()

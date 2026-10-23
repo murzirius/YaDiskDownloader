@@ -18,8 +18,13 @@ class Doctor:
         with self.lock:
             if self.thread and self.thread.is_alive():return dict(self.result)
             self.result = {'busy':True, 'checks':[], 'checked_at':None}
-            self.thread = threading.Thread(target=self.run, name='disk-doctor', daemon=True)
-            self.thread.start()
+            try:
+                self.thread = threading.Thread(target=self.run, name='disk-doctor', daemon=True)
+                self.thread.start()
+            except RuntimeError:
+                self.thread = None
+                self.result = {'busy':False, 'checks':[{'source':'Приложение', 'ok':False,
+                    'message':'Приложение на этом устройстве не смогло запустить проверку. Закройте лишние программы и нажмите «Проверить ещё раз».'}], 'checked_at':time.time()}
         return self.snapshot()
 
     def snapshot(self):

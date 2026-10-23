@@ -40,7 +40,12 @@ def quiet(settings, hour=None):
 
 class Policy:
     def __init__(self, settings, control):
-        self.settings=settings;self.control=control;self.next=0;self.last=None;self.lock=threading.Lock()
+        self.settings=settings;self.control=control;self.next=0;self.last=None;self.last_rate=None;self.lock=threading.Lock()
+
+    def update_speed(self, mib):
+        with self.lock:
+            self.settings['speed_limit_mib']=mib
+            self._check(time.monotonic())
 
     def check(self):
         now=time.monotonic()
@@ -53,7 +58,7 @@ class Policy:
     def _check(self,now):
         self.next=now+10
         active=quiet(self.settings)
-        if active!=self.last:
-            rate=self.settings.get('quiet_hours',{}).get('speed_limit_mib',0) if active else self.settings.get('speed_limit_mib',0)
+        rate=self.settings.get('quiet_hours',{}).get('speed_limit_mib',0) if active else self.settings.get('speed_limit_mib',0)
+        if active!=self.last or rate!=self.last_rate:
             self.control.rate_limiter.configure(rate)
-            self.last=active
+            self.last,self.last_rate=active,rate

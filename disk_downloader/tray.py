@@ -101,6 +101,15 @@ class Tray:
         self.notification_thread.start()
 
     def watch_notifications(self):
+        from .work_policy import quiet
+
+        def allowed(settings):
+            try:
+                return not (quiet(settings) and settings.get('quiet_hours',{}).get('mute',True))
+            except (ValueError,TypeError,AttributeError):
+                # A damaged task must not break notifications for other tasks.
+                return False
+
         first = True
         while not self.notification_stop.is_set():
             try:
@@ -110,43 +119,60 @@ class Tray:
                     previous_version = None
                     enabled = True
                     warned_health = None
+                    settings_by_job = {}
                     while not self.notification_stop.wait(1):
-                        if previous_version is not None:
-                            active = self.active()
+                        observe_health = previous_version is not None
+                        active = self.active()
+                        version = db.execute('PRAGMA data_version').fetchone()[0]
+                        if version != previous_version:
+                            pref = db.execute("SELECT CAST(value AS BLOB) FROM preferences WHERE key='notifications'").fetchone()
+                            rows = db.execute('SELECT id,phase,generation,pause_reason,CAST(settings AS BLOB) AS settings FROM jobs').fetchall()
+                            previous_version = version
+                            enabled = not pref
+                            if pref:
+                                try:
+                                    value = pref[0].decode(self.engine.store.text_encoding) if isinstance(pref[0],bytes) else pref[0]
+                                except UnicodeError:
+                                    value = None
+                                enabled = value == 'true'
+                            current = {}
+                            settings_by_job = {}
+                            for job in rows:
+                                key = (job['phase'], job['generation'], bool(job['pause_reason']))
+                                previous = self.seen.get(job['id'])
+                                current[job['id']] = key
+                                health_job = enabled and active and active[0] == job['id']
+                                phase_notice = not first and previous != key and enabled and self.icon and self.icon.visible
+                                if not health_job and not phase_notice:
+                                    continue
+                                try:
+                                    settings = self.engine.store.settings_value(job['settings'])
+                                except (ValueError,TypeError):
+                                    continue
+                                if health_job:
+                                    # Keep only the active task's small policy, not
+                                    # every saved task's full settings and paths.
+                                    settings_by_job[job['id']] = {'quiet_hours':settings.get('quiet_hours',{})}
+                                if not phase_notice or not allowed(settings):
+                                    continue
+                                text = None
+                                if job['phase'] == 'completed': text = 'Загрузка завершена. Откройте приложение через значок в трее.'
+                                elif job['phase'] == 'completed_with_errors': text = 'Загрузка завершена с замечаниями. Проверьте результат в приложении.'
+                                elif job['phase'] == 'paused' and job['pause_reason']: text = job['pause_reason']
+                                elif job['phase'] == 'failed': text = 'Задание требует внимания. Откройте приложение через значок в трее.'
+                                if text:
+                                    self.icon.notify(text, 'YaDiskDownloader')
+                            self.seen = current
+                            first = False
+                        if observe_health:
                             warning = active[1].health()['warning'] if active else ''
                             key = (active[0],warning) if active and warning else None
-                            if key and key != warned_health and enabled and self.icon and self.icon.visible:
+                            permitted = enabled and active and active[0] in settings_by_job and allowed(settings_by_job[active[0]])
+                            if key and key != warned_health and permitted and self.icon and self.icon.visible:
                                 self.icon.notify(warning,'YaDiskDownloader')
                                 warned_health = key
-                            elif not key or not enabled:
+                            elif not key or not permitted:
                                 warned_health = None
-                        version = db.execute('PRAGMA data_version').fetchone()[0]
-                        if version == previous_version:
-                            continue
-                        pref = db.execute("SELECT value FROM preferences WHERE key='notifications'").fetchone()
-                        rows = db.execute('SELECT id,phase,generation,pause_reason,settings FROM jobs').fetchall()
-                        previous_version = version
-                        enabled = not pref or pref[0] == 'true'
-                        current = {}
-                        for job in rows:
-                            key = (job['phase'], job['generation'], bool(job['pause_reason']))
-                            previous = self.seen.get(job['id'])
-                            current[job['id']] = key
-                            if first or previous == key or not enabled or not self.icon or not self.icon.visible:
-                                continue
-                            text = None
-                            if job['phase'] == 'completed': text = 'Загрузка завершена. Откройте приложение через значок в трее.'
-                            elif job['phase'] == 'completed_with_errors': text = 'Загрузка завершена с замечаниями. Проверьте результат в приложении.'
-                            elif job['phase'] == 'paused' and job['pause_reason']: text = job['pause_reason']
-                            elif job['phase'] == 'failed': text = 'Задание требует внимания. Откройте приложение через значок в трее.'
-                            if text:
-                                import json
-                                from .work_policy import quiet
-                                settings=json.loads(job['settings'])
-                                if not (quiet(settings) and settings.get('quiet_hours',{}).get('mute',True)):
-                                    self.icon.notify(text, 'YaDiskDownloader')
-                        self.seen = current
-                        first = False
             except Exception:
                 self.notification_stop.wait(1)
 

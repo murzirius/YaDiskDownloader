@@ -49,13 +49,16 @@ def write_reports(store, job_id, checkpoint=lambda: None, final_phase=None):
         return _write_reports(store, job_id, checkpoint, final_phase)
 
 
-def merged_records(store, job):
-    for row in store.rows('SELECT data FROM report_records WHERE root=? ORDER BY path,kind', (root_key(job['root']),)):
+def merged_records(store, job, key=None):
+    key = root_key(job['root']) if key is None else key
+    for row in store.rows('SELECT data FROM report_records WHERE root=? ORDER BY path,kind', (key,)):
         yield json.loads(row['data'])
 
 
 def _write_reports(store, job_id, checkpoint, final_phase):
     job = store.job(job_id)
+    # Grouping key only: publication still checks paths and ownership afresh.
+    key = root_key(job['root'])
     # Errors are current observations, not permanent history. Keep older errors
     # only while a source remains outside this job's successfully scanned scope.
     with store.db() as db:
@@ -64,11 +67,11 @@ def _write_reports(store, job_id, checkpoint, final_phase):
               AND EXISTS(SELECT 1 FROM json_each(?) scope WHERE scope.value='disk:/' OR scope.value=report_records.path
                 OR substr(report_records.path,1,length(scope.value)+1)=scope.value||'/')
               AND NOT EXISTS(SELECT 1 FROM scan_errors s WHERE s.job=? AND (s.path=report_records.path
-                OR substr(report_records.path,1,length(rtrim(s.path,'/'))+1)=rtrim(s.path,'/')||'/'))""", (root_key(job['root']),json.dumps(job['settings']['paths']),job_id))
+                OR substr(report_records.path,1,length(rtrim(s.path,'/'))+1)=rtrim(s.path,'/')||'/'))""", (key,json.dumps(job['settings']['paths']),job_id))
     batch = []
     for record in records(store, job_id):
         checkpoint()
-        batch.append((root_key(job['root']), record['source_path'], record['record_type'], json.dumps(record, ensure_ascii=False)))
+        batch.append((key, record['source_path'], record['record_type'], json.dumps(record, ensure_ascii=False)))
         if len(batch) >= 200:
             with store.db() as db:
                 db.executemany('INSERT OR REPLACE INTO report_records VALUES(?,?,?,?)', batch)
@@ -90,7 +93,7 @@ def _write_reports(store, job_id, checkpoint, final_phase):
                 if fmt == "json":
                     out.write('{"summary":' + json.dumps(summary, ensure_ascii=False) + ',"entries":[')
                     first = True
-                    for row in merged_records(store, job):
+                    for row in merged_records(store, job, key):
                         checkpoint()
                         if not first:
                             out.write(",")
@@ -101,20 +104,20 @@ def _write_reports(store, job_id, checkpoint, final_phase):
                     writer = csv.writer(out, delimiter=";", quoting=csv.QUOTE_ALL)
                     writer.writerow(["summary", *fields])
                     writer.writerow([excel_cell(json.dumps(summary, ensure_ascii=False)), "summary", *("" for _ in fields[1:])])
-                    for row in merged_records(store, job):
+                    for row in merged_records(store, job, key):
                         checkpoint()
                         writer.writerow(["", *[excel_cell(json.dumps(row[k], ensure_ascii=False) if isinstance(row[k], (list, dict)) else row[k]) for k in fields]])
                 elif fmt == "txt":
                     out.write("Локальная копия Яндекс.Диска — отчёт\n\nНастройки и итог:\n")
                     out.write(json.dumps(summary, ensure_ascii=False, indent=2) + "\n\nРесурсы:\n")
-                    for row in merged_records(store, job):
+                    for row in merged_records(store, job, key):
                         checkpoint()
                         out.write(json.dumps(row, ensure_ascii=False, indent=2) + "\n")
                 elif fmt == "html":
                     out.write('<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Отчёт Яндекс.Диск</title><style>body{font:14px system-ui;margin:24px;background:#17191d;color:#e5e7eb}table{border-collapse:collapse;width:100%}th,td{border:1px solid #41454d;padding:8px;text-align:left;vertical-align:top;overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere}th{background:#272b33}</style><h1>Отчёт Яндекс.Диск</h1><p>100% обработки может включать ошибки. Превью не является оригиналом.</p><pre>')
                     out.write(html.escape(json.dumps(summary, ensure_ascii=False, indent=2)))
                     out.write("</pre><table><thead><tr>" + "".join("<th>" + html.escape(k) + "</th>" for k in fields) + "</tr></thead><tbody>")
-                    for row in merged_records(store, job):
+                    for row in merged_records(store, job, key):
                         checkpoint()
                         out.write("<tr>" + "".join("<td>" + html.escape(json.dumps(row[k], ensure_ascii=False) if isinstance(row[k], (list, dict)) else str(row[k] if row[k] is not None else "")) + "</td>" for k in fields) + "</tr>")
                     out.write("</tbody></table></html>")

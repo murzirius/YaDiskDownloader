@@ -112,7 +112,9 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         shell: pwsh
         run: |
-          $windowsArchive = "dist/release/YaDiskDownloader-${env:RELEASE_TAG}-Windows-x64.zip"
+          $appVersion = python -c "from disk_downloader import __version__; print(__version__)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $windowsArchive = "dist/release/YaDiskDownloader-v${appVersion}-Windows-x64.zip"
           foreach ($archive in @($windowsArchive)) {
             if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
               throw "Release archive is missing: $archive"
@@ -120,7 +122,9 @@ jobs:
           }
           gh release view $env:RELEASE_TAG *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $env:RELEASE_TAG --verify-tag --title "YaDiskDownloader $env:RELEASE_TAG" --notes-file "docs/release-$env:RELEASE_TAG.md"
+            $releaseOptions = @()
+            if ($env:RELEASE_TAG -like '*-build.*') { $releaseOptions += '--prerelease' }
+            gh release create $env:RELEASE_TAG --verify-tag --title "YaDiskDownloader $env:RELEASE_TAG" --notes-file "docs/release-v${appVersion}.md" @releaseOptions
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
           gh release upload $env:RELEASE_TAG $windowsArchive --clobber

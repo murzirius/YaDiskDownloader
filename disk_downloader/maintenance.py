@@ -178,42 +178,48 @@ class Maintenance:
         if not isinstance(root,str) or not Path(root).is_absolute() or not Path(root).is_dir():
             raise ValueError('Выберите папку загрузки')
         key=root_key(root)
+        lexical=os.path.normcase(os.path.abspath(root))
         protected=set()
         with self.engine.lock:
+            # Deletion already requires an idle engine. Do not inspect any
+            # saved drive merely to resolve a legacy alias of an active job.
+            if any(thread.is_alive() for thread in self.engine.threads.values()):
+                return {'items':[],'bytes':0,'message':'Сейчас выполняется задание. Остановите его перед очисткой.'}
             for row in self.store.rows('SELECT id,root FROM jobs'):
-                if root_key(row['root'])!=key: continue
-                if self.engine.threads.get(row['id']) and self.engine.threads[row['id']].is_alive():
-                    return {'items':[],'bytes':0,'message':'В этой папке выполняется задание'}
+                if os.path.normcase(os.path.abspath(row['root'])) not in (lexical,key): continue
                 with self.store.db() as db:
                     queued=db.execute('SELECT 1 FROM job_queue WHERE job=?',(row['id'],)).fetchone()
-                for part in self.store.rows('SELECT local FROM partials WHERE job=?',(row['id'],)):
-                    protected.add(part['local'])
-                for part in self.store.rows('SELECT temp FROM pending_publications WHERE job=?',(row['id'],)):
-                    protected.add(part['temp'])
-                for artifact in self.store.rows('SELECT local FROM artifacts WHERE job=?',(row['id'],)):
-                    protected.add(artifact['local'])
                 if queued: return {'items':[],'bytes':0,'message':'Папка используется очередью заданий'}
-            manifests=list(Path(root).glob('.disk-import*.sqlite3'))
-            if len(manifests)>50:
-                return {'items':[],'bytes':0,'message':'Слишком много описей. Очистка отключена для сохранности частей.'}
-            for manifest in manifests:
-                try:
-                    safe_join(root,manifest.name)
-                    with closing(readonly(manifest)) as source:
-                        tables={r[0] for r in source.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                        for table in ('partials','artifacts'):
-                            if table in tables:
-                                protected.update(r[0] for r in source.execute('SELECT local FROM '+table) if isinstance(r[0],str))
-                except (OSError,ValueError,sqlite3.Error):
-                    return {'items':[],'bytes':0,'message':'Опись недоступна или повреждена. Очистка отключена для сохранности частей.'}
-            items=[]
-            for row in self.store.rows('SELECT local,created,purpose FROM temporary_files WHERE root=?',(key,)):
-                if row['local'] in protected or time.time()-row['created']<3600: continue
-                try:
-                    file=safe_join(root,row['local']); info=os.stat(file)
-                    if info.st_nlink!=1 or not re.fullmatch(r'\.disk-[A-Za-z0-9_-]{8,}\.part',row['local']): continue
-                    items.append({'local':row['local'],'bytes':info.st_size,'signature':list(file_signature(file,''))})
-                except (OSError,ValueError): continue
+        # Preview does not mutate files. Slow IO belongs outside the global
+        # control lock; cleanup() repeats all checks while exclusively idle.
+        manifests=list(Path(root).glob('.disk-import*.sqlite3'))
+        if len(manifests)>50:
+            return {'items':[],'bytes':0,'message':'Слишком много описей. Очистка отключена для сохранности частей.'}
+        for manifest in manifests:
+            try:
+                safe_join(root,manifest.name)
+                with closing(readonly(manifest)) as source:
+                    tables={r[0] for r in source.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                    for table in ('partials','artifacts'):
+                        if table in tables:
+                            protected.update(r[0] for r in source.execute('SELECT local FROM '+table) if isinstance(r[0],str))
+            except (OSError,ValueError,sqlite3.Error):
+                return {'items':[],'bytes':0,'message':'Опись недоступна или повреждена. Очистка отключена для сохранности частей.'}
+        # Retain only actual candidate references, including legacy aliases,
+        # using database metadata alone. Never probe other saved drives or
+        # allocate a Python set for all media in the history.
+        for reference in self.store.rows('''SELECT p.local FROM partials p JOIN temporary_files t ON t.root=? AND t.local=p.local
+          UNION SELECT p.temp AS local FROM pending_publications p JOIN temporary_files t ON t.root=? AND t.local=p.temp
+          UNION SELECT a.local FROM artifacts a JOIN temporary_files t ON t.root=? AND t.local=a.local''',(key,key,key)):
+            protected.add(reference['local'])
+        items=[]
+        for row in self.store.rows('SELECT local,created,purpose FROM temporary_files WHERE root=?',(key,)):
+            if row['local'] in protected or time.time()-row['created']<3600: continue
+            try:
+                file=safe_join(root,row['local']); info=os.stat(file)
+                if info.st_nlink!=1 or not re.fullmatch(r'\.disk-[A-Za-z0-9_-]{8,}\.part',row['local']): continue
+                items.append({'local':row['local'],'bytes':info.st_size,'signature':list(file_signature(file,''))})
+            except (OSError,ValueError): continue
         return {'items':items,'bytes':sum(r['bytes'] for r in items),'message':'Только зарегистрированные временные файлы старше часа. Пригодные части защищены.'}
 
     def cleanup(self, data):

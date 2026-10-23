@@ -131,7 +131,10 @@
             dispatch_async(dispatch_get_main_queue(), ^{ completion(1, error.localizedDescription); });
             return;
         }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        // Startup includes the readiness deadline, a final HTTP probe and
+        // bounded cleanup of the owned child before the helper reports failure.
+        int64_t commandTimeout = [command isEqualToString:@"start"] ? 120 : 60;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, commandTimeout * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
             if (task.running) [task terminate];
         });
         NSData *data = [pipe.fileHandleForReading readDataToEndOfFile];

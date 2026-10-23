@@ -1,4 +1,5 @@
 import threading
+from contextlib import nullcontext
 import time
 from datetime import datetime
 
@@ -45,6 +46,8 @@ class Management:
             self.next_due = 0
             if self.engine.shutting_down:
                 raise ValueError('Приложение завершается')
+            if self.engine.history_restore_busy:
+                raise ValueError('Приложение на ПК восстанавливает историю. Дождитесь завершения, затем повторите действие.')
             with self.store.db() as db:
                 if verb in ('pause', 'resume'):
                     db.execute("INSERT OR REPLACE INTO preferences VALUES('queue_paused',?)", ('true' if verb == 'pause' else 'false',))
@@ -97,13 +100,13 @@ class Management:
     def tick(self):
         # No scheduler action is possible before consent/connection, or while
         # any task is still running. Avoid opening SQLite just to rediscover it.
-        if (self.engine.shutting_down or not self.armed or not self.engine.api.credentials.connected
+        if (self.engine.shutting_down or self.engine.maintenance_busy or not self.armed or not self.engine.api.credentials.connected
                 or any(thread.is_alive() for thread in tuple(self.engine.threads.values()))):
             return
         if time.time() < self.next_due:
             return
         with self.engine.lock:
-            if self.engine.shutting_down or not self.armed or not self.engine.api.credentials.connected or self.paused():
+            if self.engine.shutting_down or self.engine.maintenance_busy or not self.armed or not self.engine.api.credentials.connected or self.paused():
                 return
             with self.store.db() as db:
                 for row in db.execute("SELECT job FROM job_queue WHERE state='running'").fetchall():
@@ -147,7 +150,12 @@ class Management:
         return {'items':[dict(r) for r in rows], 'total':total,'offset':offset,'has_more':offset+len(rows)<total}
 
     def history_action(self, job_id, data):
-        with self.engine.lock:
+        recovery = getattr(self.engine, 'recovery', None)
+        # start() and mutation share the same short guard. No recovery file I/O
+        # holds this lock; a completed recovery error remains removable.
+        with self.engine.lock, recovery.lock if recovery is not None else nullcontext():
+            if recovery is not None and recovery.result['busy']:
+                raise ValueError('Приложение на ПК восстанавливает сохранённые файлы. Дождитесь завершения, затем измените историю.')
             if self.engine.maintenance_busy:raise ValueError('Дождитесь завершения проверки или очистки файлов перед изменением истории.')
             self.store.job(job_id)
             thread = self.engine.threads.get(job_id)

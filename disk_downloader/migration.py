@@ -6,6 +6,7 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 
 from .store import Store
+from .backups import backup_connection
 
 
 TABLES = ("entries", "names", "artifacts", "partials", "baseline", "changes", "scan_errors")
@@ -20,7 +21,7 @@ def backup_snapshot(source, folder):
         raise ValueError("Некорректная папка переноса")
     try:
         with closing(sqlite3.connect(filename)) as snapshot:
-            source.backup(snapshot)
+            backup_connection(source,snapshot)
             snapshot.row_factory = sqlite3.Row
             yield snapshot
     finally:

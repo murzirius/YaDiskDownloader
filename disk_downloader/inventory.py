@@ -6,7 +6,7 @@ from .exclusions import excluded
 from .file_types import selected_type
 from .journal import encoded
 from .paths import forget_temporary, temporary_file
-from .import_state import UNREADABLE_META
+from .import_state import UNREADABLE_META, history_metadata
 
 
 LABELS = {"new": "Новые", "changed": "Изменённые", "unchanged": "Без изменений", "removed": "Больше нет в источнике", "excluded": "Исключены из выбора", "unknown": "Не удалось проверить"}
@@ -23,21 +23,23 @@ def compare(store, job_id, checkpoint=lambda: None):
         errors = [r[0] for r in db.execute("SELECT path FROM scan_errors WHERE job=?", (job_id,))]
         db.execute("DELETE FROM changes WHERE job=?", (job_id,))
     selections = (
-        ("SELECT e.path,e.meta,b.meta AS old FROM entries e LEFT JOIN baseline b ON b.job=e.job AND b.path=e.path WHERE e.job=? AND e.kind='file'", False),
-        ("SELECT b.path,b.meta FROM baseline b WHERE b.job=? AND b.kind='file' AND NOT EXISTS(SELECT 1 FROM entries e WHERE e.job=b.job AND e.path=b.path)", True)
+        ("SELECT e.path,e.meta,CAST(b.meta AS BLOB) AS old FROM entries e LEFT JOIN baseline b ON b.job=e.job AND b.path=e.path WHERE e.job=? AND e.kind='file'", False),
+        ("SELECT b.path,CAST(b.meta AS BLOB) AS meta FROM baseline b WHERE b.job=? AND b.kind='file' AND NOT EXISTS(SELECT 1 FROM entries e WHERE e.job=b.job AND e.path=b.path)", True)
     )
     for sql, missing in selections:
         batch = []
         for row in store.rows(sql, (job_id,)):
             checkpoint()
             if not missing:
-                before = json.loads(row['old']) if row['old'] is not None else None
+                old = history_metadata(row['old'], store.text_encoding)[0] if row['old'] is not None else None
+                before = json.loads(old) if old is not None else None
                 status = 'unknown' if before and before.get(UNREADABLE_META) else "new" if before is None else "unchanged" if stamp(before) == stamp(json.loads(row["meta"])) else "changed"
-                batch.append((job_id, row["path"], status, row["old"], row["meta"]))
+                batch.append((job_id, row["path"], status, old, row["meta"]))
             else:
                 path = row["path"]
                 in_scope = any(root == "disk:/" or root == path or path.startswith(root + "/") for root in settings["paths"])
-                before = json.loads(row['meta'])
+                old = history_metadata(row['meta'], store.text_encoding)[0]
+                before = json.loads(old)
                 if not in_scope or excluded(path, settings):
                     status = "excluded"
                 elif before.get(UNREADABLE_META):
@@ -48,7 +50,7 @@ def compare(store, job_id, checkpoint=lambda: None):
                     status = "unknown"
                 else:
                     status = "removed"
-                batch.append((job_id, path, status, row["meta"], None))
+                batch.append((job_id, path, status, old, None))
             if len(batch) == 200:
                 with store.db() as db:
                     db.executemany("INSERT INTO changes VALUES(?,?,?,?,?)", batch)
@@ -70,16 +72,15 @@ def folders(store, job_id, path="disk:/", offset=0):
     store.job(job_id)
     prefix = path.rstrip("/") + "/"
     with store.db() as db:
-        rows = db.execute("""WITH files AS (
-          SELECT path,substr(path,?) AS relative,json_extract(meta,'$.size') AS bytes,
-          json_extract(meta,'$.has_preview') AS preview FROM entries
-          WHERE job=? AND kind='file' AND substr(path,1,?)=?
-        ), grouped AS (
-          SELECT CASE WHEN instr(relative,'/')=0 THEN ? ELSE ? || substr(relative,1,instr(relative,'/')-1) END AS path,
+        rows = db.execute("""SELECT CASE WHEN instr(relative,'/')=0 THEN :path ELSE :prefix || substr(relative,1,instr(relative,'/')-1) END AS path,
           instr(relative,'/')=0 AS direct,COUNT(*) AS files,COALESCE(SUM(bytes),0) AS known_bytes,
           SUM(bytes IS NULL) AS unknown_sizes,COALESCE(SUM(preview=1),0) AS preview_files
-          FROM files GROUP BY 1,2
-        ) SELECT * FROM grouped ORDER BY known_bytes DESC,path LIMIT 101 OFFSET ?""", (len(prefix) + 1, job_id, len(prefix), prefix, path, prefix, offset)).fetchall()
+          FROM (
+          SELECT path,substr(path,:start) AS relative,json_extract(meta,'$.size') AS bytes,
+          json_extract(meta,'$.has_preview') AS preview FROM entries
+          WHERE job=:job AND kind='file' AND substr(path,1,:length)=:prefix
+          ) AS files GROUP BY 1,2 ORDER BY known_bytes DESC,path LIMIT 101 OFFSET :offset""",
+          {'path':path,'prefix':prefix,'start':len(prefix)+1,'length':len(prefix),'job':job_id,'offset':offset}).fetchall()
     return {"path": path, "items": [dict(row) for row in rows[:100]], "has_more": len(rows) > 100, "next_offset": offset + min(100, len(rows))}
 
 

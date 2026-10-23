@@ -13,14 +13,18 @@ class WriteGate:
         self.owner = None
         self.thread = None
 
-    def acquire(self, owner):
+    def acquire(self, owner, checkpoint=None):
         with self.condition:
             if self.thread == threading.get_ident():
                 raise sqlite3.OperationalError('Nested write connections are not supported')
             self.waiting.append(owner)
             try:
+                if checkpoint is not None:
+                    checkpoint()
                 while self.owner is not None or self.waiting[0] is not owner:
-                    self.condition.wait()
+                    self.condition.wait(timeout=.05 if checkpoint is not None else None)
+                    if checkpoint is not None:
+                        checkpoint()
                 self.waiting.popleft()
                 self.owner, self.thread = owner, threading.get_ident()
             except BaseException:
@@ -54,13 +58,14 @@ def gate_for(filename):
 class WriteConnection(sqlite3.Connection):
     gate = None
     admitted = False
+    admission_checkpoint = None
 
     def admit(self, sql):
         command = sql.lstrip().split(None,1)[0].upper() if sql.strip() else ''
         # PRAGMAs used by Store.db() configure the connection, not shared data.
         # All application DML/DDL (including WITH or explicit BEGIN) is admitted.
         if self.gate and not self.admitted and command not in ('', 'SELECT', 'EXPLAIN', 'PRAGMA'):
-            self.gate.acquire(self)
+            self.gate.acquire(self, self.admission_checkpoint)
             self.admitted = True
 
     def execute(self, sql, parameters=(), /):

@@ -38,12 +38,12 @@ def test_macos_private_service_starts_and_checks_same_state(monkeypatch, tmp_pat
     from disk_downloader import macos_service
     monkeypatch.setattr(sys, 'platform', 'darwin')
     calls = []
-    def start(port, state):
-        calls.append((port, state))
+    def start(port, state, *, stop_on_failure=False):
+        calls.append((port, state, stop_on_failure))
         return {'running': True}
     monkeypatch.setattr(macos_service, 'start_background', start)
     assert macos_service.main(['--port', '12345', '--state-dir', str(tmp_path), 'start']) == 0
-    assert calls == [(12345, tmp_path)]
+    assert calls == [(12345, tmp_path, True)]
     assert json.loads(capsys.readouterr().out)['running']
 
 

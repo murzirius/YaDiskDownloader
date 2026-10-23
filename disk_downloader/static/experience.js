@@ -107,8 +107,6 @@ function applyDownloadSettings(value){
   $('exclusions').value=(value.exclusions||[]).join('\n');selected.clear();for(const path of value.paths||[])selected.add(path);updateSelection();renderFiles();state.limitsTouched=true;$('operation').onchange();renderSetup();
 }
 
-$('apply-profile').addEventListener('click',()=>{const profile=profiles.find(item=>item.name===$('profile-list').value);if(profile&&!profile.error){$('auto-start').checked=profile.settings.auto_start!==false;$('auto-start').onchange();}});
-
 const verificationSummary=node('div',undefined,'verification-summary');verificationSummary.id='preflight-summary';verificationSummary.role='status';verificationSummary.hidden=true;$('active-files').before(verificationSummary);
 const resultActions=node('div',undefined,'actions');resultActions.id='result-actions';$('result-info').after(resultActions);
 let resultActionsKey='';
@@ -131,7 +129,7 @@ function renderExperience(job){
   $('retry-job').hidden=true;
   if(job.live)return;
   if(job.errors||job.scan_errors||job.counts?.partial||job.missing_previews){
-    const retry=toolButton(job.scan_errors?'Повторить обход и дозагрузку':job.errors?'Повторить ошибки':'Повторить отсутствующие копии',async()=>action(job.scan_errors?'retry':'retry_failed'));
+    const retry=toolButton(job.scan_errors?'Повторить обход и дозагрузку':job.errors?'Повторить ошибки':'Повторить отсутствующие копии',async()=>action(job.scan_errors?'retry':'retry_failed',job.id));
     retry.disabled=!state.connected;resultActions.append(retry);
   }
   if(job.completeness?.preview_only||job.completeness?.no_result){

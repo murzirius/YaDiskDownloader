@@ -175,7 +175,7 @@ def test_pause_resume_stop_and_partial_archive(system):
 def test_corrupt_original_and_preview_are_not_completed(system):
     engine, api, _ = system
     api.file("disk:/bad.dat")
-    api.data[("disk:/bad.dat", "original")] = b"wrong"
+    api.data[("disk:/bad.dat", "original")] = b"originaX"
     api.data[("disk:/bad.dat", "preview")] = b"<html>not an image</html>"
     job = run_job(system, mode="both")
     assert job["errors"] == 1 and job["saved_bytes"] == 0, job

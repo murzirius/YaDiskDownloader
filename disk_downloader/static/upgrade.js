@@ -216,7 +216,7 @@ verificationHint.after(duplicateField,node('p','Защита выключена 
 const originalAdvancedSettings=advancedSettings;
 advancedSettings=function(){return {...originalAdvancedSettings(),verification_mode:verifySelect.value,deduplicate:duplicateCheck.checked};};
 const originalApplySettings=applyDownloadSettings;
-applyDownloadSettings=function(value){verifySelect.value=value.verification_mode||'fast';duplicateCheck.checked=!!value.deduplicate;return originalApplySettings(value);};
+applyDownloadSettings=function(value){verifySelect.value=value.verification_mode||'fast';duplicateCheck.checked=!!value.deduplicate;const result=originalApplySettings(value);renderExclusionChoices();return result;};
 const originalRuntimeLimits=runtimeLimits;
 runtimeLimits=function(){return {...originalRuntimeLimits(),verification_mode:verifySelect.value,deduplicate:duplicateCheck.checked};};
 
@@ -246,17 +246,21 @@ inspectDestination=async function(){
 };
 const originalAction=action;
 let checkingStart=false;
-action=async function(verb){
+action=async function(verb,jobId=state.job){
+  if(!jobId||jobId!==state.job)return;
   if(verb==='start'){
-    if(checkingStart)return;checkingStart=true;const jobId=state.job;
+    if(checkingStart||state.jobStatus?.id!==jobId)return;
+    checkingStart=true;const revision=state.jobRevision;
+    const current=()=>state.job===jobId&&state.jobRevision===revision;
     try{
-      const result=await checkDestination(state.jobStatus.root);
-      if(state.job!==jobId)return;
+      const result=await checkDestination(state.jobStatus.root,current);
+      if(!result||!current())return;
       const plan=await api('/api/jobs/'+jobId+'/plan');
+      if(!current())return;
       if(plan.known_bytes>result.free_bytes)throw Error('На выбранном накопителе недостаточно свободного места для известных оригиналов. Освободите место или измените выбор.');
     }finally{checkingStart=false;}
   }
-  return originalAction(verb);
+  return originalAction(verb,jobId);
 };
 
 const exclusionList=node('div',undefined,'exclusion-chips');$('exclusions').after(exclusionList);
@@ -381,7 +385,7 @@ const groupedProblems=toolButton('Разобрать проблемы',async()=>
     const row=node('div',undefined,'tool-row');row.append(node('strong',group.source+' · файлов: '+group.files),node('p',group.error));
     if(group.action==='connect')row.append(toolButton('Подключить Диск',async()=>{problemDialog.close();$('auth-form').hidden=false;$('token').focus();}));
     if(group.action==='folder')row.append(toolButton('Открыть папку результатов',async()=>api('/api/jobs/'+id+'/open-folder',{})));
-    const retry=toolButton('Повторить неудачные файлы',async()=>{await action('retry');problemDialog.close();});retry.disabled=state.jobStatus?.live||!state.connected;row.append(retry);
+    const retry=toolButton('Повторить неудачные файлы',async()=>{await action('retry',id);problemDialog.close();});retry.disabled=state.jobStatus?.live||!state.connected;row.append(retry);
     row.append(toolButton('Диагностика',async()=>{problemDialog.close();$('open-service').click();}));
     row.append(toolButton('Посмотреть файлы',async()=>{problemDialog.close();fileJob=id;fileOffset=0;fileFilter.value='problems';fileDialog.showModal();await loadTaskFiles();}));problemRows.append(row);
   }
@@ -404,5 +408,3 @@ renderExperience=function(job){
     const open=toolButton('Открыть результаты',async()=>api('/api/jobs/'+job.id+'/open-folder',{}));open.dataset.resultFolder='true';resultActions.prepend(open);
   }
 };
-
-$('apply-profile').addEventListener('click',()=>{const profile=profiles.find(item=>item.name===$('profile-list').value);if(profile&&!profile.error)verifySelect.value=profile.settings.verification_mode||'fast';renderExclusionChoices();});

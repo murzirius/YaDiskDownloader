@@ -6,12 +6,24 @@ from contextlib import closing
 from pathlib import Path
 from urllib.parse import quote
 from .paths import remote_path,relative_parts,PathError
+from .backups import backup_connection
 
-from .paths import forget_temporary, publish, replace_owned, reserve_output, safe_join, temporary_file
+from .paths import forget_temporary, publish, reserve_output, safe_join, temporary_file
 
 
 FORMAT = "disk-local-import-v1"
 UNREADABLE_META = '_unreadable_history'
+
+
+def history_metadata(value, encoding='utf-8'):
+    """Preserve valid object JSON; isolate one damaged comparison record."""
+    try:
+        text = value.decode(encoding) if isinstance(value, bytes) else value
+        if not isinstance(json.loads(text), dict):
+            raise ValueError('Comparison metadata must be an object')
+        return text, False
+    except (ValueError, TypeError, RecursionError):
+        return json.dumps({UNREADABLE_META:True}), True
 
 
 def _sqlite_uri(filename):
@@ -112,14 +124,10 @@ def inherit(store, job_id, previous, checkpoint=lambda: None, progress=lambda co
                 checkpoint()
                 row = tuple(record)
                 if metadata is not None:
-                    try:
-                        text = row[metadata].decode(encoding)
-                    except (UnicodeDecodeError, AttributeError):
-                        # Preserve the original database. Only the comparison
-                        # baseline is marked unknown; fresh cloud metadata and
-                        # all existing content verification remain mandatory.
-                        text = json.dumps({UNREADABLE_META:True})
-                        unreadable += 1
+                    # The original database stays untouched. Unknown history
+                    # never authorizes cached content reuse or a removal.
+                    text, damaged = history_metadata(row[metadata], encoding)
+                    unreadable += int(damaged)
                     row = (*row[:metadata],text,*row[metadata+1:])
                 if remote is not None: remote_path(row[remote])
                 if local is not None:
@@ -200,7 +208,7 @@ def backup_import(store, job_id, previous, checkpoint=lambda: None):
     try:
         checkpoint()
         with closing(sqlite3.connect(_sqlite_uri(previous['file']),uri=True)) as source, closing(sqlite3.connect(temp)) as target:
-            source.backup(target,pages=128,progress=lambda *args:checkpoint(),sleep=.05)
+            backup_connection(source,target,checkpoint=checkpoint)
         with open(temp,'r+b') as stream:
             os.fsync(stream.fileno())
         checkpoint()
@@ -212,23 +220,24 @@ def backup_import(store, job_id, previous, checkpoint=lambda: None):
 
 
 def save_import(store, job_id, checkpoint=lambda: None):
+    # Periodic and final exports must share the report serializer, including
+    # callers which do not already hold it (manual manifest and shutdown).
+    from .reports import REPORT_LOCK
+    with REPORT_LOCK:
+        return _save_import(store, job_id, checkpoint)
+
+
+def _save_import(store, job_id, checkpoint):
+    from .service_outputs import location, finish
     job = store.job(job_id)
-    local = job["settings"].get("manifest_local")
-    owned = False
-    if local:
-        filename = safe_join(job["root"], local)
-        if os.path.isfile(filename):
-            try:
-                with closing(sqlite3.connect(_sqlite_uri(Path(job["root"]) / local), uri=True)) as db:
-                    owned = db.execute("SELECT value FROM import_meta WHERE key='format'").fetchone() == (FORMAT,)
-            except sqlite3.Error:
-                pass
-        else:
-            owned = True
-    if not local or not owned:
-        local = reserve_output(store, job, ".disk-import.sqlite3")
-        job["settings"]["manifest_local"] = local
-        store.update_job(job_id, settings=json.dumps(job["settings"], ensure_ascii=False))
+    local, replacing = location(store, job, 'manifest', '.disk-import.sqlite3', checkpoint)
+    if job['settings'].get('manifest_local') != local:
+        with store.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            settings = store.settings_value(db.execute('SELECT CAST(settings AS BLOB) FROM jobs WHERE id=?',(job_id,)).fetchone()[0])
+            settings['manifest_local'] = local
+            db.execute('UPDATE jobs SET settings=? WHERE id=?',(json.dumps(settings,ensure_ascii=False),job_id))
+        job['settings'] = settings
     temp = temporary_file(job["root"], store, 'manifest')
     def checked(rows):
         for row in rows:
@@ -250,14 +259,11 @@ def save_import(store, job_id, checkpoint=lambda: None):
             db.commit()
         checkpoint()
         manifest_bytes = os.path.getsize(temp)
-        target = safe_join(job["root"], local)
-        if owned and os.path.exists(target):
-            replace_owned(temp, target)
-        else:
-            publish(temp, target)
+        finish(store, job, 'manifest', local, temp, replacing, checkpoint)
         # Cache the size just written; UI polling must not stat a slow NAS.
         with store.db() as db:
-            settings = json.loads(db.execute('SELECT settings FROM jobs WHERE id=?',(job_id,)).fetchone()[0])
+            db.execute('BEGIN IMMEDIATE')
+            settings = store.settings_value(db.execute('SELECT CAST(settings AS BLOB) FROM jobs WHERE id=?',(job_id,)).fetchone()[0])
             if settings.get('manifest_local') == local:
                 settings['manifest_bytes'] = manifest_bytes
                 db.execute('UPDATE jobs SET settings=? WHERE id=?',(json.dumps(settings,ensure_ascii=False),job_id))

@@ -12,21 +12,20 @@ def download_plan(store, job_id):
     job = store.job(job_id)
     mode = 'both' if job['settings'].get('missing_policy') == 'both' else 'fallback' if job['settings'].get('operation') == 'missing' or job['generation'] else job['settings']['mode']
     with store.db() as db:
-        row = db.execute("""WITH copies AS (
-          SELECT e.path,e.meta,e.status,e.original_status,e.preview_status,
-          EXISTS(SELECT 1 FROM artifacts a WHERE a.job=e.job AND a.path=e.path AND a.type='original') AS original,
-          EXISTS(SELECT 1 FROM artifacts a WHERE a.job=e.job AND a.path=e.path AND a.type='preview') AS preview
-          FROM entries e WHERE e.job=? AND e.kind='file' AND e.status!='filtered')
-          SELECT COUNT(*) AS files,COALESCE(SUM(original),0) AS originals,
+        row = db.execute("""SELECT COUNT(*) AS files,COALESCE(SUM(original),0) AS originals,
           COALESCE(SUM(preview AND NOT original),0) AS preview_only,
           COALESCE(SUM(NOT original AND NOT preview),0) AS missing,
           COALESCE(SUM(status='pending'),0) AS to_download,
           COALESCE(SUM(original_status='downloaded_verified'),0) AS new_originals,
           COALESCE(SUM(preview_status='downloaded_verified'),0) AS new_previews,
           COALESCE(SUM(status='existing'),0) AS skipped,
-          COALESCE(SUM(CASE WHEN status='pending' AND NOT original AND (?!='previews' OR COALESCE(json_extract(meta,'$.file_type'),'files') NOT IN ('photos','videos')) THEN COALESCE(json_extract(meta,'$.size'),0) ELSE 0 END),0) AS known_bytes,
+          COALESCE(SUM(CASE WHEN status='pending' AND NOT original AND (:mode!='previews' OR COALESCE(json_extract(meta,'$.file_type'),'files') NOT IN ('photos','videos')) THEN COALESCE(json_extract(meta,'$.size'),0) ELSE 0 END),0) AS known_bytes,
           COALESCE(SUM(status='pending' AND json_extract(meta,'$.has_preview')=1),0) AS possible_previews
-          FROM copies""", (job_id,mode)).fetchone()
+          FROM (
+          SELECT e.path,e.meta,e.status,e.original_status,e.preview_status,
+          EXISTS(SELECT 1 FROM artifacts a WHERE a.job=e.job AND a.path=e.path AND a.type='original') AS original,
+          EXISTS(SELECT 1 FROM artifacts a WHERE a.job=e.job AND a.path=e.path AND a.type='preview') AS preview
+          FROM entries e WHERE e.job=:job AND e.kind='file' AND e.status!='filtered') AS copies""", {'job':job_id,'mode':mode}).fetchone()
     return dict(row) | {'ready':job['phase']=='ready', 'root':job['root'], 'policy':job['settings'].get('missing_policy','originals'),
                         'warning':job['settings'].get('destination_warning',''),
                         'note':'Проверяются скачанные файлы. Журналы и отчёты не входят в проверку содержимого. Размер превью заранее неизвестен.'}

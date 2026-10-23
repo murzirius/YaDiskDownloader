@@ -17,6 +17,7 @@ from PIL import Image, UnidentifiedImageError
 from .image_security import PREVIEW_FORMATS
 
 from .api import APIError, Deadline, NetworkError, PausedRequest, PREVIEW_MAX_BYTES, SIZES, Suspended, attempt_count, retry_delay, validate_resource
+from .backups import BackupTimeout
 from .import_state import backup_import, find_import, inherit, read_import, save_import
 from .file_types import FILE_TYPES, file_type, preview_type, selected_type
 from .estimation import RemainingTime, VerificationTime
@@ -53,6 +54,8 @@ def file_hash(filename, checkpoint=lambda: None):
 
 
 def safe_error(exc):
+    if isinstance(exc, BackupTimeout):
+        return str(exc)
     if isinstance(exc, UnidentifiedImageError):
         return 'Полученное превью не удалось прочитать как изображение. Яндекс.Диск мог вернуть неверные данные. Повторите загрузку файла.'
     if isinstance(exc, Image.DecompressionBombError):
@@ -279,6 +282,7 @@ class Engine:
         self.shutting_down = False
         self.folder_usage = FolderUsage()
         self.maintenance_busy = False
+        self.history_restore_busy = False
         self.status_cache = StatusCache(self)
         self.status_options = threading.local()
 
@@ -344,10 +348,12 @@ class Engine:
                 "destination": destination, "operation": operation, **values}
 
     def ensure_idle(self):
+        if self.maintenance_busy:
+            raise ValueError('Приложение на ПК выполняет проверку файлов или восстанавливает историю. Дождитесь завершения, затем повторите действие.')
         recovery = getattr(self,'recovery',None)
         if recovery and (recovery.snapshot()['busy'] or recovery.snapshot()['error']):
             raise ValueError('Сначала дождитесь восстановления после сбоя или нажмите «Повторить восстановление». Сохранённые файлы проверяются на ПК.')
-        if self.maintenance_busy or any(thread.is_alive() for thread in self.threads.values()):
+        if any(thread.is_alive() for thread in self.threads.values()):
             raise ValueError("Сейчас выполняется другая работа. Вернитесь к текущему заданию и нажмите «Остановить», затем дождитесь остановки. Скачанные файлы останутся; после этого можно подключить ключ или запустить другое задание.")
 
     def create(self, data):
@@ -476,6 +482,8 @@ class Engine:
                 elif not control.stopped:
                     control.pause()
         with self.lock:
+            if self.maintenance_busy:
+                raise ValueError('Приложение на ПК выполняет проверку файлов или восстанавливает историю. Дождитесь завершения, затем повторите действие.')
             job = self.store.job(job_id)
             scan_only = action == 'continue_scan'
             if scan_only:
@@ -1105,6 +1113,18 @@ class Engine:
             db.execute("INSERT INTO names VALUES(?,?,?,?)", (job_id, identity, candidate, candidate.casefold()))
             return candidate
 
+    def allocate_publication_name(self, job_id, identity, proposed):
+        parent, _, name = proposed.rpartition("/")
+        if len(name.encode("utf-8")) > 255:
+            name = suffix(name, digest(identity))
+            proposed = (parent + "/" if parent else "") + name
+        relative = self.allocate(job_id, identity, proposed)
+        if len(relative.rsplit("/", 1)[-1].encode("utf-8")) > 255:
+            # Preserve legacy allocations and files; only new publications
+            # need a separate portable name, including collision versions.
+            relative = self.allocate(job_id, "@bounded:" + identity, proposed)
+        return relative
+
     def map_path(self, job_id, path):
         if path == "disk:/":
             return ""
@@ -1177,6 +1197,8 @@ class Engine:
 
     def live_limits(self, job_id, data):
         with self.lock:
+            if self.maintenance_busy:
+                raise ValueError('Приложение на ПК выполняет проверку файлов или восстанавливает историю. Дождитесь завершения, затем повторите действие.')
             if not isinstance(data, dict) or not data or set(data)-{'workers','speed_limit_mib'}:
                 raise ValueError('На ходу можно менять только потоки и скорость')
             job = self.store.job(job_id)
@@ -1187,8 +1209,10 @@ class Engine:
             if control:
                 with control.lock:
                     control.workers = updated['workers']
-                control.rate_limiter.configure(updated['speed_limit_mib'])
-                if getattr(control,'policy',None):control.policy.settings['speed_limit_mib']=updated['speed_limit_mib']
+                if getattr(control,'policy',None):
+                    control.policy.update_speed(updated['speed_limit_mib'])
+                else:
+                    control.rate_limiter.configure(updated['speed_limit_mib'])
                 control.event('system','Изменены потоки и ограничение скорости')
             return {'workers':updated['workers'],'speed_limit_mib':updated['speed_limit_mib']}
 
@@ -1508,8 +1532,14 @@ class Engine:
         if signature[-1] is None:
             return
         signature = json.dumps(signature)
-        with self.store.db() as db:
-            db.execute("INSERT OR REPLACE INTO verification_cache VALUES(?,?,?)", (job["id"], relative, signature))
+        # The file and artifact are already durable. Cache admission/commit is
+        # optional; filesystem identity errors above must still propagate.
+        try:
+            with self.store.db() as db:
+                db.execute("INSERT OR REPLACE INTO verification_cache VALUES(?,?,?)", (job["id"], relative, signature))
+        except sqlite3.Error:
+            return False
+        return True
 
     def partials_digest(self, filename, size, control):
         from .partials import digest_prefix
@@ -1921,7 +1951,7 @@ class Engine:
                         proposed = entry["local"] + ".preview." + extensions[fmt]
                     # Synthetic names cannot collide with a real disk:/ path.
                     identity = entry["path"] if kind == "original" else "@preview:" + entry["path"]
-                    relative = self.allocate(job["id"], identity, proposed)
+                    relative = self.allocate_publication_name(job["id"], identity, proposed)
                     base_relative = relative
                     target = safe_join(job["root"], relative)
                     os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -1931,7 +1961,7 @@ class Engine:
                         parent, _, name = base_relative.rpartition("/")
                         name = suffix(name, digest(fingerprint(meta) + kind + str(counter)))
                         version_identity = "@version:" + kind + ":" + entry['path'] + ":" + fingerprint(meta) + ":" + str(counter)
-                        relative = self.allocate(job["id"], version_identity, (parent + "/" if parent else "") + name)
+                        relative = self.allocate_publication_name(job["id"], version_identity, (parent + "/" if parent else "") + name)
                         target = safe_join(job["root"], relative)
                     deadline.check()
                     with self.store.db() as db:

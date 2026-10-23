@@ -103,6 +103,7 @@ class Store:
             setup.execute("PRAGMA journal_mode=" + mode)
         with self.db() as db:
             db.executescript(SCHEMA)
+            self.text_encoding = {'UTF-8':'utf-8','UTF-16le':'utf-16-le','UTF-16be':'utf-16-be'}[db.execute('PRAGMA encoding').fetchone()[0]]
             db.execute('DELETE FROM run_selection')
             # Older versions allowed just one remote reference per local file.
             # Migrate transactionally; the upgrade backup retains the old schema.
@@ -128,11 +129,10 @@ class Store:
                     db.execute('ALTER TABLE jobs ADD COLUMN ' + name + ' ' + declaration)
             if "pause_reason" not in {row[1] for row in db.execute("PRAGMA table_info(jobs)")}:
                 db.execute("ALTER TABLE jobs ADD COLUMN pause_reason TEXT NOT NULL DEFAULT ''")
-            for row in db.execute("SELECT id,settings FROM jobs").fetchall():
+            self._job_projection = ",".join('CAST(settings AS BLOB) AS settings' if row[1] == 'settings' else '"'+row[1].replace('"','""')+'"' for row in db.execute("PRAGMA table_info(jobs)"))
+            for row in db.execute("SELECT id,CAST(settings AS BLOB) AS settings FROM jobs").fetchall():
                 try:
-                    settings = json.loads(row["settings"])
-                    if not isinstance(settings, dict):
-                        raise ValueError()
+                    settings = self.settings_value(row["settings"])
                 except (ValueError, TypeError):
                     db.execute("UPDATE jobs SET phase='failed',error=? WHERE id=?", ("Настройки задания повреждены. Создайте дозагрузку в прежнюю папку.", row["id"]))
                     continue
@@ -152,11 +152,9 @@ class Store:
                     changed = True
                 if changed:
                     db.execute("UPDATE jobs SET settings=? WHERE id=?", (json.dumps(settings, ensure_ascii=False), row["id"]))
-            for row in db.execute("SELECT name,settings FROM profiles").fetchall():
+            for row in db.execute("SELECT name,CAST(settings AS BLOB) AS settings FROM profiles").fetchall():
                 try:
-                    settings = json.loads(row["settings"])
-                    if not isinstance(settings, dict):
-                        raise ValueError()
+                    settings = self.settings_value(row["settings"])
                 except (ValueError, TypeError):
                     continue
                 workers_changed = normalize_saved_workers(settings)
@@ -257,9 +255,29 @@ class Store:
             else:
                 conn.close()
 
+    def settings_value(self, value):
+        """Decode one saved record without replacing its original bytes."""
+        if isinstance(value, bytes):
+            value = value.decode(self.text_encoding)
+        try:
+            result = json.loads(value)
+        except RecursionError:
+            raise ValueError('Настройки содержат слишком много вложенных данных') from None
+        if not isinstance(result, dict):
+            raise ValueError('Настройки должны быть объектом')
+        return result
+
+    def profile_rows(self):
+        for row in self.rows('SELECT name,CAST(settings AS BLOB) AS settings FROM profiles ORDER BY name'):
+            try:
+                row['settings'] = self.settings_value(row['settings'])
+            except (ValueError, TypeError):
+                row['settings'] = None
+            yield row
+
     def job(self, job_id):
         with self.db() as db:
-            row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            row = db.execute('SELECT '+self._job_projection+' FROM jobs WHERE id=?', (job_id,)).fetchone()
         if not row:
             raise ValueError("Задание не найдено")
         result = dict(row)
@@ -267,9 +285,7 @@ class Store:
             if not isinstance(result['root'], str) or not Path(result['root']).is_absolute():
                 result['root'] = ''
                 raise ValueError()
-            result["settings"] = json.loads(result["settings"])
-            if not isinstance(result["settings"], dict):
-                raise ValueError()
+            result["settings"] = self.settings_value(result["settings"])
             normalize_saved_workers(result['settings'])
             defaults = {"mode":"fallback", "preview_size":"XXXL", "reports":["json"],
                         "file_types":["photos","videos","music","files"], "paths":[],

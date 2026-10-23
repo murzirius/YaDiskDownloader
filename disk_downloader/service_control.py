@@ -45,7 +45,25 @@ class Client:
         return result
 
 
-def start_background(port, state):
+def _stop_owned_process(process):
+    """Stop only the child created by this invocation, with bounded waits."""
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            return
+        process.wait(timeout=5)
+
+
+def start_background(port, state, *, stop_on_failure=False):
     try:
         Client(port, state)
         return {'running':True, 'url':f'http://127.0.0.1:{port}'}
@@ -60,14 +78,24 @@ def start_background(port, state):
     if os.name == 'nt':options['creationflags'] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     else:options['start_new_session'] = True
     process = subprocess.Popen(command, **options)
-    deadline = time.monotonic()+45
-    while time.monotonic()<deadline:
-        try:
-            Client(port,state)
-            return {'running':True, 'pid':process.pid, 'url':f'http://127.0.0.1:{port}'}
-        except requests.ConnectionError:
-            if process.poll() is not None:raise ValueError(f'Приложение на этом устройстве завершилось при запуске (код {process.returncode}). Откройте приложение ещё раз и проверьте сообщение об ошибке.')
-            time.sleep(.2)
-    raise ValueError('Запуск занимает больше 45 с. Проверьте статус позже; повторный процесс не требуется.')
+    try:
+        deadline = time.monotonic()+45
+        while time.monotonic()<deadline:
+            try:
+                Client(port,state)
+                return {'running':True, 'pid':process.pid, 'url':f'http://127.0.0.1:{port}'}
+            except requests.ConnectionError:
+                if process.poll() is not None:raise ValueError(f'Приложение на этом устройстве завершилось при запуске (код {process.returncode}). Откройте приложение ещё раз и проверьте сообщение об ошибке.')
+                time.sleep(.2)
+        if stop_on_failure:
+            raise ValueError('Запуск приложения на этом устройстве занял больше 45 с. Повторите запуск приложения.')
+        raise ValueError('Запуск занимает больше 45 с. Проверьте статус позже; повторный процесс не требуется.')
+    except BaseException:
+        if stop_on_failure:
+            try:
+                _stop_owned_process(process)
+            except (OSError, subprocess.SubprocessError) as error:
+                raise ValueError('Приложение на этом устройстве не смогло завершить запущенный служебный процесс. Закройте его через монитор процессов перед повторным запуском.') from error
+        raise
 
 
