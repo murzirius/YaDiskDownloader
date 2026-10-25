@@ -1120,6 +1120,10 @@ class Engine:
                 control.active.clear()
                 control.finished = time.monotonic()
 
+            # Completed worker pools cannot reuse their thread-owned sockets.
+            if hasattr(self.api, 'json_connections'):
+                self.api.json_connections.close_idle()
+
             # Refresh only downloaded media, never walk service output folders.
             if not self.shutting_down and operation != 'scan':
                 self.folder_usage.for_job(self.store, job_id, self.store.job(job_id)['root'], force=True)

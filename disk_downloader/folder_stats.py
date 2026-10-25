@@ -111,4 +111,8 @@ class FolderStats:
         except Exception:
             with self.lock:self.result['error'] = 'Приложение не смогло посчитать папки. Повторите подсчёт; файлы на Диске не изменялись.'
         finally:
-            with self.lock:self.result['busy'] = False
+            try:
+                if hasattr(self.api, 'json_connections'):
+                    self.api.json_connections.close_idle()
+            finally:
+                with self.lock:self.result['busy'] = False

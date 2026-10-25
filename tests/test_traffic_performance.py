@@ -373,3 +373,25 @@ def test_failed_connection_is_included_in_bottleneck_measurements(tmp_path,monke
     from disk_downloader.api import NetworkError
     with pytest.raises(NetworkError):api.metadata('disk:/',{'attempts':1,'timeout':1})
     assert api.traffic.snapshot()['requests']==1
+
+
+def test_background_scan_releases_idle_api_sockets(tmp_path,monkeypatch):
+    import disk_downloader.api as module
+    from disk_downloader.engine import Engine
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version='HTTP/1.1'
+        def log_message(self,*args):pass
+        def do_GET(self):
+            data=b'{"path":"disk:/","name":"Disk","type":"dir","_embedded":{"items":[],"total":0}}'
+            self.send_response(200);self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
+    server=ThreadingHTTPServer(('127.0.0.1',0),Handler);server.daemon_threads=True
+    worker=threading.Thread(target=server.serve_forever,daemon=True);worker.start()
+    credentials=Credentials();credentials.set('synthetic-token');api=DiskAPI(credentials)
+    monkeypatch.setattr(module,'BASE','http://127.0.0.1:%d'%server.server_port)
+    try:
+        engine=Engine(Store(tmp_path/'state/jobs.sqlite3'),api)
+        job=engine.create({'paths':['disk:/'],'destination':str(tmp_path/'downloads'),'create_zip':False})
+        assert wait_job(engine,job)['phase']=='ready'
+        assert len(api.json_connections.items)==0
+    finally:
+        credentials.clear();api.json_connections.close_idle();server.shutdown();server.server_close();worker.join(2)
