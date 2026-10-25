@@ -385,7 +385,7 @@ const groupedProblems=toolButton('Разобрать проблемы',async()=>
     const row=node('div',undefined,'tool-row');row.append(node('strong',group.source+' · файлов: '+group.files),node('p',group.error));
     if(group.action==='connect')row.append(toolButton('Подключить Диск',async()=>{problemDialog.close();$('auth-form').hidden=false;$('token').focus();}));
     if(group.action==='folder')row.append(toolButton('Открыть папку результатов',async()=>api('/api/jobs/'+id+'/open-folder',{})));
-    const retry=toolButton('Повторить неудачные файлы',async()=>{await action('retry',id);problemDialog.close();});retry.disabled=state.jobStatus?.live||!state.connected;row.append(retry);
+    const retry=toolButton('Повторить файлы этой группы',async()=>{await api('/api/jobs/'+id+'/action',{action:'retry_group',problem_error:group.error,limits:runtimeLimits()});problemDialog.close();state.renderKey=null;await pollJob();});retry.disabled=state.jobStatus?.live||!state.connected;row.append(retry);
     row.append(toolButton('Диагностика',async()=>{problemDialog.close();$('open-service').click();}));
     row.append(toolButton('Посмотреть файлы',async()=>{problemDialog.close();fileJob=id;fileOffset=0;fileFilter.value='problems';fileDialog.showModal();await loadTaskFiles();}));problemRows.append(row);
   }

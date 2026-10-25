@@ -213,9 +213,14 @@ async function pollJob(){
   state.polling=true;
   try{
     const id=state.job;
-    const job=await api('/api/jobs/'+id);
+    const baseline=state.jobStatus?.id===id?state.jobStatus:null;
+    const result=await api('/api/jobs/'+id+'?compact=1'+(baseline&&state.statusRevision?'&since='+encodeURIComponent(state.statusRevision):''));
+    if(result.delta&&!baseline){state.statusRevision=null;return;}
+    const job=result.delta?{...baseline,...result.values}:result.values;
+    for(const key of result.removed||[])delete job[key];
     if(id!==state.job)return;
     state.jobStatus=job;
+    state.statusRevision=result.revision;
     if(state.resumePolicyJob!==job.id){state.resumePolicyJob=job.id;$('resume-policy').value=job.settings.missing_policy||'originals';}
     if(state.restoreLimits&&state.limitsJob!==job.id){
       state.limitsJob=job.id;

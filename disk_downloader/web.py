@@ -57,9 +57,16 @@ def create_app(state_dir=None, api=None, port=8766):
     management, maintenance, backups = Management(engine), Maintenance(engine), Backups(store)
     duplicate_review=DuplicateReview(engine)
     app.extensions['duplicate_review']=duplicate_review
+    from .windows_install import WindowsInstall
+    windows_install = WindowsInstall(engine)
+    app.extensions['windows_install'] = windows_install
     installer = Installer(engine,updates,backups,port)
     app.extensions['installer'] = installer
     app.extensions.update(engine=engine, store=store, disk_api=api, updates=updates, management=management, maintenance=maintenance, backups=backups, recovered=0, recovery=recovery)
+    from .performance import MemoryCache, StatusDeltas
+    memory_cache = engine.memory_cache
+    status_deltas = StatusDeltas()
+    app.extensions['memory_cache'] = memory_cache
     thumbnail_slots = threading.BoundedSemaphore(3)
     browse_slots = threading.BoundedSemaphore(2)
     local_folder_slots = threading.BoundedSemaphore(2)
@@ -80,6 +87,22 @@ def create_app(state_dir=None, api=None, port=8766):
 
     def auth_status():
         return credentials.status() | {"instance_id": instance_id, 'recovery':recovery.snapshot()}
+
+    @app.get('/api/windows-install')
+    def windows_install_status():
+        return jsonify(windows_install.snapshot())
+
+    @app.post('/api/windows-install')
+    def start_windows_install():
+        return jsonify(windows_install.start())
+
+    @app.get('/api/traffic')
+    def traffic_status():
+        return jsonify(engine.traffic.snapshot() | {'cache': memory_cache.snapshot()})
+
+    @app.post('/api/traffic')
+    def traffic_settings():
+        return jsonify(engine.traffic.configure(payload().get('limit_mb', 0)))
 
     @app.post('/api/recovery')
     def retry_recovery():
@@ -454,10 +477,13 @@ def create_app(state_dir=None, api=None, port=8766):
     @app.post("/api/disconnect")
     def disconnect():
         engine.disconnect()
+        memory_cache.select_scope(credentials.epoch)
         return jsonify(**auth_status())
 
     @app.get("/api/browse")
     def browse():
+        _, browse_epoch = credentials.snapshot()
+        credentials.check(browse_epoch)
         path = remote_path(request.args.get("path", "disk:/"))
         offset = request.args.get("offset", "0")
         sort = request.args.get("sort", "name")
@@ -469,6 +495,7 @@ def create_app(state_dir=None, api=None, port=8766):
             data = api.metadata(path, {"preview_size": "S", "attempts": 1, "timeout": 12, "total_timeout": 12}, offset=int(offset), limit=100, sort=sort)
         finally:
             browse_slots.release()
+        credentials.check(browse_epoch)
         if data.get('type') != 'dir':
             raise ValueError('Выбранный путь Яндекс.Диска не является папкой')
         embedded = data.get("_embedded", {})
@@ -480,6 +507,10 @@ def create_app(state_dir=None, api=None, port=8766):
             if item['path']==path or parent_path(item['path'])!=path or item['path'] in seen:
                 raise APIError('Яндекс.Диск вернул повторный файл или файл из другой папки')
             seen.add(item['path'])
+            epoch = browse_epoch
+            memory_cache.select_scope(epoch)
+            version = (item.get('modified'), item.get('sha256'), item.get('md5'), item.get('size'))
+            memory_cache.put(('version', epoch, item['path']), version, len(item['path'].encode('utf-8')) + 256, ttl=120)
             items.append({k: item.get(k) for k in ("path", "name", "type", "size", "modified", "mime_type")} | {"has_preview": preview_type(item) and bool(item.get("preview"))})
         cached = folder_stats.snapshot([item['path'] for item in items])['items']
         for item in items:
@@ -487,6 +518,7 @@ def create_app(state_dir=None, api=None, port=8766):
                 item['folder_stats'] = cached.get(item['path'])
                 item['modified'] = (item['folder_stats'] or {}).get('latest_modified')
                 item['size'] = (item['folder_stats'] or {}).get('bytes')
+        credentials.check(browse_epoch)
         return jsonify(path=path, items=items, total=embedded.get("total"), offset=int(offset), next_offset=int(offset) + len(items), has_more=bool(items) and (embedded.get("total") is None or int(offset) + len(items) < embedded["total"]))
 
     @app.get('/api/folder-stats')
@@ -507,10 +539,24 @@ def create_app(state_dir=None, api=None, port=8766):
             return "", 429
         try:
             _, epoch = credentials.snapshot()
+            credentials.check(epoch)
+            path = remote_path(request.args.get("path", ""))
+            size = request.args.get("size", "M")
+            if size not in SIZES:
+                raise ValueError("Некорректный размер миниатюры")
+            memory_cache.select_scope(epoch)
+            key = ('thumbnail', epoch, path, size, memory_cache.get(('version', epoch, path)))
+            cached = memory_cache.get(key)
+            if cached is not None:
+                credentials.check(epoch)
+                return send_file(io.BytesIO(cached), mimetype="image/jpeg")
             def check():
                 credentials.check(epoch)
             with Deadline(15, check, cancelled=lambda: not credentials.connected) as deadline:
-                return load_thumbnail(deadline)
+                content = load_thumbnail(deadline)
+                check()
+                memory_cache.put(key, content, len(content), ttl=120)
+                return send_file(io.BytesIO(content), mimetype="image/jpeg")
         finally:
             thumbnail_slots.release()
 
@@ -534,9 +580,8 @@ def create_app(state_dir=None, api=None, port=8766):
                 image.thumbnail((400, 400))
                 output = io.BytesIO()
                 image.convert("RGB").save(output, format="JPEG", quality=85)
-            output.seek(0)
             deadline.check()
-            return send_file(output, mimetype="image/jpeg")
+            return output.getvalue()
         finally:
             if response is not None:
                 api.close(response, connection)
@@ -630,6 +675,10 @@ def create_app(state_dir=None, api=None, port=8766):
         with store.db() as db:
             queued=db.execute('SELECT state FROM job_queue WHERE job=?',(job_id,)).fetchone()
         result['queue_state']=queued[0] if queued else None
+        control = engine.controls.get(job_id)
+        result['finishing_current'] = bool(control and control.finish_current and result.get('live'))
+        if request.args.get('compact') == '1':
+            return jsonify(status_deltas.response(result, request.args.get('since', '')))
         return jsonify(result)
 
     @app.post('/api/jobs/<job_id>/refresh-usage')
@@ -656,6 +705,8 @@ def create_app(state_dir=None, api=None, port=8766):
         limits = dict(data.get("limits") or {})
         if "paths" in data:
             limits["paths"] = data["paths"]
+        if 'problem_error' in data:
+            limits['problem_error'] = data['problem_error']
         engine.action(job_id, data.get("action"), limits or None)
         return jsonify(ok=True)
 

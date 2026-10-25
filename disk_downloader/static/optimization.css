@@ -1,0 +1,3 @@
+.settings-search-results { display: grid; gap: 8px; margin-block: 8px 16px; }
+.settings-search-results[hidden] { display: none; }
+.settings-search-results > button { width: 100%; min-width: 0; text-align: left; white-space: normal; overflow-wrap: anywhere; }

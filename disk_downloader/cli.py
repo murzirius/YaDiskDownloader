@@ -9,7 +9,7 @@ import time
 import requests
 
 
-COMMANDS = {'start','connect','disconnect','download','jobs','status','pause','resume','retry','scan','stop','doctor','open','plan','limits'}
+COMMANDS = {'start','connect','disconnect','download','jobs','status','pause','resume','retry','scan','stop','doctor','open','plan','limits','finish','traffic'}
 
 
 from .service_control import Client, start_background
@@ -36,7 +36,7 @@ def main(argv=None):
         command.add_argument('--state-dir',type=Path,default=argparse.SUPPRESS)
         command.add_argument('--json',action='store_true',default=argparse.SUPPRESS)
         if name=='start':command.add_argument('--foreground',action='store_true',help='Запуск в этом терминале с подробными сообщениями; закрытие терминала остановит приложение')
-        if name in ('pause','resume','retry','scan','plan','limits'):command.add_argument('id')
+        if name in ('pause','resume','retry','scan','plan','limits','finish'):command.add_argument('id')
         if name=='stop':command.add_argument('id',nargs='?',help='Без ID безопасно закрывает приложение')
         if name=='connect':command.add_argument('--stdin',action='store_true',help='Прочитать ключ из stdin; ключ не сохраняется на диск')
         if name=='status':
@@ -45,6 +45,11 @@ def main(argv=None):
             command.add_argument('path',nargs='?',default='disk:/');command.add_argument('--to',type=Path,required=True)
             command.add_argument('--mode',choices=['fallback','previews','both'],default='fallback')
             command.add_argument('--missing',action='store_true');command.add_argument('--run',action='store_true',help='После подготовки начать скачивание')
+        if name=='download':
+            command.add_argument('--economy',action='store_true',help='Экономить запросы метаданных')
+            command.add_argument('--early',action='store_true',help='С --run скачивать подтверждённые страницы до конца обхода')
+            command.add_argument('--verification-workers',type=int,choices=[1,2,4],default=4)
+        if name=='traffic':command.add_argument('--limit-mb',type=float,help='Дневной лимит данных; 0 отключает')
         if name=='limits':
             command.add_argument('--workers',type=int);command.add_argument('--speed',type=float)
     args=parser.parse_args(argv)
@@ -77,9 +82,11 @@ def main(argv=None):
                     print(json.dumps(result,ensure_ascii=False) if args.json else describe(result),flush=True)
                     time.sleep(2)
             elif command=='download':
-                result=client.call('/api/jobs',{'paths':[args.path],'whole_disk':args.path=='disk:/','destination':str(args.to.resolve()),'mode':args.mode,'operation':'missing' if args.missing else 'new','create_zip':False})
-                if args.run:
+                result=client.call('/api/jobs',{'paths':[args.path],'whole_disk':args.path=='disk:/','destination':str(args.to.resolve()),'mode':args.mode,'operation':'missing' if args.missing else 'new','create_zip':False,'economy_mode':args.economy,'early_download':args.early,'verification_workers':args.verification_workers,'auto_start':bool(args.early and args.run)})
+                if args.run and not args.early:
                     client.call('/api/queue',{'action':'add','job':result['id']})
+            elif command=='finish':result=client.call('/api/jobs/'+args.id+'/action',{'action':'finish_current'})
+            elif command=='traffic':result=client.call('/api/traffic',{'limit_mb':args.limit_mb}) if args.limit_mb is not None else client.call('/api/traffic')
             elif command=='plan':result=client.call('/api/jobs/'+args.id+'/plan')
             elif command=='limits':
                 data={}
