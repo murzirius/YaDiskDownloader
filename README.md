@@ -8,6 +8,8 @@
 
 Бесплатное приложение с локальным интерфейсом на русском языке. Скачивает файлы и превью, сохраняет папки, создаёт ZIP и отчёты. Работает через официальный API Яндекс Диска. Лицензия MIT.
 
+Текущая стабильная версия — [**YaDiskDownloader 1.5.0**](https://github.com/murzirius/YaDiskDownloader/releases/tag/v1.5.0).
+
 ## Быстрый запуск
 
 1. Откройте **[Releases](https://github.com/murzirius/YaDiskDownloader/releases)** и скачайте **Windows EXE** — архив с окончанием `Windows-x64.zip`.
@@ -45,7 +47,7 @@ Windows распространяется только как готовое пр
 
 [Проверки обхода и возобновления](docs/scan-pipeline-validation.md).
 
-[Измерения производительности и результаты проверок](docs/validation-v1.5.0.md). [Проверки надёжности сборки 20261023.1](https://github.com/murzirius/YaDiskDownloader/blob/main/docs/validation-remediation-v1.5.0.md).
+[Измерения производительности и результаты проверок](docs/validation-v1.5.0.md). [Проверки надёжности](https://github.com/murzirius/YaDiskDownloader/blob/main/docs/validation-remediation-v1.5.0.md).
 
 - **«Посчитать папки»** показывает суммарный объём вложенных файлов и дату последнего изменённого файла. Подсчёт можно остановить. «≥» означает неполный итог; неизвестный размер не выдаётся за ноль.
 - SVG-иконки различают фото, видео, музыку, документы, архивы и другие файлы.
