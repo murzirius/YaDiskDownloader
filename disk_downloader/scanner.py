@@ -11,6 +11,7 @@ SCAN_WORKERS = 4
 
 
 def scan_pages(engine, job_id, settings, control):
+    epoch = engine.api.credentials.epoch
     pending = {}
     cursors, ahead = {}, {}
     ignored = set()
@@ -46,6 +47,7 @@ def scan_pages(engine, job_id, settings, control):
                     if offset != cursors[path]:
                         continue
                     pending.pop(future)
+                    confirmed = False
                     try:
                         meta = future.result()
                         control.check()
@@ -82,6 +84,8 @@ def scan_pages(engine, job_id, settings, control):
                             db.execute('UPDATE entries SET scan_offset=?,scanned=? WHERE job=? AND path=?', (next_offset, int(finished), job_id, path))
                             db.execute('DELETE FROM scan_errors WHERE job=? AND path=?', (job_id, path))
                             db.execute('INSERT OR REPLACE INTO scan_pages VALUES(?,?,?)',(job_id,path,signature))
+                        if settings.get('economy_mode'):
+                            engine.cache_scan_metadata(job_id, items, epoch)
                         cursors[path] = next_offset
                         if finished:
                             ahead.pop(path, None)
@@ -99,6 +103,7 @@ def scan_pages(engine, job_id, settings, control):
                             for other, (name, _) in pending.items():
                                 if name == path:
                                     ignored.add(other)
+                        confirmed = True
                         control.event('scan', f'Получено {len(items)} объектов; просмотрено {next_offset}' + (' · папка прочитана' if finished else ''), path)
                         with control.lock:
                             control.active.pop(path, None)
@@ -116,6 +121,8 @@ def scan_pages(engine, job_id, settings, control):
                         for other, (name, _) in pending.items():
                             if name == path:
                                 ignored.add(other)
+                    if confirmed and getattr(control, 'page_ready', None):
+                        control.page_ready()
                 # The same four request slots can now serve successive pages
                 # of one large folder, rather than waiting for it page by page.
                 for path, (start, total) in list(ahead.items()):

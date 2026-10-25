@@ -69,5 +69,9 @@ class Shutdown:
                 worker.join(max(0, deadline - time.monotonic()))
         if any(worker.is_alive() for worker in workers):
             return  # Watchdog finishes a non-cooperative executor.
+        if hasattr(engine, 'traffic'):
+            self.attempt(engine.traffic.flush)
+        if hasattr(engine.api, 'json_connections'):
+            self.attempt(engine.api.json_connections.close_idle)
         self.attempt(self.state_lock.close)
         self.done.set()
