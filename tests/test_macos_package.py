@@ -1,6 +1,7 @@
 import importlib.util
 from pathlib import Path
 import plistlib
+import re
 
 import pytest
 
@@ -45,5 +46,5 @@ def test_packaging_rejects_unknown_architecture_and_missing_notices(tmp_path):
 
 def test_native_installation_docs_do_not_disable_gatekeeper():
     doc = (ROOT / 'docs' / 'macos.md').read_text(encoding='utf-8')
-    assert 'не заверена Apple' in doc
+    assert re.search(r'\bне заверен[ао]? Apple\b', doc)
     assert 'spctl --master-disable' not in doc and 'xattr -cr' not in doc
