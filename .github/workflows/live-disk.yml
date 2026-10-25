@@ -1,0 +1,36 @@
+name: Read-only Yandex Disk integration
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+permissions:
+  contents: read
+concurrency:
+  group: yandex-live-tests
+  cancel-in-progress: false
+jobs:
+  live-disk:
+    if: (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'release' && vars.YADISK_LIVE_TESTS_ENABLED == 'true')
+    environment: yandex-integration
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - run: python tools/prepare_sqlite_windows.py
+      - run: python -m pip install -r requirements-bootstrap.txt -r requirements-dev.txt
+      - name: Read synthetic fixtures and verify download, resume and missing files
+        env:
+          PYTHONUTF8: '1'
+          YADISK_TEST_TOKEN: ${{ secrets.YADISK_TEST_TOKEN }}
+        run: python tools/check_live_disk.py --output live-disk-results.json
+      - name: Save counters only; no cloud files, logs or credentials
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: live-disk-results
+          path: live-disk-results.json
+          if-no-files-found: error
+          retention-days: 7

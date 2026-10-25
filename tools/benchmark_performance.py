@@ -22,6 +22,8 @@ parser.add_argument('--output',type=Path,required=True)
 parser.add_argument('--case',choices=['idle','history','summary','scan','download','pause','offline','missing','zip'],required=True)
 parser.add_argument('--files',type=int,default=600)
 parser.add_argument('--seconds',type=float,default=16)
+parser.add_argument('--economy',action='store_true')
+parser.add_argument('--early',action='store_true')
 parser.add_argument('--profile',action='store_true',help='Collect SQL elapsed timings; do not use instrumented runs for speed comparisons')
 parser.add_argument('--test-client',action='store_true',help='Use Flask test client when localhost TCP is blocked; excludes the HTTP transport')
 args=parser.parse_args(); args.source=args.source.resolve();args.output=args.output.resolve()
@@ -82,7 +84,7 @@ with socket.socket() as probe:probe.bind(('127.0.0.1',0));port=probe.getsockname
 app=create_app(args.output/'state',api=api,port=port)
 engine=app.extensions['engine'];store=engine.store;manager=app.extensions['management']
 job=None
-settings={'destination':str(args.output/'results'),'whole_disk':True,'mode':'fallback','workers':8,'attempts':1,'timeout':20,'total_timeout':0,'auto_pause':False,'create_zip':False,'reports':['json']}
+settings={'economy_mode':args.economy,'early_download':args.early,'destination':str(args.output/'results'),'whole_disk':True,'mode':'fallback','workers':8,'attempts':1,'timeout':20,'total_timeout':0,'auto_pause':False,'create_zip':False,'reports':['json']}
 def wait_job(key,timeout=240):
     worker=engine.threads.get(key)
     if worker:worker.join(timeout)
