@@ -24,6 +24,12 @@ from .dns import Resolver
 
 BASE = "https://cloud-api.yandex.net/v1/disk"
 SIZES = ("S", "M", "L", "XL", "XXL", "XXXL")
+# Keep hashes, source dates and preview URLs: integrity checks and date filters
+# depend on these fields. Never request unrelated share/custom properties.
+RESOURCE_FIELDS = ("path,name,type,size,md5,sha256,modified,created,resource_id,"
+                   "mime_type,media_type,preview,exif.date_time,taken")
+METADATA_FIELDS = RESOURCE_FIELDS + ",_embedded.total,_embedded.limit,_embedded.offset," + ",".join(
+    "_embedded.items." + field for field in RESOURCE_FIELDS.split(","))
 PREVIEW_MAX_BYTES = 64 * 1024 * 1024
 DNS_RESOLVER = Resolver()
 
@@ -152,26 +158,35 @@ class Deadline:
         with self.lock:
             self.sockets = [item for item in self.sockets if item is not sock]
 
+    def release_io(self):
+        # Called only after a fully consumed, validated JSON body. No pending
+        # read is left on this socket, and abort holds the same lock throughout.
+        self.check()
+        with self.lock:
+            self.connections.clear()
+            self.sockets.clear()
+
     def abort(self):
         with self.lock:
             sockets = list(self.sockets) + [getattr(conn, "sock", None) for conn in self.connections]
-        for sock in sockets:
-            if sock is not None:
-                try:
-                    sock.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-                # Darwin can leave a concurrent poll/read asleep if its fd is
-                # closed here immediately after shutdown. A buffered reader
-                # owns that I/O reference and will release it on response.close.
-                if sys.platform == 'darwin' and getattr(sock, '_io_refs', 0):
-                    continue
-                try:
-                    descriptor = sock.detach()
-                    if descriptor != -1:
-                        socket.close(descriptor)
-                except OSError:
-                    pass
+            for sock in sockets:
+                if sock is not None:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    # Darwin can leave a concurrent poll/read asleep if its fd is
+                    # closed here immediately after shutdown. A buffered reader
+                    # owns that I/O reference and will release it on response.close.
+                    if sys.platform == 'darwin' and getattr(sock, '_io_refs', 0):
+                        continue
+                    try:
+                        descriptor = sock.detach()
+                        if descriptor != -1:
+                            socket.close(descriptor)
+                    except OSError:
+                        pass
+
 
     def watch(self):
         while not self.finished.wait(0.025):
@@ -288,7 +303,21 @@ class DeadlineAdapter(HTTPAdapter):
                 super().__init__(*args, **options)
                 self.fp = io.BufferedReader(ProgressRaw(self.fp.detach()))
 
-        class TimedHTTPPool(HTTPConnectionPool):
+        class ReuseDeadline:
+            def _get_conn(self, timeout=None):
+                conn = super()._get_conn(timeout)
+                try:
+                    deadline.attach(connection=conn)
+                    if conn.sock is not None:
+                        deadline.attach(sock=conn.sock)
+                        remaining = deadline.remaining()
+                        conn.sock.settimeout(remaining if math.isfinite(remaining) else None)
+                    return conn
+                except BaseException:
+                    conn.close()
+                    raise
+
+        class TimedHTTPPool(ReuseDeadline, HTTPConnectionPool):
             ConnectionCls = TimedHTTPConnection
             def _new_conn(self):
                 conn = super()._new_conn()
@@ -296,7 +325,7 @@ class DeadlineAdapter(HTTPAdapter):
                 deadline.attach(connection=conn)
                 return conn
 
-        class TimedHTTPSPool(HTTPSConnectionPool):
+        class TimedHTTPSPool(ReuseDeadline, HTTPSConnectionPool):
             ConnectionCls = TimedHTTPSConnection
             def _new_conn(self):
                 conn = super()._new_conn()
@@ -419,6 +448,8 @@ class DiskAPI:
         self.credentials = credentials
         self.rate_lock = threading.Lock()
         self.rate_until = 0
+        from .connections import JsonConnections
+        self.json_connections = JsonConnections(DeadlineAdapter)
 
     def verify_token(self, token):
         """Validate a candidate without revoking the current working connection."""
@@ -443,6 +474,12 @@ class DiskAPI:
     def _open(self, url, params, auth, timeout, checkpoint, epoch, extra_headers=None):
         self.credentials.check(epoch)
         checkpoint()
+        control = getattr(checkpoint, 'control', None) or getattr(checkpoint, '__self__', None)
+        if isinstance(control, Deadline):
+            control = getattr(control.checkpoint, '__self__', None)
+        traffic = getattr(self, 'traffic', None)
+        if traffic:
+            traffic.gate(checkpoint)
         with self.rate_lock:
             delay = max(0, self.rate_until - time.monotonic())
         with deadline.hold() if (deadline := getattr(checkpoint, "deadline", None)) else nullcontext():
@@ -450,23 +487,65 @@ class DiskAPI:
         token, current_epoch = self.credentials.snapshot()
         if current_epoch != epoch:
             raise Suspended("Подключение изменилось")
-        session = requests.Session()
-        response = None
-        session.trust_env = False
         deadline = getattr(checkpoint, "deadline", None)
-        if deadline:
-            session.mount("https://", DeadlineAdapter(deadline))
-            session.mount("http://", DeadlineAdapter(deadline))
-        headers = {"Accept-Encoding": "identity", "User-Agent": "DiskLocalDownloader/1.0"}
+        # Reuse only JSON connections; media keeps an independent session.
+        json_request = url.startswith(BASE) and params is not None
+        pooled = json_request and deadline is not None
+        session = self.json_connections.acquire(epoch, deadline) if pooled else requests.Session()
+        response = None
+        if not pooled:
+            session.trust_env = False
+            if deadline:
+                session.mount("https://", DeadlineAdapter(deadline))
+                session.mount("http://", DeadlineAdapter(deadline))
+        # Compressed JSON is safe; media and Range offsets require identity.
+        headers = {"Accept-Encoding": "gzip" if json_request else "identity", "User-Agent": "DiskLocalDownloader/1.0"}
         if extra_headers:
             headers.update({key: value for key, value in extra_headers.items() if key in ("Range", "If-Range")})
         if auth:
             headers["Authorization"] = "OAuth " + token
         token = None
+        request_started = None
         try:
             remaining = deadline.remaining() if deadline else timeout
             checkpoint()
+            request_started = time.monotonic()
             response = session.get(url, params=params, headers=headers, timeout=(max(0.01, min(10, remaining / 2)), max(0.01, remaining)), allow_redirects=False, stream=True)
+            if traffic:
+                waited = time.monotonic() - request_started
+                traffic.request_started(waited)
+                if hasattr(control, 'add_timing'):
+                    control.add_timing('server', waited)
+                original_iter = response.iter_content
+                def measured_content(chunk_size=1, decode_unicode=False):
+                    iterator = iter(original_iter(chunk_size, decode_unicode))
+                    received = 0
+                    length = response.headers.get('Content-Length', '')
+                    body_size = int(length) if length.isascii() and length.isdigit() else None
+                    while True:
+                        # A complete body must reach EOF before a quota pause.
+                        if body_size is None or received < body_size:
+                            traffic.gate(checkpoint)
+                        started = time.monotonic()
+                        try:
+                            chunk = next(iterator)
+                        except StopIteration:
+                            break
+                        receiving = time.monotonic() - started
+                        traffic.receiving(receiving)
+                        if hasattr(control, 'add_timing'):
+                            control.add_timing('receive', receiving)
+                        try:
+                            wire_position = response.raw.tell()
+                            received_now = max(0, wire_position - received)
+                            received = max(received, wire_position)
+                        except (AttributeError, OSError, ValueError):
+                            received_now = len(chunk)
+                            received += received_now
+                        traffic.received(received_now, 'json' if json_request else 'media')
+                        yield chunk
+                response.iter_content = measured_content
+                response._disk_measured = True
             if deadline:
                 deadline.attach(response=response)
             self.credentials.check(epoch)
@@ -474,6 +553,11 @@ class DiskAPI:
                 self.credentials.responses.add(response)
             return response, session
         except requests.RequestException:
+            if traffic and response is None and request_started is not None:
+                waited = time.monotonic() - request_started
+                traffic.request_started(waited)
+                if hasattr(control, 'add_timing'):
+                    control.add_timing('server', waited)
             if response is not None:
                 response.close()
             session.close()
@@ -495,8 +579,13 @@ class DiskAPI:
     def close(self, response, session):
         with self.credentials.lock:
             self.credentials.responses.discard(response)
-        response.close()
-        session.close()
+        try:
+            response.close()
+        finally:
+            # Release closures holding response/deadline/control immediately.
+            if getattr(response, '_disk_measured', False):
+                response.__dict__.pop('iter_content', None)
+            session.close()
 
     def fail_response(self, response, attempt=0):
         status = response.status_code
@@ -560,6 +649,10 @@ class DiskAPI:
                     result = json.loads(data)
                     if not isinstance(result, dict):
                         raise APIError("Некорректный ответ API")
+                    from .connections import Lease
+                    if isinstance(session, Lease):
+                        budget.release_io()
+                        session.reusable = True
                     return result
             except PausedRequest:
                 if owner:
@@ -598,7 +691,7 @@ class DiskAPI:
         settings = settings or {}
         path = remote_path(path)
         result = self.get("/resources", {"path": path, "limit": limit, "offset": offset, "sort": sort,
-                          "preview_size": preview_size or settings.get("preview_size", "XXXL"), "preview_crop": "false"}, settings, checkpoint)
+                          "preview_size": preview_size or settings.get("preview_size", "XXXL"), "preview_crop": "false", "fields": METADATA_FIELDS}, settings, checkpoint)
         validate_resource(result)
         if result["path"] != path:
             raise APIError("API вернул неожиданный путь или тип ресурса")
@@ -606,7 +699,7 @@ class DiskAPI:
 
     def media(self, path, kind, settings, checkpoint=lambda: None):
         if kind == "original":
-            result = self.get("/resources/download", {"path": remote_path(path)}, settings, checkpoint)
+            result = self.get("/resources/download", {"path": remote_path(path), "fields": "href,method,templated"}, settings, checkpoint)
             if result.get("method", "GET") != "GET" or result.get("templated", False):
                 raise APIError("Неожиданный тип ссылки API")
             url = result.get("href", "")
@@ -627,6 +720,7 @@ class DiskAPI:
                 settings["_deadline"].check()
 
         check.deadline = settings.get("_deadline")
+        check.control = getattr(checkpoint, '__self__', None)
 
         for _ in range(6):
             if not trusted_media(url):
