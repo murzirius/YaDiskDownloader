@@ -129,7 +129,7 @@ def test_hard_floor_cannot_be_disabled_and_resume_requires_cleaned_space(system,
     paused = wait_job(engine, job, phases={'paused'})
     assert '500' in paused['pause_reason'] and not api.metadata_calls
     free[0] = HARD_FREE_BYTES + 1
-    with pytest.raises(ValueError, match='1 ГиБ'):
+    with pytest.raises(ValueError, match='1 ГБ'):
         engine.action(job, 'resume')
     free[0] = RESUME_FREE_BYTES
     engine.action(job, 'resume')

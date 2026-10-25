@@ -6,7 +6,7 @@ from contextlib import nullcontext
 
 def validate(value):
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 10000:
-        raise ValueError("Скорость: от 0 до 10000 МиБ/с; 0 — без ограничения")
+        raise ValueError("Скорость: от 0 до 10000 МБ/с; 0 — без ограничения")
     return float(value)
 
 

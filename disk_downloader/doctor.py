@@ -37,7 +37,7 @@ class Doctor:
                 okay = db.execute('PRAGMA quick_check(1)').fetchone()[0] == 'ok'
             checks.append({'source':'Приложение', 'ok':okay, 'message':'История прошла быструю проверку' if okay else 'История требует восстановления. Сохраните диагностику; не удаляйте базу.'})
             usage = shutil.disk_usage(Path(self.engine.store.filename).parent)
-            checks.append({'source':'Локальное хранилище', 'ok':usage.free>64*1024*1024, 'message':f'Свободно для истории: {usage.free//1024//1024} МиБ'})
+            checks.append({'source':'Локальное хранилище', 'ok':usage.free>64*1024*1024, 'message':f'Свободно для истории: {usage.free//1024//1024} МБ'})
             checks.append({'source':'SQLite', 'ok':True, 'message':'Используется безопасный WAL' if safe_wal() else 'Используется совместимый журнал DELETE'})
             connected = self.engine.api.credentials.connected
             checks.append({'source':'Яндекс.Диск', 'ok':connected, 'message':'Ключ подключён; его действительность проверяется запросом к Диску' if connected else 'Ключ не подключён. Введите его перед загрузкой.'})

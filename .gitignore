@@ -13,3 +13,4 @@ downloads/
 dist/
 build/
 *.egg-info/
+layout-results/

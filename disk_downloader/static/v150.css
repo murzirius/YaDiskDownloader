@@ -8,3 +8,48 @@ button:hover{background:var(--input);border-color:var(--accent)}.panel-tabs butt
 
 .statistics-card{border:1px solid var(--line);border-radius:12px;margin:14px 0;padding:14px;background:var(--input)}
 .statistics-card h3{font-size:14px;margin:0 0 6px;letter-spacing:.02em}.statistics-card .statistics-note{font-size:11px;line-height:1.5;margin:0 0 10px}.statistics-card .counters{padding:0;margin:0;gap:10px 16px}.statistics-card .counters>div{min-width:0}.statistics-card .counters strong{font-variant-numeric:tabular-nums}.session-card{border-color:color-mix(in srgb,var(--accent) 30%,var(--line))}#verification-live{font-size:12px;line-height:1.6;margin-bottom:0}.storage-warning{padding:14px;margin:12px 0;border:1px solid var(--accent);border-radius:10px;background:var(--input)}.storage-warning strong{font-size:14px}.storage-warning p{font-size:13px;line-height:1.6;margin:8px 0}.storage-warning button{margin-top:4px}.storage-warning[hidden]{display:none}
+
+/* Long names and larger text must fit the same controls as short labels. */
+button{max-width:100%;min-width:0;white-space:normal;overflow-wrap:anywhere}
+main,aside,.settings-panel,.job-panel,#job-content,.tools-content,.tool-row{min-width:0}
+aside,.settings-panel,.job-panel{max-width:100%}
+.welcome-card{min-width:0;white-space:normal;overflow-wrap:anywhere;align-items:flex-start}
+.welcome-card>strong,.welcome-card>span{max-width:100%;text-align:left}
+.auth{min-width:0}.auth input{min-width:0}
+.view-toggle{gap:8px;flex-wrap:wrap}
+.folder-places{gap:8px}
+.panel-tabs{width:100%;min-width:0;gap:8px}.panel-tabs>button{flex:1 1 0;white-space:nowrap}
+.view-toggle>button{white-space:nowrap}
+.file-name .name-button{flex:1 1 auto}.file-name .exclude-button{flex-shrink:0;white-space:nowrap}
+.setup-steps{gap:8px;flex-wrap:wrap}.setup-steps button{flex:1 1 88px}
+.setup-navigation{align-items:stretch}.setup-navigation>button{flex:1 1 120px}
+.numeric-settings{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.numeric-settings label{min-width:0;line-height:1.5}
+.field>input:not([type=checkbox]),.field>textarea{display:block;width:100%;min-width:0;margin-top:6px}
+.field>.custom-select{margin-top:6px}
+.field>input[type=date],.field>input[type=datetime-local]{padding:8px;border:1px solid var(--line);border-radius:8px}
+.whole,.check{line-height:1.5;gap:8px}.whole>input[type=checkbox],.check>input[type=checkbox]{flex-shrink:0}
+.select-choice{white-space:normal;overflow-wrap:anywhere;min-width:0}
+.select-choice::after{flex-shrink:0}.select-menu button{white-space:normal;overflow-wrap:anywhere}
+.table-wrap .name-button{white-space:normal;overflow-wrap:anywhere;max-width:100%;text-align:left;justify-content:flex-start}
+.selection-bar,.section-title,.phase-line{flex-wrap:wrap;gap:8px}
+.selection-bar>label{display:flex;align-items:center}.phase-line>*{min-width:0;max-width:100%;overflow-wrap:anywhere}
+.counters{grid-template-columns:repeat(2,minmax(0,1fr))}
+.counters>div{min-width:0;flex-wrap:wrap;align-items:baseline;row-gap:4px}
+.counters span,.counters strong{min-width:0;max-width:100%;overflow-wrap:anywhere}
+.counters strong{margin-inline-start:auto;text-align:right}
+.statistics-card .counters{grid-template-columns:minmax(0,1fr)}
+.estimate-values>div{min-width:0;flex-wrap:wrap}.estimate-values strong{margin-inline-start:auto;overflow-wrap:anywhere}
+.notice>span,.network-warning>span,.result-info>span{min-width:0;flex:1;overflow-wrap:anywhere}
+.notice-close{flex-shrink:0;align-self:flex-start;min-width:32px}
+.service-warning>span{min-width:0;flex:1 1 240px}
+dialog{max-width:calc(100vw - 24px);padding:clamp(14px,4vw,24px)}
+.help-header>h2{min-width:0;overflow-wrap:anywhere}
+.help-header>button{flex:0 0 auto;min-width:36px}.help-actions{flex-wrap:wrap;align-items:center}
+.tools-dialog>button,.tools-content>button,#job-details>button{margin:4px 8px 4px 0;max-width:calc(100% - 8px)}
+#job-content>button{display:flex;width:100%;margin:8px 0}
+.v150-preferences label{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,240px);gap:12px;align-items:center}
+.v150-preferences label:has(input){grid-template-columns:minmax(0,1fr) auto}
+.v150-preferences .custom-select,.v150-preferences select{max-width:100%;width:100%}
+@media(max-width:1000px){main{grid-template-columns:minmax(0,1fr)}}
+@media(max-width:600px){.v150-preferences label{grid-template-columns:minmax(0,1fr)}.v150-preferences label:has(input){grid-template-columns:minmax(0,1fr) auto}.type-options{grid-template-columns:minmax(0,1fr)}.type-options label{white-space:normal}.tools-tabs>button{flex:1 1 120px}}
