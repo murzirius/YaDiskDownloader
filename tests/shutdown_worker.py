@@ -18,9 +18,9 @@ folder, mode, port = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
 original_create, original_shutdown = web.create_app, lifecycle.Shutdown
 
 
-def create(state, port):
+def create(state, port, **kwargs):
     api = FakeAPI()
-    app = original_create(state, api=api, port=port)
+    app = original_create(state, api=api, port=port, **kwargs)
     engine = app.extensions['engine']
     if mode == 'scan':
         api.file('disk:/one.bin', preview=False)

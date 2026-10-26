@@ -17,6 +17,7 @@ from .paths import native
 MAX_BYTES = 1024 * 1024 * 1024
 LOCK = threading.RLock()
 BACKUP_TIMEOUT = 30
+UPGRADE_BACKUP_TIMEOUT = 600
 BACKUP_BUSY_TIMEOUT = 5
 
 
@@ -196,13 +197,15 @@ def snapshot(source, destination, checkpoint=lambda: None, timeout=None):
         os.fsync(stream.fileno())
 
 
-def before_upgrade(filename):
+def before_upgrade(filename, checkpoint=lambda: None):
     filename = Path(native(filename))
     if not filename.is_file():
         return
     folder = filename.parent / 'backups'
     target = folder / ('before-' + __version__ + '.sqlite3')
-    budget = BackupBudget()
+    # A whole-history upgrade copy includes integrity checking and may exceed
+    # the interactive backup budget. Busy locks keep their separate 5s limit.
+    budget = BackupBudget(UPGRADE_BACKUP_TIMEOUT, checkpoint)
     with backup_lock(budget):
         if target.is_file():
             return

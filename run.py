@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 
 from disk_downloader.runtime import frozen, state_folder, program_folder
-from disk_downloader import desktop
+from disk_downloader import desktop, startup
 
 
 def message(text):
@@ -45,6 +45,7 @@ def lock_state(folder):
 
 
 def main():
+    startup.mark('imports')
     desktop.progress('Загружаем компоненты приложения…',10)
     from waitress import create_server
     from disk_downloader.web import create_app
@@ -70,6 +71,7 @@ def main():
         return 0
     if not 1024 <= args.port <= 65535:
         parser.error("Порт должен быть от 1024 до 65535")
+    startup.mark('state')
     desktop.progress('Проверяем порт и папку состояния…',25)
     state = Path(args.state_dir) if args.state_dir else state_folder()
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -91,10 +93,13 @@ def main():
         listener.close()
         message("Папка состояния занята другим процессом или недоступна. Завершите его или выберите отдельную --state-dir.")
         return 1
-    desktop.progress('Подготавливаем историю и профили…',40)
-    migration = migrate(state, candidates(program_folder())) if not args.state_dir else {"jobs": 0, "failed_sources": 0}
+    startup.mark('history')
+    desktop.progress('Сохраняем резервную копию и готовим историю…',40)
+    migration = migrate(state, candidates(program_folder()), checkpoint=startup.checkpoint) if not args.state_dir else {"jobs": 0, "failed_sources": 0}
+    startup.mark('database')
     desktop.progress('Открываем базу и восстанавливаем состояние…',60)
-    app = create_app(state, port=args.port)
+    app = create_app(state, port=args.port, startup_checkpoint=startup.checkpoint)
+    startup.mark('server')
     app.extensions["migration"] = migration
     server = create_server(app, sockets=[listener], threads=12, clear_untrusted_proxy_headers=True)
     url = f"http://127.0.0.1:{args.port}"
@@ -144,10 +149,12 @@ def main():
 
 if __name__ == "__main__":
     try:
+        startup.reset()
         window = os.name=='nt' and '--no-window' not in sys.argv and '--apply-update' not in sys.argv and ('--window' in sys.argv or frozen() and '--no-browser' not in sys.argv)
         sys.exit(desktop.launch(main) if window else main())
-    except Exception:
+    except Exception as exc:
         if frozen():
-            message("Не удалось запустить YaDiskDownloader. Проверьте доступ к папке состояния и свободное место на диске.")
+            detail = startup.failure(exc)
+            message(detail["message"] + "\nКод: " + detail["code"] + ("\nДиагностика: " + str(detail["report"]) if detail["report"] else ""))
             sys.exit(1)
         raise

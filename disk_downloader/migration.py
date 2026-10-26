@@ -59,11 +59,12 @@ def candidates(program_dir):
     return list(dict.fromkeys(path for path in locations if (path / "jobs.sqlite3").is_file()))[:50]
 
 
-def migrate(target, sources):
+def migrate(target, sources, checkpoint=lambda: None):
     target = Path(target).resolve()
-    store = Store(target / "jobs.sqlite3")
+    store = Store(target / "jobs.sqlite3", checkpoint=checkpoint)
     total, failures = 0, 0
     for folder in sources:
+        checkpoint()
         filename = (Path(folder) / "jobs.sqlite3").resolve()
         if filename == Path(store.filename).resolve():
             continue

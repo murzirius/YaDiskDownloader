@@ -204,6 +204,8 @@ def launch(main, inspect_window=None):
             self.gdi.SelectObject(dc,pen);self.gdi.SelectObject(dc,old);self.user.EndPaint(hwnd,ctypes.byref(paint))
 
         def close(self):
+            from .startup import cancel
+            cancel()
             if self.closing:return
             self.closing=True
             if self.shutdown:self.shutdown()
@@ -270,7 +272,11 @@ def launch(main, inspect_window=None):
                 elif kind=='finished':
                     self.closing=True;self.user.DestroyWindow(self.hwnd)
                 elif kind=='failed':
-                    self.text(2,'Не удалось запустить приложение.');self.text(5,value)
+                    self.text(10,'СБОЙ ЗАПУСКА');self.text(2,value['message'])
+                    self.text(5,'Этап: '+value['phase']+'\nКод ошибки: '+value['code'])
+                    self.startup_report=value['report']
+                    if self.startup_report:
+                        self.text(16,'Открыть диагностику');self.user.EnableWindow(self.controls[16],True)
             self.tick+=1
             if self.tick%4==0 and not self.user.IsIconic(self.hwnd):self.refresh()
 
@@ -299,7 +305,10 @@ def launch(main, inspect_window=None):
                     key=wp&0xffff
                     if key==16:
                         import webbrowser
-                        if self.url:webbrowser.open(self.url)
+                        if getattr(self,'startup_report',None):
+                            from .platform_actions import open_path
+                            threading.Thread(target=open_path,args=(str(self.startup_report),),daemon=True).start()
+                        elif self.url:webbrowser.open(self.url)
                     elif key==18:self.user.ShowWindow(hwnd,6)
                     elif key==19:self.close()
                     return 0
@@ -315,9 +324,11 @@ def launch(main, inspect_window=None):
         try:
             window.exit_code=int(main() or 0)
             window.messages.put(('finished',None))
-        except BaseException:
+        except BaseException as exc:
             window.exit_code=1
-            if not window.closing:window.messages.put(('failed','Проверьте доступ к папке состояния, свободное место и отсутствие второй копии приложения.'))
+            if not window.closing:
+                from .startup import failure
+                window.messages.put(('failed',failure(exc)))
     worker=threading.Thread(target=startup,name='disk-desktop-server',daemon=True);worker.start()
     msg=w.MSG()
     window.user.GetMessageW.argtypes=(ctypes.POINTER(w.MSG),w.HWND,w.UINT,w.UINT)
