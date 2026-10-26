@@ -53,7 +53,10 @@ def failure(exc, *, state=None):
     code = uuid.uuid4().hex[:8]
     cause = 'application'
     message = 'Ошибка приложения на ПК. Откройте диагностику и приложите файл к сообщению об ошибке.'
-    if type(exc).__name__ == 'BackupTimeout':
+    if hasattr(exc, 'integrity'):
+        cause = 'history_integrity'
+        message = 'История не прошла проверку SQLite. Не удаляйте её; откройте диагностику.'
+    elif type(exc).__name__ == 'BackupTimeout':
         cause = 'history_timeout'
         message = 'Не завершена резервная копия истории. Прежняя история сохранена; откройте диагностику.'
     elif getattr(exc, 'sqlite_errorname', ''):
@@ -84,6 +87,8 @@ def failure(exc, *, state=None):
              'system': platform.system(), 'system_release': platform.release(),
              'architecture': platform.machine(),
              'sqlite_version': getattr(sys.modules.get('sqlite3'), 'sqlite_version', None)}
+    if hasattr(exc, 'integrity'):
+        value['integrity'] = exc.integrity
     if value['sqlite_code']:
         from .sqlite_support import error_details
         value['sqlite'] = error_details(exc)

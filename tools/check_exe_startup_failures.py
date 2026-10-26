@@ -5,6 +5,7 @@ import requests
 import win32gui,win32process
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from smoke_windows_exe import children
+from disk_downloader import __build__
 
 parser=argparse.ArgumentParser();parser.add_argument('--exe',required=True,type=Path);parser.add_argument('--output',required=True,type=Path);args=parser.parse_args()
 exe=args.exe.resolve(strict=True);results=[]
@@ -46,7 +47,7 @@ for scenario in ('normal','invalid_history'):
     assert not list((state/'startup-diagnostics').glob('startup-*.txt'))
    else:
     assert report and report['cause']=='database' and report['sqlite_code']=='SQLITE_NOTADB'
-    assert report['phase']=='history' and report['build']=='20261026.2'
+    assert report['phase']=='history' and report['build']==__build__
     assert any(text=='Открыть диагностику' and win32gui.IsWindowEnabled(hwnd) for hwnd,text in values)
     assert hashlib.sha256(damaged.read_bytes()).hexdigest()==before
     assert not list((state/'backups').glob('.backup-*'))

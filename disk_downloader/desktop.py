@@ -11,6 +11,27 @@ def progress(text, percent):
         _window.messages.put(('progress',(text,percent)))
 
 
+def confirm_history_recovery(info):
+    from .startup import checkpoint
+    checkpoint()
+    if not _window or _window.closing:return False
+    import ctypes
+    if info['method']=='indexes':
+        text = ('На отдельной копии восстановлены служебные индексы истории. Полная проверка SQLite пройдена.\n\n'
+                'Применить восстановление? Перед изменением исходная история будет сохранена отдельно в backups\\recovery-originals. '
+                'Задания и скачанные файлы не удаляются.\n\nЗакройте другие программы, работающие с базой истории.')
+    else:
+        text = ('Текущая история не прошла проверку. Найдена проверенная резервная копия: '+info['name']+'\n'
+                'Дата копии: '+info['modified']+'\n\nВосстановить её? Новые задания, прогресс и настройки после этой даты могут отсутствовать. '
+                'Скачанные файлы останутся на месте. Текущая история сохранится отдельно в backups\\recovery-originals. '
+                'Позднее можно проверить папку и дозагрузить недостающее.\n\nЗакройте другие программы, работающие с базой истории.')
+    user=ctypes.WinDLL('user32',use_last_error=True)
+    user.MessageBoxW.argtypes=(ctypes.c_void_p,ctypes.c_wchar_p,ctypes.c_wchar_p,ctypes.c_uint)
+    accepted=user.MessageBoxW(_window.hwnd,text,'Восстановление истории YaDiskDownloader',0x4|0x30|0x100)==6
+    checkpoint()
+    return accepted
+
+
 def ready(app, url, shutdown):
     if _window:
         _window.app=app;_window.url=url;_window.shutdown=shutdown

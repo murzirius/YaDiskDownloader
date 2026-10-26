@@ -80,6 +80,10 @@ jobs:
       - run: python build_windows.py --output dist/windows --work build/windows
       - name: Smoke actual EXE, UI, patched SQLite, tray and full shutdown
         run: python tools/smoke_windows_exe.py --exe dist/windows/YaDiskDownloader.exe --output smoke-results.json
+      - name: Check normal startup and visible startup diagnostics in actual EXE
+        run: python tools/check_exe_startup_failures.py --exe dist/windows/YaDiskDownloader.exe --output startup-failure-results.json
+      - name: Check confirmed history recovery and cancellation in actual EXE
+        run: python tools/check_exe_startup_recovery.py --exe dist/windows/YaDiskDownloader.exe --output startup-recovery-results.json
       - name: Check background SQLite diagnostics in actual EXE
         run: python tools/check_exe_database_errors.py --exe dist/windows/YaDiskDownloader.exe --output database-error-results.json
       - name: Recover unreadable application history in actual EXE
@@ -93,6 +97,8 @@ jobs:
           name: windows-exe-smoke
           path: |
             smoke-results.json
+            startup-failure-results.json
+            startup-recovery-results.json
             desktop-dpi-results.json
             database-error-results.json
             history-recovery-application.json

@@ -3,6 +3,7 @@ import json
 import os
 import re
 import sqlite3
+import shutil
 import threading
 import time
 import uuid
@@ -13,6 +14,7 @@ from urllib.parse import quote
 
 from . import __version__
 from .paths import native
+from .history_integrity import HistoryIntegrityError, require as require_integrity
 
 MAX_BYTES = 1024 * 1024 * 1024
 LOCK = threading.RLock()
@@ -189,15 +191,108 @@ def snapshot(source, destination, checkpoint=lambda: None, timeout=None):
     budget = BackupBudget(timeout, checkpoint)
     with closing(sqlite3.connect(destination)) as target, bounded_statements(target,budget):
         backup_connection(source, target, budget.check, budget.remaining())
-        if target.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
-            raise ValueError('Резервная копия не прошла проверку')
+        require_integrity(target)
         _standalone(target,budget)
     budget.check()
     with open(destination, 'r+b') as stream:
         os.fsync(stream.fileno())
 
 
-def before_upgrade(filename, checkpoint=lambda: None):
+def _finish_private_copy(filename, budget):
+    with closing(sqlite3.connect(_database_uri(filename, 'rw'), uri=True, timeout=.05)) as db, bounded_statements(db, budget):
+        require_integrity(db)
+        _standalone(db, budget)
+    with open(filename, 'r+b') as stream:
+        os.fsync(stream.fileno())
+
+
+def _original_safety(source, folder, budget, method):
+    # This intentionally UNVERIFIED snapshot retains the pre-recovery pages.
+    # It is kept outside the list of normal, validated restore candidates.
+    folder = folder / 'recovery-originals'
+    folder.mkdir(exist_ok=True)
+    identity = uuid.uuid4().hex
+    temporary = folder / ('.original-' + identity)
+    target = folder / ('original-' + identity + '.sqlite3')
+    try:
+        with closing(sqlite3.connect(temporary)) as raw, bounded_statements(raw, budget):
+            backup_connection(source, raw, budget.check, budget.remaining())
+            _standalone(raw, budget)
+        with temporary.open('r+b') as stream:os.fsync(stream.fileno())
+        os.replace(temporary, target)
+        with target.with_suffix('.json').open('x', encoding='utf-8') as stream:
+            json.dump({'method':method, 'verified':False, 'original':target.name,
+                       'created':datetime.now(timezone.utc).isoformat()},stream)
+            stream.flush();os.fsync(stream.fileno())
+        return target
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _recover_startup(source, temporary, folder, budget, failure, recovery, version):
+    size = source.execute('PRAGMA page_count').fetchone()[0] * source.execute('PRAGMA page_size').fetchone()[0]
+    if shutil.disk_usage(folder).free < size * 3 + 256 * 1024 * 1024:
+        raise OSError(28, 'Insufficient local space for protected history recovery')
+    prepared = False
+    info = {'method':'indexes'}
+    if failure.integrity.get('index_candidate'):
+        try:
+            with closing(sqlite3.connect(_database_uri(temporary,'rw'),uri=True,timeout=.05)) as copy, bounded_statements(copy,budget):
+                copy.execute('PRAGMA cache_size=-8192')
+                copy.execute('PRAGMA temp_store=FILE')
+                copy.create_function('unicode_fold',1,lambda value:(value or '').casefold(),deterministic=True)
+                copy.execute('REINDEX')
+                copy.commit()
+                require_integrity(copy)
+                _standalone(copy,budget)
+            _finish_private_copy(temporary,budget)
+            prepared = True
+        except (sqlite3.Error, HistoryIntegrityError):
+            budget.check()
+    if not prepared:
+        # Never roll history back without showing which verified copy will be used.
+        candidates = [path for path in folder.glob('*.sqlite3')
+                      if not path.is_symlink() and re.fullmatch(r'(before-[0-9]+\.[0-9]+\.[0-9]+|backup-[0-9TZ-]+-[a-f0-9]{8})\.sqlite3',path.name)]
+        candidates.sort(key=lambda path:path.stat().st_mtime,reverse=True)
+        for candidate in candidates:
+            budget.check()
+            try:
+                with closing(readonly(candidate)) as saved, bounded_statements(saved,budget):
+                    Backups.validate(saved,budget.check)
+                    snapshot(saved,temporary,budget.check,budget.remaining())
+                info = {'method':'backup','name':candidate.name,
+                        'modified':datetime.fromtimestamp(candidate.stat().st_mtime).astimezone().strftime('%d.%m.%Y %H:%M')}
+                prepared = True
+                break
+            except (sqlite3.Error, ValueError):
+                budget.check()
+    if not prepared:
+        raise failure
+    budget.check()
+    if not recovery(info):
+        raise failure
+    budget.check()
+    previous_mode = source.execute('PRAGMA locking_mode').fetchone()[0]
+    try:
+        # Retain the exclusive lock after COMMIT. The backup API requires no
+        # open destination transaction; other writers still must stay excluded.
+        source.execute('PRAGMA locking_mode=EXCLUSIVE')
+        source.execute('BEGIN EXCLUSIVE')
+        if source.execute('PRAGMA data_version').fetchone()[0] != version:
+            raise ValueError('История изменилась во время подготовки. Восстановление отменено; повторите запуск.')
+        source.commit()
+        _original_safety(source,folder,budget,info['method'])
+        with closing(readonly(temporary)) as healthy:
+            require_integrity(healthy)
+            backup_connection(healthy,source,budget.check,budget.remaining())
+        with bounded_statements(source,budget):
+            require_integrity(source)
+    finally:
+        if source.in_transaction:source.rollback()
+        source.execute('PRAGMA locking_mode='+previous_mode)
+
+
+def before_upgrade(filename, checkpoint=lambda: None, recovery=None):
     filename = Path(native(filename))
     if not filename.is_file():
         return
@@ -216,7 +311,13 @@ def before_upgrade(filename, checkpoint=lambda: None):
             # Open the existing local database writable before taking the
             # pre-migration snapshot; mode=rw must never create a missing file.
             with closing(recovery_source(filename, timeout=min(5, budget.remaining()))) as source:
-                snapshot(source, temporary, budget.check, budget.remaining())
+                version = source.execute('PRAGMA data_version').fetchone()[0]
+                try:
+                    snapshot(source, temporary, budget.check, budget.remaining())
+                except HistoryIntegrityError as error:
+                    if recovery is None:
+                        raise
+                    _recover_startup(source, temporary, folder, budget, error, recovery, version)
             os.replace(temporary, target)
             automatic=[file for file in folder.glob('before-*.sqlite3') if not file.is_symlink() and re.fullmatch(r'before-\d+\.\d+\.\d+\.sqlite3',file.name)]
             for old in sorted(automatic,key=lambda file:file.stat().st_mtime,reverse=True)[5:]:
@@ -298,10 +399,10 @@ class Backups:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def validate(self, source, checkpoint=lambda: None):
+    @staticmethod
+    def validate(source, checkpoint=lambda: None):
         checkpoint()
-        if source.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
-            raise ValueError('Резервная копия повреждена')
+        require_integrity(source)
         tables = {row[0] for row in source.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if not {'jobs', 'entries', 'names', 'artifacts', 'profiles', 'preferences'}.issubset(tables):
             raise ValueError('Это не резервная копия YaDiskDownloader')

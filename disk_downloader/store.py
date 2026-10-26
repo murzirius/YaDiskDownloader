@@ -89,7 +89,7 @@ CREATE TABLE IF NOT EXISTS pending_service_outputs (root TEXT,kind TEXT,local TE
 
 
 class Store:
-    def __init__(self, filename, *, checkpoint=lambda: None):
+    def __init__(self, filename, *, checkpoint=lambda: None, recovery=None):
         mode = journal_mode()
         self.wal = mode == 'WAL'
         self.filename = str(filename)
@@ -98,7 +98,7 @@ class Store:
         Path(filename).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         from .backups import before_upgrade, recovery_source
         checkpoint()
-        before_upgrade(Path(filename), checkpoint=checkpoint)
+        before_upgrade(Path(filename), checkpoint=checkpoint, recovery=recovery)
         connection = recovery_source(filename, timeout=30) if Path(filename).is_file() else sqlite3.connect(self.filename, timeout=30)
         with closing(connection) as setup:
             setup.execute("PRAGMA journal_mode=" + mode)
