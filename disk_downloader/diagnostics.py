@@ -27,6 +27,22 @@ def error_kind(value):
     return "other" if value else "none"
 
 
+def storage_event_code(message):
+    if message.startswith('Накопитель снова доступен.'):
+        return 'storage_resumed'
+    if message.startswith('Накопитель ответил.'):
+        return 'storage_confirming'
+    if message.startswith(('Накопитель или NAS не отвечает', 'Проверка накопителя ещё выполняется', 'Накопитель ещё не ответил')):
+        return 'storage_probe_wait'
+    if message.startswith('Папка найдена, но не удалось проверить свободное место'):
+        return 'storage_space_probe_failed'
+    if message.startswith('Папка загрузки недоступна.'):
+        return 'storage_unavailable'
+    if message.startswith(('По выбранному пути теперь другая папка', 'Папка назначения больше не является обычной папкой')):
+        return 'storage_validation_blocked'
+    return None
+
+
 def bundle(engine, job_id):
     salt = secrets.token_bytes(32)
     def source_id(path):
@@ -50,6 +66,12 @@ def bundle(engine, job_id):
     for row in engine.store.rows("SELECT time,category,level,message,path FROM journal_events WHERE job=? ORDER BY id DESC LIMIT 2000", (job_id,)):
         message, path = row.pop("message"), row.pop("path")
         row["error_type"] = error_kind(message) if row["category"] == "errors" else "none"
+        if row['category'] == 'system' and (code := storage_event_code(message)):
+            row['event_code'] = code
+            match = re.search(r'Код (Windows|ОС): (\d+)', message)
+            if match:
+                row['os_error_code'] = int(match[2])
+                row['os_error_source'] = 'windows' if match[1]=='Windows' else 'os'
         match = re.search(r"\bHTTP (\d{3})\b", message)
         if match:
             row["http_status"] = int(match[1])
@@ -59,7 +81,18 @@ def bundle(engine, job_id):
         if path:
             row["source_id"] = source_id(path)
         events.append(row)
-    return {"environment.json": environment, "settings.json": settings, "summary.json": summary, "errors.json": entries, "events.json": events, "requests.json": engine.request_errors.snapshot() if hasattr(engine, 'request_errors') else []}
+    control = engine.controls.get(job_id)
+    storage = control.storage_snapshot() if control else None
+    # snapshot contains only fixed enums, counters and prewritten user messages.
+    # Exclude the message as well: exports need no free-form text.
+    if storage:
+        storage.pop('message', None)
+        if storage.get('probe'):
+            storage['probe'] = dict(storage['probe'])
+            storage['probe'].pop('error', None)
+    return {"environment.json": environment, "settings.json": settings, "summary.json": summary, "errors.json": entries, "events.json": events,
+            "storage.json": storage,
+            "requests.json": engine.request_errors.snapshot() if hasattr(engine, 'request_errors') else []}
 
 
 def write_bundle(engine, job_id):
@@ -71,7 +104,7 @@ def write_bundle(engine, job_id):
         with zipfile.ZipFile(temp, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for name, data in files.items():
                 archive.writestr(name, json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
-            archive.writestr("README.txt", "Диагностика YaDiskDownloader. Без ключей, временных ссылок, имён и путей файлов, исходного содержимого, профилей и базы SQLite. До 1000 ошибок файлов и 2000 последних событий. Идентификаторы source_id связывают ошибки и события одного источника.".encode("utf-8"))
+            archive.writestr("README.txt", "Диагностика YaDiskDownloader. Без ключей, временных ссылок, имён и путей файлов, исходного содержимого, профилей и базы SQLite. До 1000 ошибок файлов и 2000 последних событий. storage.json содержит этап, время и числовой код ошибки проверки накопителя, без адреса NAS. Идентификаторы source_id связывают ошибки и события одного источника.".encode("utf-8"))
         with open(temp,'r+b') as stream:
             os.fsync(stream.fileno())
         publish(temp, safe_join(job["root"], local))

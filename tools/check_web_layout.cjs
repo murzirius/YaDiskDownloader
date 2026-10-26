@@ -63,6 +63,22 @@ const audit=()=>{
   await close();await page.evaluate(()=>{void askConfirmation('Остановить обработку и сохранить прогресс? Уже скачанные файлы останутся в выбранной папке.');});await record('confirmation');await page.locator('.confirmation-dialog').getByRole('button',{name:'Отмена',exact:true}).click();
   await page.evaluate(()=>{void chooseFolderInApp($('destination').value);});await page.locator('.folder-browser').waitFor({state:'visible'});await page.waitForTimeout(200);await record('folder-browser');await page.locator('.folder-browser').getByRole('button',{name:'Отмена',exact:true}).click();
   await close();await page.evaluate(()=>{notice('Приложение на ПК: накопитель временно недоступен. Проверьте подключение и повторите попытку.');$('service-warning').hidden=false;$('service-warning-text').textContent='Приложение на ПК не ответило вовремя. Проверьте связь.';$('network-warning').hidden=false;$('network-warning').textContent='Нет интернета. После восстановления соединения работа продолжится.';$('storage-warning').hidden=false;$('storage-warning-text').textContent='Папка загрузки недоступна. Ожидаем подключения накопителя.';});await record('warnings');
+  const storageStates=[
+   ['storage-checking',{checking:true},'Ждём ответ накопителя'],
+   ['storage-confirming',{confirming:true,confirmations:1,confirmation_required:2},'Подтверждаем восстановление связи'],
+   ['storage-space',{probe:{stage:'space',state:'unavailable'}},'Не удалось проверить свободное место'],
+   ['storage-manual',{automatic:false,pause_kind:'storage_manual'},'Запись на накопитель заблокирована']
+  ];
+  for(const [name,extra,title] of storageStates){
+   await page.evaluate(({extra,title})=>{
+    renderStorage({storage:{waiting:true,automatic:true,pause_kind:'storage',attempt:123,retry_in:60,message:'Папка найдена, но не удалось проверить свободное место на накопителе. Проверьте доступ к NAS и его состояние. Скачанные файлы сохранены.',...extra}});
+    if($('storage-warning-title').textContent!==title)throw Error('Wrong storage warning title');
+    if($('storage-warning').hidden)throw Error('Storage warning hidden');
+   },{extra,title});
+   const r=await page.evaluate(audit);
+   results.push({width,scale,name,...r});
+   if(process.env.SCREENSHOTS&&width===390&&scale==='1.3')await page.screenshot({path:path.join(out,`${width}-${scale}-${name}.png`),fullPage:false});
+  }
   await page.locator('#job-history').locator('..').locator('.select-choice').click();await record('history-select');await close();
   await page.evaluate(()=>{$('grid-view').click();});await record('file-grid');
   await page.evaluate(()=>{$('home').click();connection(false);});await record('disconnected');

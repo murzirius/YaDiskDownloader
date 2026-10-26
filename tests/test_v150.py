@@ -192,7 +192,8 @@ def test_cli_background_survives_its_launch_terminal_process(tmp_path):
         import psutil
         process=psutil.Process(json.loads(result.stdout)['pid'])
         client=Client(port,tmp_path/'state')
-        assert client.call('/api/runtime')['version']=='1.5.0'
+        from disk_downloader import __version__
+        assert client.call('/api/runtime')['version']==__version__
         assert Client(port,tmp_path/'state').call('/api/status')['jobs']==[]
         assert client.call('/api/exit',{})['ok']
         due_at=time.monotonic()+test_timeout(20)

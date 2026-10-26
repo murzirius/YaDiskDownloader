@@ -181,8 +181,11 @@ function renderStorage(job){
   const storage=job.storage,waiting=!!storage?.waiting;
   $('storage-warning').hidden=!waiting;
   if(!waiting)return;
+  $('storage-warning-title').textContent=storage.pause_kind==='user'?'Проверка накопителя на паузе':storage.pause_kind==='storage_manual'?'Запись на накопитель заблокирована':storage.probe?.stage==='space'&&storage.probe?.state==='unavailable'?'Не удалось проверить свободное место':storage.confirming?'Подтверждаем восстановление связи':storage.checking?'Ждём ответ накопителя':'Накопитель недоступен';
   $('storage-warning-text').textContent=storage.message;
-  $('storage-retry-status').textContent=storage.automatic?(storage.retry_in>0?'Повторная проверка через '+Math.ceil(storage.retry_in)+' с.':'Проверяем накопитель…')+' После восстановления прежней папки работа продолжится сама.':'Автоматическое продолжение выключено. Проверьте накопитель и нажмите «Продолжить».';
+  const attempt=storage.attempt?' Проверка № '+storage.attempt+'.':'';
+  const confirmations=storage.confirming?' Успешных проверок: '+storage.confirmations+' / '+storage.confirmation_required+'.':'';
+  $('storage-retry-status').textContent=storage.automatic?(storage.retry_in>0?'Повторная проверка через '+Math.ceil(storage.retry_in)+' с.':'Проверяем накопитель…')+attempt+confirmations+' После устойчивого восстановления прежней папки работа продолжится сама.':'Автоматическое продолжение выключено. Проверьте накопитель и нажмите «Продолжить».';
   $('stop-storage-retry').hidden=!storage.automatic;
 }
 function renderEstimate(job){

@@ -110,6 +110,8 @@ class Control:
         self.remaining_time = RemainingTime(self.statistics_clock)
         self.space_check = None
         self.space_lock = threading.RLock()
+        self.space_gate = threading.Lock()
+        self.space_usage_generation = None
         self.space_draining = False
         self.finish_current = False
         self.floor_latched = False
@@ -139,6 +141,13 @@ class Control:
         self.storage_retry_due = None
         self.storage_retry_attempt = 0
         self.storage_retry_delays = (2, 4, 8, 16, 32, 60)
+        self.storage_confirmations = 0
+        self.storage_confirmation_required = 2
+        self.storage_confirmation_interval = 1.0
+        self.storage_confirmation_since = None
+        self.storage_confirmation_generation = None
+        self.storage_healthy_since = None
+        self.storage_backoff_reset_after = 60.0
 
     def add_timing(self, category, seconds):
         with self.lock:
@@ -230,12 +239,22 @@ class Control:
             return True
 
     def storage_snapshot(self):
+        probe = self.destination.snapshot() if self.destination else None
+        slow = bool(probe and probe['probing'] and probe.get('state') in ('slow','timeout'))
         with self.condition:
-            waiting = self.paused and self.storage_problem and not self.stopped
-            return {'waiting':waiting, 'automatic':waiting and self.pause_kind == 'storage',
-                    'attempt':self.storage_retry_attempt,
+            waiting = not self.stopped and self.finished is None and (self.paused and self.storage_problem or slow)
+            automatic = waiting and self.pause_kind in ('', 'storage')
+            message = self.storage_problem_reason if waiting else ''
+            if slow and waiting:
+                message = self.destination.waiting_message()
+            return {'waiting':bool(waiting), 'automatic':bool(automatic),
+                    'checking':bool(probe and probe['probing']),
+                    'confirming':waiting and self.pause_kind == 'storage' and self.storage_confirmations > 0,
+                    'confirmations':self.storage_confirmations,
+                    'confirmation_required':self.storage_confirmation_required,
+                    'attempt':self.storage_retry_attempt, 'pause_kind':self.pause_kind,
                     'retry_in':max(0,self.storage_retry_due-time.monotonic()) if waiting and self.storage_retry_due is not None else None,
-                    'message':self.storage_problem_reason if waiting else ''}
+                    'message':message, 'probe':probe}
 
     def resume(self):
         with self.condition:
@@ -567,8 +586,11 @@ class Engine:
                     job["settings"].update({key: validated[key] for key in keys})
                     self.store.update_job(job_id, settings=json.dumps(job["settings"], ensure_ascii=False))
 
-                if (control.pause_reason or control.storage_problem) and self.check_space(job_id, control, force=True):
+                serial = control.pause_serial
+                if (control.pause_reason or control.storage_problem) and self.check_space(job_id, control, force=True, interactive=True):
                     raise ValueError(control.pause_reason)
+                if serial != control.pause_serial:
+                    raise ValueError('На ПК поступила новая команда паузы. Для продолжения нажмите «Продолжить» ещё раз.')
                 self.store.update_job(job_id, phase=getattr(control, "phase", "downloading"), pause_reason="")
                 control.pause_reason = ""
                 control.resume()
@@ -831,7 +853,24 @@ class Engine:
         self.store.update_job(job_id, phase="paused" if control.paused else phase)
         control.event("archive" if phase == "packing" else "system", PHASES.get(phase, phase))
 
-    def check_space(self, job_id, control, force=False):
+    def check_space(self, job_id, control, force=False, interactive=False):
+        # Only one caller owns an OS probe. Interactive commands never wait
+        # behind a slow NAS while holding the engine's command lock.
+        acquired = control.space_gate.acquire(blocking=False)
+        if not acquired and interactive:
+            if not control.pause_reason:
+                control.pause_reason = 'Приложение ещё проверяет папку на устройстве. Дождитесь ответа и повторите продолжение.'
+            return True
+        while not acquired:
+            if control.stopped:raise Suspended('Задание остановлено')
+            if control.paused:return True
+            acquired = control.space_gate.acquire(timeout=.1)
+        try:
+            return self._check_space(job_id, control, force, interactive)
+        finally:
+            control.space_gate.release()
+
+    def _check_space(self, job_id, control, force=False, interactive=False):
         with control.space_lock:
             if control.stopped:raise Suspended('Задание остановлено')
             if control.paused and not force:return True
@@ -842,12 +881,19 @@ class Engine:
             control.next_space_check = time.monotonic() + 0.5
             job = self.store.job(job_id)
             if control.destination:
-                generation = control.destination.generation
-                usage, error = control.destination.check(lambda: control.stopped, force=refresh or floor_check)
-                fresh_usage = generation != control.destination.generation
+                usage, error = control.destination.check(
+                    lambda: control.stopped or (control.paused and control.pause_kind == 'user' and not interactive),
+                    force=refresh or floor_check, wait_timeout=.2 if interactive else None)
+                fresh_usage = control.space_usage_generation != control.destination.generation
                 if control.stopped:
                     raise Suspended('Задание остановлено')
+                if control.paused and control.pause_kind == 'user' and not interactive:
+                    return True
                 if error or usage is None:
+                    control.storage_healthy_since = None
+                    control.storage_confirmations = 0
+                    control.storage_confirmation_since = None
+                    control.storage_confirmation_generation = None
                     reason = error or 'Папка загрузки недоступна. Подключите накопитель и нажмите «Продолжить».'
                     changed = control.pause_reason != reason
                     control.storage_problem = True
@@ -862,11 +908,19 @@ class Engine:
             else:
                 usage = shutil.disk_usage(job['root'])
                 fresh_usage = True
-            control.storage_problem = False
-            control.storage_problem_reason = ''
-            control.next_space_check = time.monotonic()+.5
+            confirming = control.paused and control.pause_kind == 'storage' and not interactive
+            if not confirming:
+                control.storage_problem = False
+                control.storage_problem_reason = ''
+                if control.storage_healthy_since is None:
+                    control.storage_healthy_since = time.monotonic()
+                elif time.monotonic()-control.storage_healthy_since >= control.storage_backoff_reset_after:
+                    control.storage_retry_attempt = 0
+            control.next_space_check = time.monotonic()+(control.destination.interval if control.destination else .5)
             if fresh_usage or control.free_credit is None:
                 control.free_credit = usage.free
+                if control.destination:
+                    control.space_usage_generation = control.destination.generation
             free = min(usage.free, control.free_credit)
             floor = RESUME_FREE_BYTES if control.floor_latched else HARD_FREE_BYTES
             if free < floor:
@@ -878,6 +932,8 @@ class Engine:
                 reason = 'Мало места на устройстве: осталось меньше 500 МБ или ещё не восстановлен запас. Скачивание на паузе. Освободите не менее 1 ГБ и нажмите «Продолжить».'
                 changed = control.pause_reason != reason
                 control.floor_latched = True
+                control.storage_problem = False
+                control.storage_problem_reason = ''
                 control.space_draining = False
                 control.pause_reason = reason
                 control.pause(source='space')
@@ -894,6 +950,8 @@ class Engine:
             if occupied >= threshold:
                 reason = f"Автопауза: диск заполнен на {occupied:.1f}%, порог {threshold:g}%. Освободите место и нажмите «Продолжить»."
                 if control.pause_reason != reason:
+                    control.storage_problem = False
+                    control.storage_problem_reason = ''
                     control.pause_reason = reason
                     control.pause(source='space')
                     self.store.update_job(job_id, phase="paused", pause_reason=reason)
@@ -914,6 +972,8 @@ class Engine:
                         if control.stopped or not control.paused or control.pause_kind != 'storage':return
                         serial = control.pause_serial
                         delay = control.storage_retry_delays[min(control.storage_retry_attempt,len(control.storage_retry_delays)-1)]
+                        if control.storage_confirmations:
+                            delay = max(delay, control.storage_confirmation_interval)
                         control.storage_retry_attempt += 1
                         control.storage_retry_due = time.monotonic()+delay
                         while not control.stopped and control.paused and control.pause_kind == 'storage' and serial == control.pause_serial:
@@ -923,12 +983,28 @@ class Engine:
                         if control.stopped or not control.paused or control.pause_kind != 'storage' or serial != control.pause_serial:return
                     if self.check_space(job_id,control,force=True):
                         continue
+                    with control.condition:
+                        if control.stopped or not control.paused or control.pause_kind != 'storage' or serial != control.pause_serial:return
+                        generation = control.destination.generation
+                        if generation != control.storage_confirmation_generation:
+                            control.storage_confirmation_generation = generation
+                            control.storage_confirmations += 1
+                            if control.storage_confirmation_since is None:
+                                control.storage_confirmation_since = time.monotonic()
+                        stable = (control.storage_confirmations >= control.storage_confirmation_required
+                                  and time.monotonic()-control.storage_confirmation_since >= control.storage_confirmation_interval)
+                        if not stable:
+                            control.storage_problem_reason = 'Накопитель ответил. Подтверждаем устойчивую связь; задание пока остаётся на паузе.'
+                            control.pause_reason = control.storage_problem_reason
+                            continue
                     with self.lock:
                         if self.shutting_down or self.controls.get(job_id) is not control:return
                         self.store.update_job(job_id,phase=getattr(control,'phase','downloading'),pause_reason='')
                         if control.resume_storage(serial):
                             control.pause_reason = ''
-                            control.storage_retry_attempt = 0
+                            control.storage_problem = False
+                            control.storage_problem_reason = ''
+                            control.storage_healthy_since = time.monotonic()
                             control.event('system','Накопитель снова доступен. Прежняя папка проверена; продолжаем работу.',level='success')
                         else:
                             self.store.update_job(job_id,phase='stopping' if control.stopped else 'paused',pause_reason=control.pause_reason)
