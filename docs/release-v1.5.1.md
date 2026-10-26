@@ -19,6 +19,13 @@
 
 **YaDiskDownloader-v1.5.1-Windows-x64.zip** — распакуйте архив и запустите `YaDiskDownloader.exe`.
 
+## macOS
+
+- **Apple Silicon (M1 и новее):** `YaDiskDownloader-v1.5.1-macOS-arm64.dmg`.
+- **Intel:** `YaDiskDownloader-v1.5.1-macOS-x64.dmg`.
+
+Откройте DMG и перенесите приложение в «Программы». CLI поддерживается только в Linux: [инструкция](https://github.com/murzirius/YaDiskDownloader/blob/v1.5.1/docs/cli.md).
+
 ## Ограничения проверки
 
 Проверки недоступного и медленного NAS воспроизводятся на искусственных данных. Скорость и стабильность конкретного сетевого накопителя зависят от Windows, локальной сети и самого NAS. Подробности: [проверка восстановления накопителя](https://github.com/murzirius/YaDiskDownloader/blob/main/docs/validation-storage-v1.5.1.md).
