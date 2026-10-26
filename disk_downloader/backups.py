@@ -276,6 +276,7 @@ def _recover_startup(source, temporary, folder, budget, failure, recovery, versi
     try:
         # Retain the exclusive lock after COMMIT. The backup API requires no
         # open destination transaction; other writers still must stay excluded.
+        source.execute('PRAGMA synchronous=FULL')
         source.execute('PRAGMA locking_mode=EXCLUSIVE')
         source.execute('BEGIN EXCLUSIVE')
         if source.execute('PRAGMA data_version').fetchone()[0] != version:

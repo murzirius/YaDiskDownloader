@@ -94,6 +94,7 @@ def test_exclusive_destination_lock_blocks_external_writer_during_apply(tmp_path
     def copying(source,target,*args,**kwargs):
         names=[row[2] for row in target.execute('PRAGMA database_list')]
         if any(name and os.path.samefile(name,path) for name in names) and len(checked)==0:
+            assert target.execute('PRAGMA synchronous').fetchone()[0]==2
             with closing(sqlite3.connect(path,timeout=.01)) as other:
                 with pytest.raises(sqlite3.OperationalError,match='locked'):other.execute("INSERT INTO profiles VALUES('concurrent','{}')")
             checked.append(True)
