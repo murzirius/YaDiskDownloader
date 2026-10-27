@@ -100,7 +100,10 @@ def test_native_progress_names_source_and_never_moves_bar_backwards(monkeypatch)
     desktop.history_progress('save_original',1024**2,2*1024**2,1)
     desktop.history_progress('verify_repaired',None,None,3)
     desktop.history_progress('apply_recovery',2*1024**2,2*1024**2,4)
-    events=[window.messages.get_nowait()[1] for _ in range(3)]
+    queued=[]
+    while not window.messages.empty():queued.append(window.messages.get_nowait())
+    assert sum(kind=='recovery_notice' for kind,_ in queued)==1
+    events=[value for kind,value in queued if kind=='progress']
     assert 'исходную историю' in events[0][0] and '1 / 2 МБ (50%)' in events[0][0]
     assert '3 с' in events[1][0]
     assert [v[1] for v in events]==sorted(v[1] for v in events)

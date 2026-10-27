@@ -50,6 +50,7 @@ for mode in (('indexes_yes',) if args.large else ('indexes_yes','indexes_no','ba
    message=' '.join(texts)
    assert hashlib.sha256(database.read_bytes()).hexdigest()==before,'Original changed before consent'
    assert 'recovery-originals' in message
+   assert 'может занять несколько минут' in message
    if mode=='backup_yes':assert 'before-1.5.0.sqlite3' in message and 'после этой даты' in message
    else:assert 'индексы' in message and 'Полная проверка SQLite пройдена' in message
    decision=7 if mode=='indexes_no' else 6
@@ -64,6 +65,8 @@ for mode in (('indexes_yes',) if args.large else ('indexes_yes','indexes_no','ba
       text=win32gui.GetWindowText(win32gui.GetDlgItem(windows[0],2))
       if 'Сохраняем исходную историю' in text and 'МБ (' in text:observed.add('save_original')
       if 'Применяем восстановленную историю' in text and 'МБ (' in text:observed.add('apply_recovery')
+      notice=win32gui.GetWindowText(win32gui.GetDlgItem(windows[0],5))
+      if 'может занять несколько минут' in notice:observed.add('recovery_notice')
      try:
       response=session.get(url,timeout=.3)
       if response.status_code==200:break
@@ -75,7 +78,12 @@ for mode in (('indexes_yes',) if args.large else ('indexes_yes','indexes_no','ba
      assert db.execute('PRAGMA integrity_check').fetchone()[0]=='ok'
      assert db.execute('SELECT COUNT(*) FROM fixture').fetchone()[0]==(9 if mode=='backup_yes' else 64)
      if args.large:assert db.execute('SELECT COUNT(*) FROM entries').fetchone()[0]==220000
-    if args.large:assert observed=={'save_original','apply_recovery'},observed
+    if args.large:assert observed=={'save_original','apply_recovery','recovery_notice'},observed
+    due=time.monotonic()+3
+    while time.monotonic()<due:
+     if 'может занять несколько минут' not in win32gui.GetWindowText(win32gui.GetDlgItem(windows[0],5)):break
+     time.sleep(.1)
+    assert 'может занять несколько минут' not in win32gui.GetWindowText(win32gui.GetDlgItem(windows[0],5)),'Recovery notice remained after startup'
     originals=list((state/'backups/recovery-originals').glob('original-*.sqlite3'));assert len(originals)==1
     with closing(sqlite3.connect(originals[0])) as db:
      assert db.execute('SELECT COUNT(*) FROM fixture NOT INDEXED').fetchone()[0]==64

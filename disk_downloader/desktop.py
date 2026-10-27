@@ -4,6 +4,7 @@ import queue
 import threading
 
 _window = None
+HISTORY_RECOVERY_NOTICE = 'Восстановление истории может занять несколько минут.\nДождитесь завершения.'
 
 
 def progress(text, percent):
@@ -15,6 +16,10 @@ def progress(text, percent):
 
 
 def history_progress(stage, done, total, elapsed):
+    if (_window and stage in ('repair_indexes','inspect_backups','confirm_recovery','lock_history','save_original','apply_recovery','verify_recovery')
+            and not getattr(_window,'recovery_notice_requested',False)):
+        _window.recovery_notice_requested = True
+        _window.messages.put(('recovery_notice',None))
     stages = {
         'backup_copy': ('Сохраняем копию истории', 30, 35),
         'backup_verify': ('Проверяем копию истории', 36, 36),
@@ -58,6 +63,7 @@ def confirm_history_recovery(info):
                 'Скачанные файлы останутся на месте. Текущая история сохранится отдельно в backups\\recovery-originals. '
                 'Позднее можно проверить папку и дозагрузить недостающее.\n\nЗакройте другие программы, работающие с базой истории.')
     user=ctypes.WinDLL('user32',use_last_error=True)
+    text += '\n\n' + HISTORY_RECOVERY_NOTICE
     user.MessageBoxW.argtypes=(ctypes.c_void_p,ctypes.c_wchar_p,ctypes.c_wchar_p,ctypes.c_uint)
     accepted=user.MessageBoxW(_window.hwnd,text,'Восстановление истории YaDiskDownloader',0x4|0x30|0x100)==6
     checkpoint()
@@ -139,8 +145,9 @@ def launch(main, inspect_window=None):
             self.button_brush=self.gdi.CreateSolidBrush(0x493a2d)
             self.accent_brush=self.gdi.CreateSolidBrush(0xe1c3a8)
             self.focus_brush=self.gdi.CreateSolidBrush(0x7e6652)
+            self.warning_brush=self.gdi.CreateSolidBrush(0x263443)
             self.dark_text=0x281f18;self.light_text=0xeae5e2;self.muted_text=0xbeafa6
-            self.paint_resources=[self.font,self.heading_font,self.label_font,self.background,self.panel,self.input_brush,self.button_brush,self.accent_brush,self.focus_brush]
+            self.paint_resources=[self.font,self.heading_font,self.label_font,self.background,self.panel,self.input_brush,self.button_brush,self.accent_brush,self.focus_brush,self.warning_brush]
             self.gdi.SetBkMode.argtypes=(w.HDC,ctypes.c_int)
             self.gdi.GetStockObject.restype=w.HANDLE
             self.callback=ctypes.WINFUNCTYPE(ctypes.c_ssize_t,w.HWND,w.UINT,w.WPARAM,w.LPARAM)(self.wndproc)
@@ -297,9 +304,14 @@ def launch(main, inspect_window=None):
                 try:kind,value=self.messages.get_nowait()
                 except queue.Empty:break
                 if kind=='progress':self.text(2,value[0]);self.user.SendMessageW(self.controls[3],0x0402,value[1],0)
+                elif kind=='recovery_notice':
+                    self.recovery_warning=True;self.text(5,HISTORY_RECOVERY_NOTICE)
+                    self.user.InvalidateRect(self.controls[5],None,True)
                 elif kind=='notice':self.text(5,value)
                 elif kind=='snapshot_done':self.snapshot_busy=False
                 elif kind=='ready':
+                    self.recovery_warning=False;self.text(5,'История и файлы остаются на устройстве.')
+                    self.user.InvalidateRect(self.controls[5],None,True)
                     self.text(10,'ГОТОВО К РАБОТЕ');self.text(2,'Откройте браузер, чтобы начать загрузку.');self.user.SendMessageW(self.controls[3],0x0402,100,0)
                     self.user.EnableWindow(self.controls[16],True)
                     self.refresh(True)
@@ -325,6 +337,7 @@ def launch(main, inspect_window=None):
                 elif kind=='finished':
                     self.closing=True;self.user.DestroyWindow(self.hwnd)
                 elif kind=='failed':
+                    self.recovery_warning=False
                     self.text(10,'СБОЙ ЗАПУСКА');self.text(2,value['message'])
                     self.text(5,'Этап: '+value['phase']+'\nКод ошибки: '+value['code'])
                     self.startup_report=value['report']
@@ -350,6 +363,9 @@ def launch(main, inspect_window=None):
                     self.gdi.SetBkMode(wp,1);self.gdi.SetTextColor(wp,self.light_text);self.gdi.SetBkColor(wp,0x342b25)
                     if message in (0x0133,0x0134):return self.input_brush
                     key=next((k for k,h in getattr(self,'controls',{}).items() if h==lp),None)
+                    if key==5 and getattr(self,'recovery_warning',False):
+                        self.gdi.SetTextColor(wp,0x9cdef9);self.gdi.SetBkColor(wp,0x263443)
+                        return self.warning_brush
                     if key in (9,20,10):self.gdi.SetTextColor(wp,self.muted_text)
                     return self.background if key in (1,20,9) else self.panel
                 if message==0x8001:self.user.ShowWindow(hwnd,9);self.user.SetForegroundWindow(hwnd);self.refresh(True);return 0
