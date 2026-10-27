@@ -84,6 +84,8 @@ jobs:
         run: python tools/check_exe_startup_failures.py --exe dist/windows/YaDiskDownloader.exe --output startup-failure-results.json
       - name: Check confirmed history recovery and cancellation in actual EXE
         run: python tools/check_exe_startup_recovery.py --exe dist/windows/YaDiskDownloader.exe --output startup-recovery-results.json
+      - name: Check visible progress and responsive UI with large synthetic history
+        run: python tools/check_exe_startup_recovery.py --large --exe dist/windows/YaDiskDownloader.exe --output startup-recovery-large.json
       - name: Check background SQLite diagnostics in actual EXE
         run: python tools/check_exe_database_errors.py --exe dist/windows/YaDiskDownloader.exe --output database-error-results.json
       - name: Recover unreadable application history in actual EXE
@@ -99,6 +101,7 @@ jobs:
             smoke-results.json
             startup-failure-results.json
             startup-recovery-results.json
+            startup-recovery-large.json
             desktop-dpi-results.json
             database-error-results.json
             history-recovery-application.json

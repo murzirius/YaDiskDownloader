@@ -39,12 +39,12 @@ from .platform_actions import open_path
 from .insights import DestinationChecks, download_plan, files as job_files, problems as job_problems
 
 
-def create_app(state_dir=None, api=None, port=8766, *, startup_checkpoint=None, startup_recovery=None):
+def create_app(state_dir=None, api=None, port=8766, *, startup_checkpoint=None, startup_recovery=None, startup_progress=None):
     app = Flask(__name__)
     app.secret_key = secrets.token_bytes(32)
     app.config.update(MAX_CONTENT_LENGTH=1024 * 1024, SESSION_COOKIE_NAME=f"disk_downloader_{port}", SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Strict", SEND_FILE_MAX_AGE_DEFAULT=0)
     state = Path(state_dir or state_folder())
-    store = Store(state / "jobs.sqlite3", **({"checkpoint": startup_checkpoint} if startup_checkpoint else {}), **({"recovery": startup_recovery} if startup_recovery else {}))
+    store = Store(state / "jobs.sqlite3", **({"checkpoint": startup_checkpoint} if startup_checkpoint else {}), **({"recovery": startup_recovery} if startup_recovery else {}), **({"progress": startup_progress} if startup_progress else {}))
     from .single_instance import state_key
     state_identity = state_key(state)
     recovery = Recovery(store)

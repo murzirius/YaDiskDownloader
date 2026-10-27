@@ -8,7 +8,39 @@ _window = None
 
 def progress(text, percent):
     if _window:
+        if not getattr(_window, 'app', None):
+            percent = min(99, max(getattr(_window, 'startup_percent', 0), percent))
+            _window.startup_percent = percent
         _window.messages.put(('progress',(text,percent)))
+
+
+def history_progress(stage, done, total, elapsed):
+    stages = {
+        'backup_copy': ('Сохраняем копию истории', 30, 35),
+        'backup_verify': ('Проверяем копию истории', 36, 36),
+        'repair_indexes': ('Восстанавливаем индексы на копии', 37, 37),
+        'verify_repaired': ('Проверяем восстановленную копию', 39, 39),
+        'inspect_backups': ('Проверяем прежние резервные копии', 39, 39),
+        'confirm_recovery': ('Ожидаем решения о восстановлении', 40, 40),
+        'lock_history': ('Получаем доступ к истории', 41, 41),
+        'save_original': ('Сохраняем исходную историю', 42, 48),
+        'apply_recovery': ('Применяем восстановленную историю', 49, 55),
+        'verify_recovery': ('Проверяем результат восстановления', 56, 56),
+        'history_ready': ('Резервная копия истории готова', 58, 58),
+        'setup_history': ('Подготавливаем базу истории', 61, 61),
+        'prepare_jobs': ('Обновляем историю заданий', 63, 63),
+        'migrate_legacy': ('Переносим прежние задания', 65, 65),
+    }
+    if stage not in stages:return
+    text, start, end = stages[stage]
+    percent = start
+    if total is not None and total > 0 and done is not None:
+        fraction = min(1, max(0, done/total))
+        percent = int(start + fraction*(end-start))
+        text += f' · {done/1024**2:.0f} / {total/1024**2:.0f} МБ ({fraction:.0%}) · {int(elapsed)} с'
+    else:
+        text += f' · {int(elapsed)} с'
+    progress(text, percent)
 
 
 def confirm_history_recovery(info):

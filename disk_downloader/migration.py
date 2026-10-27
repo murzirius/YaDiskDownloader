@@ -59,9 +59,11 @@ def candidates(program_dir):
     return list(dict.fromkeys(path for path in locations if (path / "jobs.sqlite3").is_file()))[:50]
 
 
-def migrate(target, sources, checkpoint=lambda: None, recovery=None):
+def migrate(target, sources, checkpoint=lambda: None, recovery=None, progress=None):
     target = Path(target).resolve()
-    store = Store(target / "jobs.sqlite3", checkpoint=checkpoint, recovery=recovery)
+    store = Store(target / "jobs.sqlite3", checkpoint=checkpoint, recovery=recovery, progress=progress)
+    from .history_progress import HistoryProgress
+    observation = HistoryProgress(checkpoint, progress)
     total, failures = 0, 0
     for folder in sources:
         checkpoint()
@@ -83,7 +85,7 @@ def migrate(target, sources, checkpoint=lambda: None, recovery=None):
                     if previous and previous[0] == stamp:
                         continue
                 with backup_snapshot(source, target) as snapshot:
-                    with store.db() as db:
+                    with store.db() as db, observation.statements(db, 'migrate_legacy'):
                         imported = []
                         columns = [row[1] for row in db.execute("PRAGMA table_info(jobs)") if row[1] in {r[1] for r in snapshot.execute("PRAGMA table_info(jobs)")}]
                         for job in snapshot.execute("SELECT * FROM jobs"):

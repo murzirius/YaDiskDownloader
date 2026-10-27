@@ -89,7 +89,7 @@ CREATE TABLE IF NOT EXISTS pending_service_outputs (root TEXT,kind TEXT,local TE
 
 
 class Store:
-    def __init__(self, filename, *, checkpoint=lambda: None, recovery=None):
+    def __init__(self, filename, *, checkpoint=lambda: None, recovery=None, progress=None):
         mode = journal_mode()
         self.wal = mode == 'WAL'
         self.filename = str(filename)
@@ -97,12 +97,14 @@ class Store:
         self._sessions = threading.local()
         Path(filename).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         from .backups import before_upgrade, recovery_source
+        from .history_progress import HistoryProgress
+        observation = HistoryProgress(checkpoint, progress)
         checkpoint()
-        before_upgrade(Path(filename), checkpoint=checkpoint, recovery=recovery)
+        before_upgrade(Path(filename), checkpoint=checkpoint, recovery=recovery, progress=progress)
         connection = recovery_source(filename, timeout=30) if Path(filename).is_file() else sqlite3.connect(self.filename, timeout=30)
         with closing(connection) as setup:
             setup.execute("PRAGMA journal_mode=" + mode)
-        with self.db() as db:
+        with self.db() as db, observation.statements(db, 'setup_history'):
             db.executescript(SCHEMA)
             self.text_encoding = {'UTF-8':'utf-8','UTF-16le':'utf-16-le','UTF-16be':'utf-16-be'}[db.execute('PRAGMA encoding').fetchone()[0]]
             db.execute('DELETE FROM run_selection')
@@ -131,6 +133,7 @@ class Store:
             if "pause_reason" not in {row[1] for row in db.execute("PRAGMA table_info(jobs)")}:
                 db.execute("ALTER TABLE jobs ADD COLUMN pause_reason TEXT NOT NULL DEFAULT ''")
             self._job_projection = ",".join('CAST(settings AS BLOB) AS settings' if row[1] == 'settings' else '"'+row[1].replace('"','""')+'"' for row in db.execute("PRAGMA table_info(jobs)"))
+            observation.begin('prepare_jobs')
             for row in db.execute("SELECT id,CAST(settings AS BLOB) AS settings FROM jobs").fetchall():
                 try:
                     settings = self.settings_value(row["settings"])

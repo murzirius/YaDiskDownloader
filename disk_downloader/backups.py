@@ -15,6 +15,7 @@ from urllib.parse import quote
 from . import __version__
 from .paths import native
 from .history_integrity import HistoryIntegrityError, require as require_integrity
+from .history_progress import HistoryProgress
 
 MAX_BYTES = 1024 * 1024 * 1024
 LOCK = threading.RLock()
@@ -28,11 +29,12 @@ class BackupTimeout(TimeoutError):
 
 
 class BackupBudget:
-    def __init__(self, timeout=None, checkpoint=lambda: None):
+    def __init__(self, timeout=None, checkpoint=lambda: None, observe=None):
         self.deadline = time.monotonic() + (BACKUP_TIMEOUT if timeout is None else timeout)
         self.checkpoint = checkpoint
         self.busy_since = None
         self.sql_error = None
+        self.observe = observe
 
     def check(self):
         self.checkpoint()
@@ -51,6 +53,9 @@ class BackupBudget:
     def progress(self, status, remaining, total):
         # DONE is SQLite's durable success boundary; do not turn a completed
         # connection copy into a false cancellation after its commit.
+        if self.observe is not None:
+            try:self.observe(status, remaining, total)
+            except Exception:pass
         if status == sqlite3.SQLITE_DONE:
             return
         now = time.monotonic()
@@ -125,9 +130,9 @@ def bounded_commit(db, budget):
             time.sleep(min(.05, budget.remaining()))
 
 
-def backup_connection(source, target, checkpoint=lambda: None, timeout=None):
+def backup_connection(source, target, checkpoint=lambda: None, timeout=None, *, progress=None):
     """Copy open SQLite connections with bounded busy waits and cancellation."""
-    budget = BackupBudget(timeout, checkpoint)
+    budget = BackupBudget(timeout, checkpoint, observe=progress)
     previous = []
     try:
         for db in (source, target):
@@ -186,11 +191,13 @@ def _standalone(db, budget):
     budget.check()
 
 
-def snapshot(source, destination, checkpoint=lambda: None, timeout=None):
+def snapshot(source, destination, checkpoint=lambda: None, timeout=None, *, progress=None):
     destination = Path(native(destination))
     budget = BackupBudget(timeout, checkpoint)
     with closing(sqlite3.connect(destination)) as target, bounded_statements(target,budget):
-        backup_connection(source, target, budget.check, budget.remaining())
+        if progress:progress.begin('backup_copy')
+        backup_connection(source, target, budget.check, budget.remaining(), **({'progress':progress.copying(source)} if progress else {}))
+        if progress:progress.begin('backup_verify')
         require_integrity(target)
         _standalone(target,budget)
     budget.check()
@@ -206,7 +213,7 @@ def _finish_private_copy(filename, budget):
         os.fsync(stream.fileno())
 
 
-def _original_safety(source, folder, budget, method):
+def _original_safety(source, folder, budget, method, progress):
     # This intentionally UNVERIFIED snapshot retains the pre-recovery pages.
     # It is kept outside the list of normal, validated restore candidates.
     folder = folder / 'recovery-originals'
@@ -216,7 +223,7 @@ def _original_safety(source, folder, budget, method):
     target = folder / ('original-' + identity + '.sqlite3')
     try:
         with closing(sqlite3.connect(temporary)) as raw, bounded_statements(raw, budget):
-            backup_connection(source, raw, budget.check, budget.remaining())
+            backup_connection(source, raw, budget.check, budget.remaining(), progress=progress.copying(source))
             _standalone(raw, budget)
         with temporary.open('r+b') as stream:os.fsync(stream.fileno())
         os.replace(temporary, target)
@@ -229,7 +236,7 @@ def _original_safety(source, folder, budget, method):
         temporary.unlink(missing_ok=True)
 
 
-def _recover_startup(source, temporary, folder, budget, failure, recovery, version):
+def _recover_startup(source, temporary, folder, budget, failure, recovery, version, progress):
     size = source.execute('PRAGMA page_count').fetchone()[0] * source.execute('PRAGMA page_size').fetchone()[0]
     if shutil.disk_usage(folder).free < size * 3 + 256 * 1024 * 1024:
         raise OSError(28, 'Insufficient local space for protected history recovery')
@@ -237,12 +244,14 @@ def _recover_startup(source, temporary, folder, budget, failure, recovery, versi
     info = {'method':'indexes'}
     if failure.integrity.get('index_candidate'):
         try:
+            progress.begin('repair_indexes')
             with closing(sqlite3.connect(_database_uri(temporary,'rw'),uri=True,timeout=.05)) as copy, bounded_statements(copy,budget):
                 copy.execute('PRAGMA cache_size=-8192')
                 copy.execute('PRAGMA temp_store=FILE')
                 copy.create_function('unicode_fold',1,lambda value:(value or '').casefold(),deterministic=True)
                 copy.execute('REINDEX')
                 copy.commit()
+                progress.begin('verify_repaired')
                 require_integrity(copy)
                 _standalone(copy,budget)
             _finish_private_copy(temporary,budget)
@@ -250,6 +259,7 @@ def _recover_startup(source, temporary, folder, budget, failure, recovery, versi
         except (sqlite3.Error, HistoryIntegrityError):
             budget.check()
     if not prepared:
+        progress.begin('inspect_backups')
         # Never roll history back without showing which verified copy will be used.
         candidates = [path for path in folder.glob('*.sqlite3')
                       if not path.is_symlink() and re.fullmatch(r'(before-[0-9]+\.[0-9]+\.[0-9]+|backup-[0-9TZ-]+-[a-f0-9]{8})\.sqlite3',path.name)]
@@ -259,7 +269,7 @@ def _recover_startup(source, temporary, folder, budget, failure, recovery, versi
             try:
                 with closing(readonly(candidate)) as saved, bounded_statements(saved,budget):
                     Backups.validate(saved,budget.check)
-                    snapshot(saved,temporary,budget.check,budget.remaining())
+                    snapshot(saved,temporary,budget.check,budget.remaining(),progress=progress)
                 info = {'method':'backup','name':candidate.name,
                         'modified':datetime.fromtimestamp(candidate.stat().st_mtime).astimezone().strftime('%d.%m.%Y %H:%M')}
                 prepared = True
@@ -269,9 +279,16 @@ def _recover_startup(source, temporary, folder, budget, failure, recovery, versi
     if not prepared:
         raise failure
     budget.check()
-    if not recovery(info):
+    progress.begin('confirm_recovery')
+    accepted = recovery(info)
+    if not accepted:
         raise failure
+    # Preparing/verifying the candidate and applying it are separate bounded
+    # stages. Neither slow preparation nor reading the prompt may consume the
+    # time reserved for preserving the original and applying the verified copy.
+    budget.deadline = time.monotonic() + UPGRADE_BACKUP_TIMEOUT
     budget.check()
+    progress.begin('lock_history')
     previous_mode = source.execute('PRAGMA locking_mode').fetchone()[0]
     try:
         # Retain the exclusive lock after COMMIT. The backup API requires no
@@ -282,18 +299,22 @@ def _recover_startup(source, temporary, folder, budget, failure, recovery, versi
         if source.execute('PRAGMA data_version').fetchone()[0] != version:
             raise ValueError('История изменилась во время подготовки. Восстановление отменено; повторите запуск.')
         source.commit()
-        _original_safety(source,folder,budget,info['method'])
-        with closing(readonly(temporary)) as healthy:
+        progress.begin('save_original')
+        _original_safety(source,folder,budget,info['method'],progress)
+        with closing(readonly(temporary)) as healthy, bounded_statements(healthy,budget):
+            progress.begin('verify_repaired')
             require_integrity(healthy)
-            backup_connection(healthy,source,budget.check,budget.remaining())
+            progress.begin('apply_recovery')
+            backup_connection(healthy,source,budget.check,budget.remaining(),progress=progress.copying(healthy))
         with bounded_statements(source,budget):
+            progress.begin('verify_recovery')
             require_integrity(source)
     finally:
         if source.in_transaction:source.rollback()
         source.execute('PRAGMA locking_mode='+previous_mode)
 
 
-def before_upgrade(filename, checkpoint=lambda: None, recovery=None):
+def before_upgrade(filename, checkpoint=lambda: None, recovery=None, progress=None):
     filename = Path(native(filename))
     if not filename.is_file():
         return
@@ -301,7 +322,8 @@ def before_upgrade(filename, checkpoint=lambda: None, recovery=None):
     target = folder / ('before-' + __version__ + '.sqlite3')
     # A whole-history upgrade copy includes integrity checking and may exceed
     # the interactive backup budget. Busy locks keep their separate 5s limit.
-    budget = BackupBudget(UPGRADE_BACKUP_TIMEOUT, checkpoint)
+    progress = HistoryProgress(checkpoint, progress)
+    budget = BackupBudget(UPGRADE_BACKUP_TIMEOUT, progress.check)
     with backup_lock(budget):
         if target.is_file():
             return
@@ -314,16 +336,17 @@ def before_upgrade(filename, checkpoint=lambda: None, recovery=None):
             with closing(recovery_source(filename, timeout=min(5, budget.remaining()))) as source:
                 version = source.execute('PRAGMA data_version').fetchone()[0]
                 try:
-                    snapshot(source, temporary, budget.check, budget.remaining())
+                    snapshot(source, temporary, budget.check, budget.remaining(), progress=progress)
                 except HistoryIntegrityError as error:
                     if recovery is None:
                         raise
-                    _recover_startup(source, temporary, folder, budget, error, recovery, version)
+                    _recover_startup(source, temporary, folder, budget, error, recovery, version, progress)
             os.replace(temporary, target)
             automatic=[file for file in folder.glob('before-*.sqlite3') if not file.is_symlink() and re.fullmatch(r'before-\d+\.\d+\.\d+\.sqlite3',file.name)]
             for old in sorted(automatic,key=lambda file:file.stat().st_mtime,reverse=True)[5:]:
                 try: old.unlink()
                 except OSError: pass
+            progress.begin('history_ready')
         finally:
             temporary.unlink(missing_ok=True)
 

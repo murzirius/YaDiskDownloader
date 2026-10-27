@@ -31,6 +31,18 @@ def corrupt(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def large_history(path, rows=220000):
+    """Large synthetic job exercises setup queries as well as page copying."""
+    import json
+    corrupt(path)
+    with closing(sqlite3.connect(path)) as db,db:
+        db.execute('INSERT INTO jobs(id,settings,root,service,phase,started) VALUES(?,?,?,?,?,?)',
+                   ('synthetic-completed','{}',str(path.parent/'results'),str(path.parent/'service'),'completed','2026-01-01'))
+        meta=json.dumps({'name':'synthetic.bin','type':'file','size':0,'media_type':'document','synthetic_padding':'x'*3200})
+        db.executemany('INSERT INTO entries(job,path,kind,meta,local,status) VALUES(?,?,?,?,?,?)',
+                       (('synthetic-completed',f'disk:/synthetic/{i:07}.bin','file',meta,f'synthetic/{i:07}.bin','done') for i in range(rows)))
+
+
 def test_integrity_classification_has_no_raw_names_or_values(tmp_path):
     path=tmp_path/'history.sqlite3';corrupt(path)
     with closing(sqlite3.connect(path)) as db:
@@ -144,15 +156,15 @@ def test_cancel_during_sqlite_apply_rolls_back_and_keeps_safety_copy(tmp_path,mo
     if wal:
         with closing(sqlite3.connect(path)) as db:db.execute('PRAGMA journal_mode=WAL')
     original=backups.backup_connection
-    def copy(source,target,checkpoint=lambda:None,timeout=None):
+    def copy(source,target,checkpoint=lambda:None,timeout=None,**kwargs):
         if any(row[2] and os.path.samefile(row[2],path) for row in target.execute('PRAGMA database_list')):
             calls=[]
             def cancel():
                 calls.append(1)
                 if len(calls)==3:raise InterruptedError('synthetic cancel during destination copy')
                 checkpoint()
-            return original(source,target,checkpoint=cancel,timeout=timeout)
-        return original(source,target,checkpoint=checkpoint,timeout=timeout)
+            return original(source,target,checkpoint=cancel,timeout=timeout,**kwargs)
+        return original(source,target,checkpoint=checkpoint,timeout=timeout,**kwargs)
     monkeypatch.setattr(backups,'backup_connection',copy)
     with pytest.raises(InterruptedError):backups.before_upgrade(path,recovery=lambda _:True)
     with closing(sqlite3.connect(path)) as db:

@@ -94,12 +94,13 @@ def main():
         message("Папка состояния занята другим процессом или недоступна. Завершите его или выберите отдельную --state-dir.")
         return 1
     recovery = desktop.confirm_history_recovery if desktop.status()['enabled'] else None
+    history_progress = desktop.history_progress if desktop.status()['enabled'] else None
     startup.mark('history')
     desktop.progress('Сохраняем резервную копию и готовим историю…',40)
-    migration = migrate(state, candidates(program_folder()), checkpoint=startup.checkpoint, recovery=recovery) if not args.state_dir else {"jobs": 0, "failed_sources": 0}
+    migration = migrate(state, candidates(program_folder()), checkpoint=startup.checkpoint, recovery=recovery, progress=history_progress) if not args.state_dir else {"jobs": 0, "failed_sources": 0}
     startup.mark('database')
     desktop.progress('Открываем базу и восстанавливаем состояние…',60)
-    app = create_app(state, port=args.port, startup_checkpoint=startup.checkpoint, startup_recovery=recovery)
+    app = create_app(state, port=args.port, startup_checkpoint=startup.checkpoint, startup_recovery=recovery, startup_progress=history_progress)
     startup.mark('server')
     app.extensions["migration"] = migration
     server = create_server(app, sockets=[listener], threads=12, clear_untrusted_proxy_headers=True)

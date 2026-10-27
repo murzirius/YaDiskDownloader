@@ -30,6 +30,8 @@ def check(output):
         user.GetClientRect.argtypes=(w.HWND,ctypes.POINTER(w.RECT))
         user.GetWindowRect.argtypes=(w.HWND,ctypes.POINTER(w.RECT))
         user.ClientToScreen.argtypes=(w.HWND,ctypes.POINTER(w.POINT))
+        user.GetDC.argtypes=(w.HWND,);user.GetDC.restype=w.HDC
+        user.ReleaseDC.argtypes=(w.HWND,w.HDC)
         gdi.GetObjectW.argtypes=(w.HANDLE,ctypes.c_int,ctypes.c_void_p)
         kernel=ctypes.WinDLL('kernel32');kernel.GetCurrentProcess.restype=w.HANDLE
         user.GetGuiResources.argtypes=(w.HANDLE,w.DWORD)
@@ -49,7 +51,18 @@ def check(output):
             assert gdi.GetObjectW(window.font,len(font),font)>0
             height=ctypes.cast(font,ctypes.POINTER(ctypes.c_long)).contents.value
             assert height==-round(16*dpi/96),(dpi,height)
-            results.append({'dpi':dpi,'font_height':height,'all_controls_fit':True})
+            label=window.controls[2];area=w.RECT();user.GetClientRect(label,ctypes.byref(area))
+            dc=user.GetDC(label);old=gdi.SelectObject(dc,window.font)
+            try:
+                for text in ('Сохраняем исходную историю · 10240 / 10240 МБ (100%) · 999 с',
+                             'Применяем восстановленную историю · 10240 / 10240 МБ (100%) · 999 с',
+                             'Проверяем результат восстановления · 999 с'):
+                    measured=w.RECT(0,0,area.right,0)
+                    assert user.DrawTextW(dc,text,-1,ctypes.byref(measured),0x410)>0
+                    assert measured.bottom<=area.bottom,(dpi,text,measured.bottom,area.bottom)
+            finally:
+                gdi.SelectObject(dc,old);user.ReleaseDC(label,dc)
+            results.append({'dpi':dpi,'font_height':height,'all_controls_fit':True,'history_progress_text_fits':True})
         assert user.GetGuiResources(process,0)<=before+1,'Repeated scaling leaked GDI objects'
     desktop.launch(lambda:None,inspect_window=inspect)
     output.parent.mkdir(parents=True,exist_ok=True)
