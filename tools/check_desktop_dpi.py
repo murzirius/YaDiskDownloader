@@ -60,9 +60,13 @@ def check(output):
                     measured=w.RECT(0,0,area.right,0)
                     assert user.DrawTextW(dc,text,-1,ctypes.byref(measured),0x410)>0
                     assert measured.bottom<=area.bottom,(dpi,text,measured.bottom,area.bottom)
+                notice_area=w.RECT();user.GetClientRect(window.controls[5],ctypes.byref(notice_area))
+                measured=w.RECT(0,0,notice_area.right,0)
+                assert user.DrawTextW(dc,desktop.HISTORY_RECOVERY_NOTICE,-1,ctypes.byref(measured),0x410)>0
+                assert measured.bottom<=notice_area.bottom,(dpi,'recovery notice',measured.bottom,notice_area.bottom)
             finally:
                 gdi.SelectObject(dc,old);user.ReleaseDC(label,dc)
-            results.append({'dpi':dpi,'font_height':height,'all_controls_fit':True,'history_progress_text_fits':True})
+            results.append({'dpi':dpi,'font_height':height,'all_controls_fit':True,'history_progress_text_fits':True,'recovery_notice_text_fits':True})
         assert user.GetGuiResources(process,0)<=before+1,'Repeated scaling leaked GDI objects'
     desktop.launch(lambda:None,inspect_window=inspect)
     output.parent.mkdir(parents=True,exist_ok=True)
