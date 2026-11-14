@@ -109,11 +109,18 @@ jobs:
           if-no-files-found: ignore
       - run: python -m pip download --no-deps --dest dist/windows/third_party pystray==0.19.5
       - run: python tools/package_release.py --exe dist/windows/YaDiskDownloader.exe --output dist/release
+      - name: Build per-user installer (Inno Setup is preinstalled on the runner)
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue) -and -not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup --no-progress -y }
+          python tools/build_installer.py --output dist/release
+      - name: Check install, upgrade and removal with the real installer
+        run: python -m pytest -q tests/test_windows_installer.py
       - uses: actions/upload-artifact@v6
         with:
           name: Windows-release
           path: |
             dist/release/*-Windows-x64.zip
+            dist/release/*-Windows-x64-Setup.exe
       - name: Publish checked release assets
         if: startsWith(github.ref, 'refs/tags/v')
         env:
@@ -124,7 +131,8 @@ jobs:
           $appVersion = python -c "from disk_downloader import __version__; print(__version__)"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $windowsArchive = "dist/release/YaDiskDownloader-v${appVersion}-Windows-x64.zip"
-          foreach ($archive in @($windowsArchive)) {
+          $installer = "dist/release/YaDiskDownloader-v${appVersion}-Windows-x64-Setup.exe"
+          foreach ($archive in @($windowsArchive, $installer)) {
             if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
               throw "Release archive is missing: $archive"
             }
@@ -136,7 +144,7 @@ jobs:
             gh release create $env:RELEASE_TAG --verify-tag --title "YaDiskDownloader $env:RELEASE_TAG" --notes-file "docs/release-v${appVersion}.md" @releaseOptions
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
-          gh release upload $env:RELEASE_TAG $windowsArchive --clobber
+          gh release upload $env:RELEASE_TAG $windowsArchive $installer --clobber
           exit $LASTEXITCODE
 
   native_cli:

@@ -10,7 +10,7 @@ import pytest
 from tools import package_release
 
 
-DOCS = ('docs/usage.md', 'docs/features-v1.3.0.md', 'docs/cli.md',
+DOCS = ('docs/windows-installer.md', 'docs/usage.md', 'docs/features-v1.3.0.md', 'docs/cli.md',
         'docs/features-v1.5.0.md', 'docs/validation-v1.5.0.md',
         'docs/scan-pipeline-validation.md', 'docs/validation-storage-v1.5.0.md',
         'docs/macos.md', 'docs/architecture.md', 'docs/testing.md', 'docs/traffic-and-performance.md', 'docs/validation-storage-v1.5.1.md')

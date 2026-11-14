@@ -12,8 +12,8 @@ ROOT=Path(__file__).resolve().parents[1]
 VERSION=re.search(r'__version__\s*=\s*"([0-9.]+)"',(ROOT/'disk_downloader/__init__.py').read_text(encoding='utf-8')).group(1)
 BUILD=re.search(r'__build__\s*=\s*"([0-9.]+)"',(ROOT/'disk_downloader/__init__.py').read_text(encoding='utf-8')).group(1)
 ROOT_FILES=('pyproject.toml','start.sh','build_posix.py','build_macos_service.py','run_cli.py','run_macos_service.py','README.md','LICENSE','.gitignore','run.py','build_windows.py','windows.manifest','requirements.txt','requirements-dev.txt','requirements-build.txt','requirements-bootstrap.txt')
-SOURCE_FOLDERS={'disk_downloader','docs','tests','tools','native','.github'}
-SOURCE_SUFFIXES={'.py','.js','.cjs','.css','.html','.md','.txt','.yml','.yaml','.svg','.m'}
+SOURCE_FOLDERS={'disk_downloader','docs','tests','tools','native','.github','installer'}
+SOURCE_SUFFIXES={'.py','.js','.cjs','.css','.html','.md','.txt','.yml','.yaml','.svg','.m','.iss'}
 PRIVATE_NAMES={'agent.md','agents.md','agents.override.md','claude.md','claude.local.md',
                'codex.md','gemini.md','skill.md','copilot-instructions.md',
                'opencode.md','local_settings.py','config.local.py','settings.local.py',
@@ -24,7 +24,7 @@ DISTRIBUTION_DOCS=('README.md','LICENSE','docs/usage.md','docs/features-v1.3.0.m
                    'docs/cli.md','docs/features-v1.5.0.md','docs/validation-v1.5.0.md',
                    'docs/scan-pipeline-validation.md','docs/validation-storage-v1.5.0.md',
                    'docs/macos.md','docs/architecture.md','docs/testing.md',
-                   'docs/traffic-and-performance.md', 'docs/validation-storage-v1.5.1.md', f'docs/release-v{VERSION}.md')
+                   'docs/traffic-and-performance.md', 'docs/validation-storage-v1.5.1.md', 'docs/windows-installer.md', f'docs/release-v{VERSION}.md')
 
 
 def _tracked_sources():

@@ -27,6 +27,13 @@ def test_install_preserves_history_and_requires_ownership(tmp_path):
     assert (target/'YaDiskDownloader.exe').read_bytes()==b'foreign executable'
 
 
+def test_in_app_install_does_not_overwrite_setup_installation(tmp_path):
+    source,target=tmp_path/'source',tmp_path/'app'
+    payload(source);target.mkdir();(target/'unins000.exe').write_bytes(b'uninstaller')
+    with pytest.raises(ValueError):install_files(source,target)
+    assert not (target/'YaDiskDownloader.exe').exists()
+
+
 def test_incomplete_archive_cannot_modify_installed_program(tmp_path):
     source,target=tmp_path/'source',tmp_path/'app'
     payload(source);install_files(source,target)

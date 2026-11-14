@@ -28,6 +28,8 @@ def install_files(source, target):
     source, target = Path(source).resolve(), Path(target).absolute()
     target.parent.mkdir(parents=True, exist_ok=True)
     safe_join(target.parent, target.name)
+    if (target / 'unins000.exe').exists():
+        raise ValueError('Программа уже установлена установщиком Setup. Обновляйте её новым Setup.exe или из окна версии.')
     target.mkdir(exist_ok=True)
     marker = Path(safe_join(target, 'install-files.json'))
     owned = {}
